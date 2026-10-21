@@ -21,19 +21,19 @@ s2-table-window-prototype = ["native-markdown-candidate", "pulldown-cmark/omni-b
 paged-graphemes = ["native-markdown-candidate"]
 # Share the source and fixed-page I/O with grapheme indexing while keeping line-break logic in its own module.
 paged-line-breaks = ["native-markdown-candidate"]
-# Shape paged glyph runs from the frozen source for the opt-in candidate; the default native editor remains TextKit.
+# Shape bounded glyph runs from the frozen source; the native plugin selects this for its production editor.
 paged-shaping = ["native-markdown-candidate", "dep:harfrust", "dep:read-fonts"]
 # Query bounded intersections of the two Unicode indexes; these results do not certify font width or native layout.
 paged-layout-breaks = ["paged-graphemes", "paged-line-breaks"]
-# Reuse the same grapheme revision for script indexing consumed by the opt-in paged candidate.
+# Reuse one grapheme revision for script indexing consumed by the production paged editor.
 paged-scripts = ["paged-graphemes"]
-# Measure bounded widths from real glyphs and break opportunities without changing the default native entry point.
+# Measure bounded widths from actual glyphs and certified break opportunities on the shared source.
 paged-soft-line-measure = ["paged-shaping", "paged-layout-breaks"]
 # Resolve measured opportunities and whole-grapheme emergency breaks; missing dictionary or font input cannot become Ready.
 paged-soft-line-resolve = ["paged-soft-line-measure"]
 # Derive safe glyph slices from the measured choice and reuse output instead of reshaping the remaining paragraph for each soft line.
 paged-safe-glyph-slices = ["paged-soft-line-resolve"]
-# Compose font, script, bidi, and line output over the same source and indexes for the opt-in paged candidate.
+# Compose font, script, bidi and visual lines over the same bounded source and indexes.
 paged-line-compose = ["paged-safe-glyph-slices", "paged-scripts"]
 # Publish incremental shaping only for a real font plan and certified source boundaries; this does not select a native editor.
 paged-shaping-frontier = ["paged-line-compose"]

@@ -340,11 +340,11 @@ fn unicode_and_display_name_ties_remain_a_strict_total_order() {
 
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
-/// 同路径保存保持55条目录的after与Pending进度，旧正文搜索仍须撤权并查到新正文。
-fn native_and_legacy_content_saves_preserve_directory_continuation_but_revoke_search() {
+/// Same-path mmap saves preserve browse continuation while revoking searches of old body bytes.
+fn content_saves_preserve_directory_continuation_but_revoke_search() {
     let fixture = tempfile::tempdir().unwrap();
     for index in 0..55 {
-        // 固定名称和初始正文分离，正文变化不应改变目录中的排名。
+        // Stable paths keep their tree position even when a later public buffer transaction changes the body.
         fs::write(fixture.path().join(format!("note-{index:02}.md")), "before").unwrap();
     }
     let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
@@ -367,7 +367,7 @@ fn native_and_legacy_content_saves_preserve_directory_continuation_but_revoke_se
         .unwrap()
         .ino();
     session.save_document_buffer(&mut document).unwrap();
-    // no-op没有发布，目录和搜索的两种原权限都保留。
+    // A clean save publishes nothing: both the directory page and the body-search authority stay usable.
     assert!(page.authority.is_current(&session, &HashSet::new()));
     assert!(search.authority.is_current(&session, "before"));
     document
@@ -379,7 +379,7 @@ fn native_and_legacy_content_saves_preserve_directory_continuation_but_revoke_se
         )
         .unwrap();
     session.save_document_buffer(&mut document).unwrap();
-    // 真实原子替换换了note inode，但root/path/kind/stem/collapse未变。
+    // The real atomic save replaces the note inode, but not its path, kind, stem, root or collapse policy.
     assert_ne!(
         fs::metadata(fixture.path().join("note-20.md"))
             .unwrap()
@@ -413,11 +413,20 @@ fn native_and_legacy_content_saves_preserve_directory_continuation_but_revoke_se
             .unwrap(),
         MarkdownWorkspacePageProgress::Pending
     ));
-    let legacy = session.open_note("note-30.md").unwrap();
-    session
-        .save_note("note-30.md", "after", &legacy.revision)
+    // Change a second real mmap-backed document while the existing pager is between bounded scan steps.
+    // Neither reading nor editing this buffer may materialize a second whole-document string API.
+    let mut second_document = session.open_document_buffer("note-30.md").unwrap();
+    second_document
+        .replace_utf16_range_with_selection(
+            0..6,
+            "after",
+            crate::MarkdownTextSelection::caret(0),
+            crate::MarkdownTextSelection::caret(5),
+        )
         .unwrap();
-    // Pending不会因自动保存丢掉已扫进度或跳回第一页；搜索正文权限仍正确撤销。
+    session.save_document_buffer(&mut second_document).unwrap();
+    // Saving body bytes cannot reset the Pending browse scan or replay its first page. A search
+    // prepared before that real publication must nevertheless lose its body-dependent authority.
     assert!(second.authority.is_current(&session, &HashSet::new()));
     assert!(!refreshed_search.authority.is_current(&session, "after"));
     let third = finish_page(&mut pager, 12, 7, &HashSet::new());
@@ -454,37 +463,6 @@ fn native_and_legacy_content_saves_preserve_directory_continuation_but_revoke_se
     );
     assert!(!fifth.has_more);
     assert!(fifth.authority.is_current(&session, &HashSet::new()));
-}
-
-#[test]
-/// legacy真实rename后即使dirsync返回Err，也只撤正文搜索，目录仍从原末项继续。
-fn legacy_post_rename_sync_failure_preserves_browse_and_revokes_search_before_error() {
-    let fixture = tempfile::tempdir().unwrap();
-    fs::write(fixture.path().join("a.md"), "before").unwrap();
-    fs::write(fixture.path().join("b.md"), "before").unwrap();
-    let workspace = MarkdownWorkspace::new(fixture.path().to_owned(), fixture.path().join("data"));
-    let session = workspace.open_session().unwrap();
-    let original = session.open_note("a.md").unwrap();
-    let mut pager = session.open_workspace_pager().unwrap();
-    let page = finish_page(&mut pager, 1, 512, &HashSet::new());
-    let search = session
-        .search_notes_page_cancellable("before", 1, None, &AtomicBool::new(false))
-        .unwrap();
-    let result =
-        session.save_note_with_directory_sync("a.md", "after", &original.revision, |parent| {
-            // 这个回调只在真实rename和撤权之后调用，不靠预设counter假装已发布。
-            assert_eq!(parent, fixture.path().canonicalize().unwrap());
-            assert_eq!(fs::read(fixture.path().join("a.md")).unwrap(), b"after");
-            assert!(!search.authority.is_current(&session, "before"));
-            assert!(page.authority.is_current(&session, &HashSet::new()));
-            Err(MarkdownWorkspaceError::StorageUnavailable)
-        });
-    assert_eq!(result, Err(MarkdownWorkspaceError::StorageUnavailable));
-    assert!(!search.authority.is_current(&session, "before"));
-    assert!(page.authority.is_current(&session, &HashSet::new()));
-    let next = finish_page(&mut pager, 1, 512, &HashSet::new());
-    assert_eq!(ordered_paths(&next), ["b.md"]);
-    assert!(!next.has_more);
 }
 
 #[cfg(feature = "native-markdown-candidate")]

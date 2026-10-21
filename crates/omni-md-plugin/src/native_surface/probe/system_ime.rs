@@ -68,7 +68,9 @@ pub fn write_native_markdown_ime_fixture(path: &std::path::Path) -> Result<(), S
         .map_err(|_| "无法创建独占的中文输入法合成原文")?;
     file.write_all(b"X").map_err(|_| "无法写入合成原文首字")?;
     let mut block = [0u8; 4095];
-    for scalar in block.chunks_exact_mut(3) {
+    // The fixed page is divisible by the three UTF-8 bytes of this scalar; write
+    // complete scalars without a document-sized String or a partial final unit.
+    for scalar in block.as_chunks_mut::<3>().0 {
         scalar.copy_from_slice("中".as_bytes());
     }
     let mut remaining = validation::ORIGINAL_UTF16 - 1;

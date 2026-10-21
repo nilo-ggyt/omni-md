@@ -157,7 +157,8 @@ impl Mask {
             let low = first.saturating_sub(start).min(4);
             let high = through.saturating_sub(start).min(4);
             let mask = ((1u16 << (high * 2)) - 1) & !((1u16 << (low * 2)) - 1);
-            *byte |= fill.flags * 0x55 & mask as u8;
+            // Replicate each certified two-bit flag, then mask the actual source-byte intersection.
+            *byte |= (fill.flags * 0x55) & mask as u8;
         }
         file.write_all_at(&bytes[..count], offset as u64)
             .map_err(storage)?;

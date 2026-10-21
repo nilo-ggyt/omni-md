@@ -2,6 +2,8 @@
 //!
 //! The SDK is the only host integration boundary. The foreground session owns
 //! its confined workspace, mounted native view, and deterministic close contract.
+//! Core owns canonical document and filesystem transactions; this entry point
+//! passes the Host's existing vault authority through without choosing a new root.
 
 #[cfg(any(target_os = "macos", test))]
 mod cancelable_mailbox;
@@ -109,7 +111,7 @@ impl PluginSession for MarkdownSession {
         #[cfg(target_os = "macos")]
         {
             return native_surface::request_native_markdown_close(request)
-                .map_err(|_| PluginError::new("close_failed", "Markdown 原生 surface 关闭失败"));
+                .map_err(|_| PluginError::new("close_failed", "Markdown 原生编辑器关闭失败"));
         };
         // Unsupported platforms expose an explicit protocol error and allocate no surface.
         #[cfg(not(target_os = "macos"))]
@@ -117,7 +119,7 @@ impl PluginSession for MarkdownSession {
             let _ = request;
             Err(PluginError::new(
                 "platform_unavailable",
-                "Markdown 原生 surface 只支持 macOS",
+                "Markdown 原生编辑器只支持 macOS",
             ))
         }
     }
@@ -135,7 +137,8 @@ fn activate_markdown(
     host: &mut dyn OmniBarHostContext,
     _invocation: &PluginInvocation<'_>,
 ) -> Result<PluginActivation, PluginError> {
-    // Activation is the first point where workspace/session resources may be created.
+    // Activation is the first resource boundary. Keep the Host's configured vault
+    // and application-data authorities; neither metadata nor this adapter selects a new root.
     let workspace = omni_markdown_core::MarkdownWorkspace::new(
         host.workspace_root().to_path_buf(),
         host.application_data_root().to_path_buf(),
@@ -144,9 +147,10 @@ fn activate_markdown(
     let session = workspace
         .open_session()
         .map_err(|_| PluginError::new("session_failed", "Markdown 工作区无法打开"))?;
-    // The host mounts this surface synchronously; failure drops the unopened workspace.
+    // Surface construction consumes the already-open confined session. Failure
+    // returns before a plugin session or borrowed mounted-view descriptor is published.
     native_surface::show_native_markdown_window(session.clone(), host.foreground_lifecycle(), host)
-        .map_err(|_| PluginError::new("surface_failed", "Markdown 原生 surface 创建失败"))?;
+        .map_err(|_| PluginError::new("surface_failed", "Markdown 原生编辑器创建失败"))?;
     // The host borrows the mounted view until the lifecycle unmount boundary.
     let native_view = native_surface::active_native_markdown_view();
     Ok(PluginActivation::Session(Box::new(MarkdownSession {

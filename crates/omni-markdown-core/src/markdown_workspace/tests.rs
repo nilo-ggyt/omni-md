@@ -1,71 +1,30 @@
 //! Regression tests preserved with their owning document/workspace boundary.
 
 use std::fs;
-use std::hint::black_box;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use tempfile::{TempDir, tempdir};
+#[cfg(feature = "native-markdown-candidate")]
+use tempfile::TempDir;
+use tempfile::tempdir;
 
 #[cfg(feature = "native-markdown-candidate")]
 use crate::markdown_document_buffer::MarkdownTextSelection;
 
-use super::{
-    MAX_ATTACHMENT_BYTES, MarkdownOpenMetrics, MarkdownWorkspace, MarkdownWorkspaceError,
-    conflict_draft_path, markdown_open_metrics,
-};
-
-#[test]
-/// Preserve established Unicode character and mixed-line-ending display semantics.
-fn open_metrics_match_codemirror_line_break_semantics_in_one_byte_scan() {
-    // Hand-calculated empty, Unicode, CRLF, and mixed-ending cases provide an oracle independent of storage shape.
-    for (content, expected) in [
-        (
-            "",
-            MarkdownOpenMetrics {
-                character_count: 0,
-                line_count: 1,
-                line_separator: "\n",
-            },
-        ),
-        (
-            "中文😀\nnext",
-            MarkdownOpenMetrics {
-                character_count: 8,
-                line_count: 2,
-                line_separator: "\n",
-            },
-        ),
-        (
-            "a\r\nb\r\nc",
-            MarkdownOpenMetrics {
-                character_count: 5,
-                line_count: 3,
-                line_separator: "\r\n",
-            },
-        ),
-        (
-            "a\rb\nc",
-            MarkdownOpenMetrics {
-                character_count: 5,
-                line_count: 3,
-                line_separator: "\r",
-            },
-        ),
-    ] {
-        // Each independent expected metric tuple must match without normalizing or replacing the fixture bytes.
-        assert_eq!(markdown_open_metrics(content), expected);
-    }
-}
+#[cfg(feature = "native-markdown-candidate")]
+use super::conflict_draft_path;
+use super::{MAX_ATTACHMENT_BYTES, MarkdownWorkspace, MarkdownWorkspaceError};
 
 /// Isolated owner for a vault and private application-data tree across workspace reconstruction.
+#[cfg(feature = "native-markdown-candidate")]
 struct ConflictRecoveryFixture {
     _temporary_directory: TempDir,
     vault_directory: PathBuf,
     recovery_directory: PathBuf,
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 impl ConflictRecoveryFixture {
     /// Own isolated vault and private application-data directories for conflict recovery tests.
     fn new() -> Self {
@@ -385,6 +344,7 @@ fn native_workspace_listing_bounds_metadata_without_opening_note_bodies() {
     assert_eq!(bounded.directories.len() + bounded.notes.len(), 2);
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Keep a damaged unrelated note from preventing listing or opening a valid current note.
 fn workspace_listing_and_current_note_open_do_not_read_other_note_bodies() {
@@ -410,250 +370,87 @@ fn workspace_listing_and_current_note_open_do_not_read_other_note_bodies() {
     );
 
     // Opening the valid note must remain independent of the damaged sibling body.
-    let current = access.open_note("Current.md").expect("open current note");
-    assert_eq!(current.content, "# Current\n正文");
+    let current = access
+        .open_document_buffer("Current.md")
+        .expect("open current note");
+    // Only this finite synthetic oracle owns output bytes; the public buffer remains streamed.
+    let mut bytes = Vec::new();
+    current.write_to(&mut bytes).expect("stream current note");
+    assert_eq!(bytes, "# Current\n正文".as_bytes());
     assert_eq!(
-        access.open_note("Unopened.md").err(),
+        access.open_document_buffer("Unopened.md").err(),
         Some(MarkdownWorkspaceError::InvalidUtf8Document)
     );
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
-/// Verify exact Unicode reads, atomic saves, and optimistic conflict rejection.
-fn mmap_open_and_atomic_save_detect_external_conflict() {
-    // Create a Unicode note and activate a confined workspace.
-    let root = tempdir().expect("temporary root");
-    fs::write(root.path().join("note.md"), "before").expect("note fixture");
-    let workspace = MarkdownWorkspace::with_root(root.path().to_path_buf());
-    let access = workspace.open_session().expect("open session");
-
-    // Open and save against the returned revision, then compare the committed bytes and receipt.
-    let opened = access.open_note("note.md").expect("open note");
-    assert_eq!(opened.content, "before");
-    let saved = access
-        .save_note("note.md", "after", &opened.revision)
-        .expect("save note");
-    assert_eq!(
-        fs::read_to_string(root.path().join("note.md")).unwrap(),
-        "after"
-    );
-
-    // An external replacement must make the old revision reject while preserving the external bytes.
-    fs::write(root.path().join("note.md"), "external").expect("external change");
-    assert_eq!(
-        access.save_note("note.md", "local", &saved.revision).err(),
-        Some(MarkdownWorkspaceError::SaveConflict)
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("note.md")).unwrap(),
-        "external"
-    );
-}
-
-#[test]
-/// Avoid persistent private draft state during an ordinary successful legacy save.
+/// A successful streamed native save must not create historical conflict storage.
 fn normal_save_never_creates_conflict_recovery_storage() {
-    // Open a clean fixture whose recovery directory has never been created.
     let fixture = ConflictRecoveryFixture::new();
     fs::write(fixture.vault_directory.join("note.md"), "before").expect("note fixture");
     let workspace = fixture.workspace();
     let access = workspace.open_session().expect("open session");
-    let opened = access.open_note("note.md").expect("open note");
-
-    // A revision-matching save should publish only the note bytes.
+    let mut document = access
+        .open_document_buffer("note.md")
+        .expect("open native buffer");
+    // Publish real canonical edits before saving; the save cannot obtain text from a legacy String DTO.
+    document
+        .replace_utf16_range(
+            0..document.utf16_len(),
+            "saved",
+            MarkdownTextSelection::caret(5),
+        )
+        .unwrap();
     access
-        .save_note("note.md", "saved", &opened.revision)
-        .expect("normal save");
-
-    // Private recovery storage must remain absent when no conflict needs preservation.
+        .save_document_buffer(&mut document)
+        .expect("streamed save");
+    assert_eq!(
+        fs::read(fixture.vault_directory.join("note.md")).unwrap(),
+        b"saved"
+    );
     assert!(!fixture.recovery_directory.exists());
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
-/// Protect legacy unsaved text across both external conflicts and workspace reconstruction.
-fn conflict_preserves_disk_and_recovers_draft_after_workspace_rebuild() {
-    // Open the initial baseline and replace the disk file externally.
-    let fixture = ConflictRecoveryFixture::new();
-    fs::write(fixture.vault_directory.join("note.md"), "before").expect("note fixture");
-    let workspace = fixture.workspace();
-    let access = workspace.open_session().expect("open session");
-    let opened = access.open_note("note.md").expect("open note");
-    fs::write(fixture.vault_directory.join("note.md"), "external").expect("external update");
-
-    // The conflict must preserve external bytes while installing an owner-private recoverable local draft.
-    assert_eq!(
-        access
-            .save_note("note.md", "latest local draft", &opened.revision)
-            .err(),
-        Some(MarkdownWorkspaceError::SaveConflict)
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.vault_directory.join("note.md")).unwrap(),
-        "external"
-    );
-    assert_eq!(
-        fs::symlink_metadata(&fixture.recovery_directory)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert_eq!(
-        fs::symlink_metadata(fixture.draft_path("note.md"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-
-    // A fresh workspace must recover the saved draft with the current external disk revision as its baseline.
-    let rebuilt_workspace = fixture.workspace();
-    let rebuilt_access = rebuilt_workspace.open_session().expect("rebuilt session");
-    let recovered = rebuilt_access.open_note("note.md").expect("recover draft");
-    assert_eq!(recovered.content, "latest local draft");
-    assert_eq!(recovered.byte_count, "latest local draft".len() as u64);
-    assert_eq!(recovered.character_count, 18);
-    assert_eq!(recovered.line_count, 1);
-    assert_eq!(recovered.line_separator, "\n");
-    assert!(recovered.recovered_conflict);
-    assert_ne!(recovered.revision, opened.revision);
-}
-
-#[test]
-/// Require draft replacement to publish a new complete inode and clean all temporary names.
-fn conflict_draft_updates_replace_atomically_without_temporary_residue() {
-    // Create private recovery storage for one existing note.
-    let fixture = ConflictRecoveryFixture::new();
-    fs::write(fixture.vault_directory.join("note.md"), "disk").expect("note fixture");
-    let workspace = fixture.workspace();
-    let access = workspace.open_session().expect("open session");
-
-    // Write two complete draft versions and capture their file identities.
-    access
-        .update_conflict_draft("note.md", "first draft")
-        .expect("initial recovery draft");
-    let draft_path = fixture.draft_path("note.md");
-    let first_inode = fs::metadata(&draft_path).unwrap().ino();
-    access
-        .update_conflict_draft("note.md", "newest draft")
-        .expect("updated recovery draft");
-    let second_inode = fs::metadata(&draft_path).unwrap().ino();
-
-    // The second version must replace the first atomically with only the final draft remaining.
-    assert_ne!(first_inode, second_inode);
-    let recovered = access.open_note("note.md").expect("updated recovery draft");
-    assert_eq!(recovered.content, "newest draft");
-    let recovery_entries = fs::read_dir(&fixture.recovery_directory)
-        .unwrap()
-        .map(|entry| {
-            // The isolated recovery directory should contain only readable final entries after atomic draft replacement.
-            entry.unwrap().path()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(recovery_entries, vec![draft_path]);
-}
-
-#[test]
-/// Make choosing disk contents an explicit recovery-draft discard operation.
-fn explicit_disk_reload_removes_the_recovery_draft() {
-    // Create an external version and a persisted local draft for the same note.
-    let fixture = ConflictRecoveryFixture::new();
-    fs::write(fixture.vault_directory.join("note.md"), "external").expect("note fixture");
-    let workspace = fixture.workspace();
-    let access = workspace.open_session().expect("open session");
-    access
-        .update_conflict_draft("note.md", "local draft")
-        .expect("recovery draft");
-
-    // Explicit reload chooses the validated authoritative disk bytes.
-    let reloaded = access
-        .reload_note_from_disk("note.md")
-        .expect("confirmed disk reload");
-
-    // The returned note and a subsequent open must show disk text with no stale recovery flag or record.
-    assert_eq!(reloaded.content, "external");
-    assert!(!reloaded.recovered_conflict);
-    assert!(!fixture.draft_path("note.md").exists());
-    assert!(!access.open_note("note.md").unwrap().recovered_conflict);
-}
-
-#[test]
-/// Keep a saved conflict copy independent from clearing the original note's recovery record.
-fn saved_conflict_copy_can_clear_only_the_original_recovery_draft() {
-    // Create local and external versions plus another note's draft, then save the local text to a separate note.
-    let fixture = ConflictRecoveryFixture::new();
-    fs::write(fixture.vault_directory.join("note.md"), "external").expect("note fixture");
-    let workspace = fixture.workspace();
-    let access = workspace.open_session().expect("open session");
-    access
-        .update_conflict_draft("note.md", "local draft")
-        .expect("recovery draft");
-    let created = access
-        .create_note("", "Local draft")
-        .expect("collision-safe copy target");
-    access
-        .save_note(&created.relative_path, "local draft", &created.revision)
-        .expect("persist conflict copy");
-
-    // Clear only the explicitly identified original draft.
-    access
-        .clear_conflict_draft("note.md")
-        .expect("clear original recovery draft");
-
-    // The saved copy and unrelated recovery record must remain intact.
-    assert_eq!(
-        fs::read_to_string(fixture.vault_directory.join("Local draft.md")).unwrap(),
-        "local draft"
-    );
-    assert!(!fixture.draft_path("note.md").exists());
-    let original = access.open_note("note.md").expect("original disk note");
-    assert_eq!(original.content, "external");
-    assert!(!original.recovered_conflict);
-}
-
-#[test]
-/// Reject redirection at either private recovery-directory or draft-file boundaries.
+/// Actual mapped recovery rejects linked directories and records without changing their targets.
 fn conflict_recovery_rejects_directory_and_file_symlinks() {
-    // Substitute the recovery directory with a link to an unrelated temporary tree.
     let fixture = ConflictRecoveryFixture::new();
-    fs::write(fixture.vault_directory.join("note.md"), "disk").expect("note fixture");
+    fs::write(fixture.vault_directory.join("note.md"), "disk").unwrap();
     let workspace = fixture.workspace();
-    let access = workspace.open_session().expect("open session");
-    let outside = tempdir().expect("outside recovery target");
-    fs::create_dir_all(fixture.recovery_directory.parent().unwrap()).expect("app data parent");
-    std::os::unix::fs::symlink(outside.path(), &fixture.recovery_directory)
-        .expect("recovery directory symlink");
-
-    // Draft writes through a linked directory must reject without publishing outside the private boundary.
+    let access = workspace.open_session().unwrap();
+    access.write_conflict_fixture("note.md", "local").unwrap();
+    let original = fs::read(fixture.draft_path("note.md")).unwrap();
+    let outside = tempdir().unwrap();
+    let moved = outside.path().join("records");
+    // The actual record is valid; only its directory role changes before the public open.
+    fs::rename(&fixture.recovery_directory, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &fixture.recovery_directory).unwrap();
     assert_eq!(
-        access.update_conflict_draft("note.md", "local").err(),
+        access.open_document_buffer("note.md").err(),
         Some(MarkdownWorkspaceError::ConflictRecoveryUnavailable)
     );
-    assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
-
-    // Restore a real private directory, then substitute the per-note record with a file symlink.
-    fs::remove_file(&fixture.recovery_directory).expect("remove directory symlink");
-    fs::create_dir(&fixture.recovery_directory).expect("private recovery directory");
-    fs::set_permissions(
-        &fixture.recovery_directory,
-        fs::Permissions::from_mode(0o700),
-    )
-    .expect("private directory permissions");
-    let outside_file = outside.path().join("outside.draft");
-    fs::write(&outside_file, "outside").expect("outside draft target");
-    std::os::unix::fs::symlink(&outside_file, fixture.draft_path("note.md"))
-        .expect("recovery file symlink");
-
-    // Writes and reads must reject the linked record while preserving its outside target.
+    fs::remove_file(&fixture.recovery_directory).unwrap();
+    fs::rename(&moved, &fixture.recovery_directory).unwrap();
+    assert_eq!(fs::read(fixture.draft_path("note.md")).unwrap(), original);
+    let external = outside.path().join("outside.draft");
+    fs::write(&external, &original).unwrap();
+    fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(fixture.draft_path("note.md")).unwrap();
+    std::os::unix::fs::symlink(&external, fixture.draft_path("note.md")).unwrap();
     assert_eq!(
-        access.update_conflict_draft("note.md", "local").err(),
+        access.open_document_buffer("note.md").err(),
         Some(MarkdownWorkspaceError::ConflictDraftCorrupted)
     );
-    assert_eq!(fs::read_to_string(outside_file).unwrap(), "outside");
+    assert_eq!(fs::read(&external).unwrap(), original);
+    assert_eq!(
+        fs::read(fixture.vault_directory.join("note.md")).unwrap(),
+        b"disk"
+    );
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Avoid silently hiding unsaved recovery corruption behind otherwise readable disk text.
 fn malformed_conflict_draft_is_rejected_without_falling_back_to_disk() {
@@ -675,7 +472,7 @@ fn malformed_conflict_draft_is_rejected_without_falling_back_to_disk() {
 
     // Opening the note must surface record corruption and preserve the original disk text.
     assert_eq!(
-        access.open_note("note.md").err(),
+        access.open_document_buffer("note.md").err(),
         Some(MarkdownWorkspaceError::ConflictDraftCorrupted)
     );
     assert_eq!(
@@ -697,13 +494,10 @@ fn create_and_search_use_only_markdown_files() {
     let created = access
         .create_note("Projects", "Roadmap")
         .expect("create note");
-    access
-        .save_note(
-            &created.relative_path,
-            "# Roadmap\n\n极致性能目标",
-            &created.revision,
-        )
-        .expect("save body");
+    let content = "# Roadmap\n\n极致性能目标";
+    // This case owns search fixtures, not editor behavior: populate the real newly created
+    // file directly so basic workspace search remains testable without native editor features.
+    fs::write(root.path().join(&created.relative_path), content).expect("search body fixture");
     fs::write(root.path().join("ignored.txt"), "极致性能目标").expect("ignored file");
 
     // ASCII-insensitive title matching must find the expected note before body results.
@@ -818,6 +612,7 @@ fn attachment_import_streams_to_reserved_directory_and_builds_nested_link() {
     );
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Preserve literal code and unrelated links while updating imported asset links after a depth-changing move.
 fn moving_note_rewrites_only_live_vault_attachment_destinations() {
@@ -835,11 +630,12 @@ fn moving_note_rewrites_only_live_vault_attachment_destinations() {
     fs::write(root.path().join("Note.md"), original).expect("note fixture");
     let workspace = MarkdownWorkspace::with_root(root.path().to_path_buf());
     let access = workspace.open_session().expect("open session");
-    let opened = access.open_note("Note.md").expect("open note");
+    let opened = access.open_document_buffer("Note.md").expect("open note");
+    let opened_revision = opened.original_revision().unwrap().encode_hex();
 
     // Move to a nested directory and compare only the intended imported-link prefix changes.
     let moved = access
-        .move_note("Note.md", "Archive", Some(&opened.revision))
+        .move_note("Note.md", "Archive", Some(&opened_revision))
         .expect("move nested");
     let nested = fs::read_to_string(root.path().join("Archive/Note.md")).unwrap();
     assert_eq!(
@@ -907,6 +703,7 @@ fn attachment_import_rejects_oversize_and_symlink_destinations() {
     );
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Keep imported asset storage outside user note and destination APIs.
 fn reserved_attachments_tree_cannot_be_opened_as_notes_or_note_directories() {
@@ -920,7 +717,7 @@ fn reserved_attachments_tree_cannot_be_opened_as_notes_or_note_directories() {
 
     // Note opening and directory resolution must both reject this reserved subtree.
     assert_eq!(
-        access.open_note("attachments/hidden.md").err(),
+        access.open_document_buffer("attachments/hidden.md").err(),
         Some(MarkdownWorkspaceError::NoteNotFound)
     );
     assert_eq!(
@@ -962,6 +759,7 @@ fn import_sources_must_be_regular_files_not_symlinks() {
     assert!(!root.path().join("attachments").exists());
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Reject lexical parent traversal and filesystem-link escapes at the note boundary.
 fn traversal_and_symlink_escape_are_rejected() {
@@ -977,11 +775,11 @@ fn traversal_and_symlink_escape_are_rejected() {
 
     // Both traversal syntax and a linked note must reject before returning outside contents.
     assert_eq!(
-        access.open_note("../outside.md").err(),
+        access.open_document_buffer("../outside.md").err(),
         Some(MarkdownWorkspaceError::InvalidRelativePath)
     );
     assert_eq!(
-        access.open_note("escape.md").err(),
+        access.open_document_buffer("escape.md").err(),
         Some(MarkdownWorkspaceError::NoteNotFound)
     );
 }
@@ -1135,6 +933,7 @@ fn unopened_note_lifecycle_accepts_no_expected_revision() {
     assert!(!root.path().join(&copied.relative_path).exists());
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Protect all existing entries while exercising successful revision-checked note lifecycle operations.
 fn note_lifecycle_never_overwrites_existing_entries() {
@@ -1145,12 +944,13 @@ fn note_lifecycle_never_overwrites_existing_entries() {
     fs::write(root.path().join("taken.md"), "keep").expect("collision fixture");
     let workspace = MarkdownWorkspace::with_root(root.path().to_path_buf());
     let access = workspace.open_session().expect("open session");
-    let opened = access.open_note("note.md").expect("open note");
+    let opened = access.open_document_buffer("note.md").expect("open note");
+    let opened_revision = opened.original_revision().unwrap().encode_hex();
 
     // A conflicting rename must preserve both notes without changing the original revision.
     assert_eq!(
         access
-            .rename_note("note.md", "taken", Some(&opened.revision))
+            .rename_note("note.md", "taken", Some(&opened_revision))
             .err(),
         Some(MarkdownWorkspaceError::EntryAlreadyExists)
     );
@@ -1161,7 +961,7 @@ fn note_lifecycle_never_overwrites_existing_entries() {
 
     // A successful rename and move must retain the source bytes under the new identifier.
     let renamed = access
-        .rename_note("note.md", "renamed.md", Some(&opened.revision))
+        .rename_note("note.md", "renamed.md", Some(&opened_revision))
         .expect("rename note");
     assert_eq!(renamed.relative_path, "renamed.md");
     let moved = access
@@ -1190,6 +990,7 @@ fn note_lifecycle_never_overwrites_existing_entries() {
     );
 }
 
+#[cfg(feature = "native-markdown-candidate")]
 #[test]
 /// Require exact optimistic revisions before rename, move, copy, and delete of an opened note.
 fn stale_revision_blocks_destructive_note_lifecycle_actions() {
@@ -1199,28 +1000,29 @@ fn stale_revision_blocks_destructive_note_lifecycle_actions() {
     fs::write(root.path().join("note.md"), "before").expect("note fixture");
     let workspace = MarkdownWorkspace::with_root(root.path().to_path_buf());
     let access = workspace.open_session().expect("open session");
-    let opened = access.open_note("note.md").expect("open note");
+    let opened = access.open_document_buffer("note.md").expect("open note");
+    let opened_revision = opened.original_revision().unwrap().encode_hex();
     fs::write(root.path().join("note.md"), "external").expect("external update");
 
     // Every stale-revision lifecycle operation must reject while preserving the external note and destination tree.
     assert_eq!(
         access
-            .rename_note("note.md", "renamed", Some(&opened.revision))
+            .rename_note("note.md", "renamed", Some(&opened_revision))
             .err(),
         Some(MarkdownWorkspaceError::SaveConflict)
     );
     assert_eq!(
         access
-            .move_note("note.md", "Archive", Some(&opened.revision))
+            .move_note("note.md", "Archive", Some(&opened_revision))
             .err(),
         Some(MarkdownWorkspaceError::SaveConflict)
     );
     assert_eq!(
-        access.copy_note("note.md", Some(&opened.revision)).err(),
+        access.copy_note("note.md", Some(&opened_revision)).err(),
         Some(MarkdownWorkspaceError::SaveConflict)
     );
     assert_eq!(
-        access.delete_note("note.md", Some(&opened.revision)).err(),
+        access.delete_note("note.md", Some(&opened_revision)).err(),
         Some(MarkdownWorkspaceError::SaveConflict)
     );
     assert_eq!(
@@ -1232,164 +1034,16 @@ fn stale_revision_blocks_destructive_note_lifecycle_actions() {
     assert!(!root.path().join("note 副本.md").exists());
 }
 
-#[test]
-#[ignore = "manual release-profile storage benchmark"]
-/// Provide an explicitly ignored release-profile storage benchmark with isolated real filesystem fixtures.
-fn markdown_storage_latency_profile() {
-    // Fixed sample counts define bounded measurement work; the benchmark is opt-in rather than a normal correctness test.
-    const OPEN_SAMPLE_COUNT: usize = 200;
-    const SEARCH_SAMPLE_COUNT: usize = 50;
-    const SAVE_SAMPLE_COUNT: usize = 30;
-    const SEARCH_FILE_COUNT: usize = 128;
-    const ONE_MIB: usize = 1_024 * 1_024;
-    const SEARCH_FILE_BYTES: usize = 32 * 1_024;
-
-    // Create open and search documents outside timed regions so measurements exclude fixture construction.
-    let root = tempdir().expect("Markdown benchmark workspace");
-    let first_document = build_markdown_benchmark_document(ONE_MIB, b'a');
-    let second_document = build_markdown_benchmark_document(ONE_MIB, b'b');
-    fs::write(
-        root.path().join("open-profile.md"),
-        first_document.as_bytes(),
-    )
-    .expect("write open benchmark fixture");
-    for index in 0..SEARCH_FILE_COUNT {
-        // Populate a fixed number of equal-size searchable notes outside the timed search region.
-        let mut candidate = build_markdown_benchmark_document(SEARCH_FILE_BYTES, b'c');
-        if index + 1 == SEARCH_FILE_COUNT {
-            // Place the token in the final fixture so a successful search exercises a representative vault scan.
-            candidate.replace_range(.."benchmark-target-token".len(), "benchmark-target-token");
-        }
-        fs::write(
-            root.path().join(format!("search-profile-{index:03}.md")),
-            candidate.as_bytes(),
-        )
-        .expect("write search benchmark fixture");
-    }
-
-    // Activate one workspace after fixtures are complete.
-    let workspace = MarkdownWorkspace::with_root(root.path().to_path_buf());
-    let access = workspace.open_session().expect("open benchmark session");
-
-    // Warm the open path before recording per-call latency samples.
-    for _ in 0..5 {
-        // Warm open operations before collecting observations to reduce first-use noise.
-        black_box(
-            access
-                .open_note("open-profile.md")
-                .expect("warm mmap open")
-                .byte_count,
-        );
-    }
-    let mut open_latencies = Vec::with_capacity(OPEN_SAMPLE_COUNT);
-    for _ in 0..OPEN_SAMPLE_COUNT {
-        // Measure each bounded mapped open independently and retain only its elapsed duration.
-        let started_at = Instant::now();
-        let opened = access
-            .open_note("open-profile.md")
-            .expect("profile mmap open");
-        open_latencies.push(started_at.elapsed());
-        black_box(opened.byte_count);
-    }
-    print_markdown_latency_profile("mmap_open_1_mib", open_latencies);
-
-    // Warm and sample bounded searches with a target near the scan end.
-    for _ in 0..2 {
-        // Warm search separately from timed samples so setup is not reported as recurring latency.
-        black_box(
-            access
-                .search_notes("benchmark-target-token", 10)
-                .expect("warm mmap search")
-                .len(),
-        );
-    }
-    let mut search_latencies = Vec::with_capacity(SEARCH_SAMPLE_COUNT);
-    for _ in 0..SEARCH_SAMPLE_COUNT {
-        // Each measured search must actually find the fixture token before its latency is accepted.
-        let started_at = Instant::now();
-        let results = access
-            .search_notes("benchmark-target-token", 10)
-            .expect("profile mmap search");
-        search_latencies.push(started_at.elapsed());
-        // Correctness is checked outside the measured interval so an empty fast failure cannot pass the profile.
-        assert_eq!(results.len(), 1);
-        black_box(results.len());
-    }
-    print_markdown_latency_profile("mmap_search_5_mib_129_notes", search_latencies);
-
-    // Alternate full saved revisions so each measured save performs actual persistence work.
-    let mut current_revision = access
-        .open_note("open-profile.md")
-        .expect("open save benchmark note")
-        .revision;
-    let mut save_latencies = Vec::with_capacity(SAVE_SAMPLE_COUNT);
-    for sample in 0..SAVE_SAMPLE_COUNT {
-        // Alternate content revisions for every measured save so no sample becomes a clean no-op.
-        let content = if sample % 2 == 0 {
-            // Even samples write the second document revision.
-            &second_document
-        } else {
-            // Odd samples write the first revision again, maintaining actual alternating save work.
-            &first_document
-        };
-        let started_at = Instant::now();
-        let receipt = access
-            .save_note("open-profile.md", content, &current_revision)
-            .expect("profile atomic save");
-        save_latencies.push(started_at.elapsed());
-        current_revision = receipt.revision;
-        black_box(receipt.byte_count);
-    }
-    print_markdown_latency_profile("atomic_save_1_mib", save_latencies);
-
-    // Close activation after all samples so the benchmark leaves no active workspace marker.
-    workspace.close_session();
-    assert!(!workspace.is_session_open());
-}
-
-/// Construct a fixed-byte ASCII benchmark document without conflating Unicode geometry with I/O timing.
-fn build_markdown_benchmark_document(byte_count: usize, fill: u8) -> String {
-    // Insert a predictable newline pattern into the preallocated fixture body.
-    let mut bytes = vec![fill; byte_count];
-    let heading = b"# Markdown benchmark\n";
-    bytes[..heading.len()].copy_from_slice(heading);
-    String::from_utf8(bytes).expect("ASCII benchmark document")
-}
-
-/// Report stable percentile summaries from measured benchmark durations.
-fn print_markdown_latency_profile(label: &str, mut samples: Vec<Duration>) {
-    // Sort once before extracting order statistics; reporting is outside measured operations.
-    samples.sort_unstable();
-    let p50 = markdown_latency_percentile(&samples, 50);
-    let p95 = markdown_latency_percentile(&samples, 95);
-    let p99 = markdown_latency_percentile(&samples, 99);
-    println!(
-        "{label} samples={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",
-        samples.len(),
-        p50.as_secs_f64() * 1_000.0,
-        p95.as_secs_f64() * 1_000.0,
-        p99.as_secs_f64() * 1_000.0,
-    );
-}
-
-/// Select a bounded nearest-rank latency sample from nonempty sorted observations.
-fn markdown_latency_percentile(samples: &[Duration], percentile: usize) -> Duration {
-    // Require nonempty samples and clamp the percentile index to the available observation range.
-    assert!(!samples.is_empty());
-    let rank = percentile
-        .saturating_mul(samples.len())
-        .div_ceil(100)
-        .saturating_sub(1)
-        .min(samples.len() - 1);
-    samples[rank]
-}
-
 /// Exercise mutable-source races in isolated processes so a future SIGBUS cannot kill unrelated tests.
 #[test]
 fn immutable_snapshot_external_mutation_isolated_regressions() {
     // Every scenario gets fresh paths and a single-test child, avoiding cross-test descriptor noise.
     let directory = tempdir().expect("snapshot process fixtures");
-    for scenario in ["inspection", "search", "recovery", "release"] {
+    #[cfg(not(feature = "native-markdown-candidate"))]
+    let scenarios = ["inspection", "search", "release"];
+    #[cfg(feature = "native-markdown-candidate")]
+    let scenarios = ["inspection", "search", "recovery", "release"];
+    for scenario in scenarios {
         // Run real external writers against the exact inode being inspected or retained by the child.
         let root = directory.path().join(scenario);
         fs::create_dir(&root).unwrap();
@@ -1474,15 +1128,24 @@ fn immutable_snapshot_process_scenario() {
     match scenario.as_str() {
         // Borrowed UTF-8 must stay immutable even when the source is truncated during the inspection callback.
         "inspection" => {
-            let outcome =
-                super::inspect_validated_markdown_text(&path, super::MAX_DOCUMENT_BYTES, |text| {
-                    // Snapshot acquisition has completed before this callback receives its immutable string.
-                    mutate_snapshot_source(&path, "truncate");
-                    assert_eq!(text, original);
-                    mutate_snapshot_source(&path, "nonutf8");
-                    assert_eq!(text, original);
-                    text.chars().count()
-                });
+            let outcome = super::inspect_bounded_markdown_text_cancellable(
+                &path,
+                super::MAX_DOCUMENT_BYTES,
+                || true,
+                |text| {
+                    // Each visit reads the same frozen source after actual external mutations.
+                    // No whole-document slice or second owned text is needed to prove immutable bytes.
+                    for mutation in ["truncate", "nonutf8"] {
+                        mutate_snapshot_source(&path, mutation);
+                        text.visit_validated_bytes(&|| true, |offset, bytes| {
+                            assert_eq!(bytes, &original.as_bytes()[offset..offset + bytes.len()]);
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                },
+                None,
+            );
             assert!(matches!(
                 outcome,
                 Err(MarkdownWorkspaceError::DocumentChangedDuringRead)
@@ -1518,11 +1181,12 @@ fn immutable_snapshot_process_scenario() {
             workspace.close_session();
         }
         // Owner-only recovery permissions do not prevent another same-user process from modifying the inode.
+        #[cfg(feature = "native-markdown-candidate")]
         "recovery" => {
             let workspace = MarkdownWorkspace::new(root.clone(), root.join("app-data"));
             let access = workspace.open_session().unwrap();
             let draft = "unsaved recovery 中文😀\n".repeat(4_000);
-            access.update_conflict_draft("Note.md", &draft).unwrap();
+            access.write_conflict_fixture("Note.md", &draft).unwrap();
             let record =
                 conflict_draft_path(&root.join("app-data/markdown-conflict-recovery"), "Note.md");
             let payload = root.join("valid.bin");
@@ -1530,11 +1194,13 @@ fn immutable_snapshot_process_scenario() {
             let writer = start_snapshot_stress_writer(&record, &payload);
             for _ in 0..120 {
                 // Recovery may reject a corrupt or changing record; it must never silently substitute disk text.
-                match access.open_note("Note.md") {
+                match access.open_document_buffer("Note.md") {
                     // A recovered record must be one complete valid payload rather than mixed mutable mapping bytes.
-                    Ok(note) => {
-                        assert!(note.recovered_conflict);
-                        assert_eq!(note.content, draft);
+                    Ok(document) => {
+                        assert!(document.has_pending_legacy_recovery());
+                        let mut bytes = Vec::new();
+                        document.write_to(&mut bytes).unwrap();
+                        assert_eq!(bytes, draft.as_bytes());
                     }
                     // Truncation, invalid magic/UTF-8, and identity mutation are explicit recovery failures.
                     Err(MarkdownWorkspaceError::ConflictDraftCorrupted) => {}
@@ -1543,7 +1209,10 @@ fn immutable_snapshot_process_scenario() {
                 }
             }
             assert_snapshot_writer_finished(writer);
-            assert_eq!(access.open_note("Note.md").unwrap().content, draft);
+            let document = access.open_document_buffer("Note.md").unwrap();
+            let mut bytes = Vec::new();
+            document.write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, draft.as_bytes());
             workspace.close_session();
         }
         // An immutable map must retain neither descriptors nor a named scratch tree, then release its VM region on Drop.

@@ -1,29 +1,33 @@
-//! 原链接click只保弱权限和源坐标；目标沿唯一RootLeaf有界恢复，Ready之后才允许一次系统副作用。
+//! Resolve one weak click through the existing bounded RootLeaf producer before any external effect.
 
 use super::*;
 mod heading;
 
-/// 同一次真实链接动作只有一个续体；标题解析不另建排版、Doc或永久slug目录。
+/// One continuation owns either a clicked target or a heading query, never a second document or slug index.
 pub(super) struct PendingLink {
     task: LinkTask,
 }
 
 enum LinkTask {
-    Click(PendingClick),
+    // Allocate once per admitted gesture, keeping the idle slot small. Pending source
+    // quanta move this same Box back into the slot instead of reallocating its Scene key.
+    Click(Box<PendingClick>),
     Heading(Box<heading::PendingHeading>),
 }
 
 impl PendingLink {
-    /// 清槽后的唯一取消出口；标题任务必须显式结算scratch关闭失败，不能藏进Drop。
+    /// Retire after removing the slot; explicitly return heading scratch-close errors instead of hiding them in Drop.
     pub(super) fn retire(mut self) -> std::result::Result<(), ViewError> {
         match &mut self.task {
+            // A click retains only a weak gesture and immutable coordinates, so no external cleanup is needed.
             LinkTask::Click(_) => Ok(()),
+            // The Core query owns scratch resources; cancellation must settle them even before a target is found.
             LinkTask::Heading(pending) => pending.query.cancel().map_err(ViewError::HeadingAnchor),
         }
     }
 }
 
-/// 不保Scene、Reader、Doc或Native对象；View放弃该手势后Weak立即失效。
+/// Retain no Scene, reader, document, or native object; dropping the View's gesture revokes this weak intent.
 struct PendingClick {
     key: NativeMarkdownPagedSceneKey,
     index: usize,
@@ -31,22 +35,25 @@ struct PendingClick {
 }
 
 impl NativeMarkdownPagedBody {
-    /// 只接纳mouseup已经确认的原Scene命中；不在指针栈读取URL、推进Parser或截获拖动。
+    /// Accept only a hit already confirmed by mouse-up on its original Scene.
+    /// Parsing and URL materialization stay off the pointer callback, leaving ordinary dragging unchanged.
     pub(super) fn follow_link(
         &self,
         key: &NativeMarkdownPagedSceneKey,
         index: usize,
         intent: Weak<()>,
     ) -> std::result::Result<(), ViewError> {
+        // A stale Scene or ended gesture cannot acquire another continuation using the same numeric position.
         if !self.scene_current(key) || intent.strong_count() == 0 {
             return Err(ViewError::Revoked);
         }
+        // Replace the pure Rust slot before closing the previous query; no RefCell borrow crosses its cleanup.
         let previous = self.pending_link.replace(Some(PendingLink {
-            task: LinkTask::Click(PendingClick {
+            task: LinkTask::Click(Box::new(PendingClick {
                 key: key.clone(),
                 index,
                 intent,
-            }),
+            })),
         }));
         if let Some(previous) = previous {
             previous.retire()?;
@@ -54,8 +61,9 @@ impl NativeMarkdownPagedBody {
         self.schedule().map_err(|_| ViewError::Revoked)
     }
 
-    /// 一次主队列回合最多推进原4096量子，原FontTrial未完成则只等它已有的完成通知。
+    /// Advance at most the existing 4096-unit quantum; an in-flight FontTrial wakes its own continuation.
     pub(super) fn advance_link(&self, request: &NativeMarkdownPagedSceneRequest) -> Result<bool> {
+        // Take ownership for this turn; asynchronous completion must not keep a mutable slot borrow alive.
         let Some(pending) = self.pending_link.borrow_mut().take() else {
             return Ok(false);
         };
@@ -65,6 +73,7 @@ impl NativeMarkdownPagedBody {
         };
         let view = self.view()?;
         let current = || view.link_intent_current(&pending.key, &pending.intent);
+        // Expected gesture retirement ends the click; real Source/font/resource errors still propagate.
         let live = match current() {
             Ok(live) => live,
             Err(ViewError::Revoked | ViewError::Closed | ViewError::Pending) => false,
@@ -72,8 +81,9 @@ impl NativeMarkdownPagedBody {
         };
         if !pending.key.request.same(request) || !live {
             view.retire_link_intent(&pending.intent);
-            return Ok(false); // 后继输入/焦点/宽度撤旧，不消费较新Scene或借同一坐标打开旧target。
+            return Ok(false); // New input, focus, or width retires the old target without borrowing a successor Scene.
         }
+        // Borrow the one producer by ownership, not a RefCell lease; restore it before native callbacks can reenter.
         let mut producer = self
             .producer
             .borrow_mut()
@@ -81,7 +91,8 @@ impl NativeMarkdownPagedBody {
             .expect("发布Scene的活动Body持唯一Producer");
         let result = producer.advance_link(self, &pending.key, pending.index);
         let waiting_font = producer.has_in_flight();
-        *self.producer.borrow_mut() = Some(producer); // 所有Native调用与后续重入之前先归还原唯一owner槽。
+        *self.producer.borrow_mut() = Some(producer); // The original producer is back in its slot before any later native work.
+        // The bounded source step may revoke its caller; recheck the same gesture, not newly captured input.
         let live = match current() {
             Ok(live) => live,
             Err(ViewError::Revoked | ViewError::Closed | ViewError::Pending) => false,
@@ -90,33 +101,35 @@ impl NativeMarkdownPagedBody {
         match result {
             Err(cause) if cause.is_foreground_revocation() && !live => {
                 view.retire_link_intent(&pending.intent);
-                self.schedule()?; // 原Source健康已由Producer核过；后继正常回合负责退休失效排版，不在此另造图。
+                self.schedule()?; // Producer already checked Source health; the normal next turn retires stale layout.
             }
             Err(cause) => return Err(cause),
             Ok(_) if !live => {
+                // Even a resolved URI has no authority to open after its original click has ended.
                 view.retire_link_intent(&pending.intent);
                 self.schedule()?;
             }
             Ok(None) => {
-                // 同步Native重入可以接纳较新click；旧量子只能放回仍未被替换的槽，不覆写新意图。
+                // Native reentry may admit a newer click. Restore this continuation only into an untouched slot.
                 if self.pending_link.borrow().is_none() {
                     *self.pending_link.borrow_mut() = Some(PendingLink {
                         task: LinkTask::Click(pending),
                     });
                 }
                 if !waiting_font {
+                    // No worker owns the wake, so schedule the next bounded turn instead of spinning here.
                     self.schedule()?;
                 }
             }
             Ok(Some(link)) => {
                 if let Some(link) = link {
-                    // 语义页保有的只是原有限URI；原owner/key已复核且Producer已归槽，
-                    // 仅在真正URL副作用边界物化String，不让排版量子搬移整个目标。
+                    // This is the finite URI certified by the semantic page, not the source paragraph.
+                    // Materialize it only at the effect boundary after restoring the producer and rechecking the owner.
                     let destination = link.destination.into_string();
                     view.finish_link_activation(&pending.key, &pending.intent, &destination);
                 } else {
                     view.retire_link_intent(&pending.intent);
-                } // 真正覆盖而无link是一次完成；未知空洞不得被伪装成None或消耗第一次click。
+                } // A covered non-link is a completed lookup; unknown coverage must never masquerade as None.
             }
         }
         Ok(true)

@@ -191,6 +191,8 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
             // 从已经完整显示的真实数组取得两个槽的弱身份；不借私有 slots 或强持
             // 被替换的旧容器，否则会干扰后面的实际析构与 provider 释放证明。
             let original_slots = {
+                // SAFETY: the retained fixture group is used on main and contains only CALayer
+                // children installed by LayerPool; the returned typed array is inspected synchronously.
                 let children = unsafe { original_group.sublayers() }
                     .filter(|children| children.len() == 2)
                     .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
@@ -241,10 +243,14 @@ fn paired_reuse(case: PaletteCase) -> Result<()> {
             weaks.extend(pool.weaks());
             // 同几何只有左格真实变色；右格除了 CGImage 相同，还必须保持原 Native
             // 容器及 parent。整组重建虽然像素也能正确，仍不能满足本次资源复用契约。
+            // SAFETY: this live pool mount belongs to the main-thread fixture and its children
+            // were installed exclusively through the CALayer sublayer API.
             let partial_group_same = unsafe { pool.mount().sublayers() }.is_some_and(|children| {
                 children.len() == 1
                     && std::ptr::eq::<CALayer>(&*children.objectAtIndex(0), &*original_group)
             });
+            // SAFETY: the local retained group remains alive on main; only LayerPool-created
+            // CALayer entries inhabit this public array, and no borrowed element escapes it.
             let partial_slots = unsafe { original_group.sublayers() }
                 .filter(|children| children.len() == 2)
                 .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
@@ -401,11 +407,15 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                 let roles = pool.weaks();
                 observed.borrow_mut().extend(roles);
                 // 原图已通过完整像素对照；只从公开 Native 数组取得其原 group 和两格身份。
+                // SAFETY: the fixture owns the live main-thread mount and installs only
+                // CALayer children, so the public sublayer array has the declared element type.
                 let group = unsafe { pool.mount().sublayers() }
                     .filter(|children| children.len() == 1)
                     .map(|children| children.objectAtIndex(0))
                     .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
                 let original_slots = {
+                    // SAFETY: the retained fixture group has only CALayer children; this
+                    // synchronous main-thread snapshot lends weak identities without changing ownership.
                     let children = unsafe { group.sublayers() }
                         .filter(|children| children.len() == 2)
                         .ok_or(NativeMarkdownPagedTextViewError::InvalidGeometry)?;
@@ -428,6 +438,8 @@ fn interrupted_partial_publication(case: PaletteCase) -> Result<()> {
                     if !parent_is(pool.mount(), &backing) {
                         return false;
                     }
+                    // SAFETY: this callback runs synchronously on main while the fixture retains
+                    // the original group; all public-array entries were installed as CALayer objects.
                     let children = unsafe { group.sublayers() };
                     if !actual_replacement_seen.get()
                         && let Some(children) = children.filter(|children| children.len() == 2)

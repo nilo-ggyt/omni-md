@@ -16,7 +16,8 @@ pub use markdown_table_cell_display::{
     MarkdownTableCellDisplayScalar, MarkdownTableCellDisplayStep,
 };
 
-// 一个冻结源胶囊供独立布局算法共用；只捕获资源引用，不触发算法或Native排版。
+// Independent layout algorithms share one frozen source capsule; capturing it
+// retains resource authority without running analysis or constructing Native layout.
 #[cfg(any(
     feature = "paged-graphemes",
     feature = "paged-line-breaks",
@@ -30,7 +31,8 @@ mod markdown_layout_index;
 ))]
 pub use markdown_layout_index::MARKDOWN_LAYOUT_INDEX_BYTES;
 
-// 脚本分段复用同版字素状态与原冻结Source，不按读取窗口制造新的shaping边界。
+// Script runs reuse the original frozen source and grapheme revision; a read
+// window is an I/O boundary, not permission to invent another shaping boundary.
 #[cfg(feature = "paged-scripts")]
 mod markdown_scripts;
 #[cfg(feature = "paged-scripts")]
@@ -64,7 +66,8 @@ pub use markdown_layout_source::{
     VerifiedMarkdownLayoutTableRow, VerifiedMarkdownRootLeafStyleBoundary,
 };
 
-// 精确字体解析与分页字形仅在显式候选路径编译，AppKit不进入这个纯Core依赖图。
+// The native plugin enables these paged font/shaping contracts in production.
+// Core keeps them feature-selectable and never acquires an AppKit dependency.
 #[cfg(feature = "paged-shaping")]
 mod markdown_layout_font;
 #[cfg(feature = "paged-shaping")]
@@ -105,12 +108,14 @@ pub use markdown_layout_breaks::{
     MarkdownLayoutBreakResourceObserver, MarkdownLayoutBreakStep, MarkdownLayoutBreakUnit,
 };
 
-// 宽度阶段只交付真实候选与尚需完成的工作，最终软行发布由后继组合器拥有。
+// Width preparation reports real candidates and remaining work; the composer
+// alone owns publication of a completed soft line.
 #[cfg(feature = "paged-soft-line-measure")]
 mod markdown_soft_line_measure;
 #[cfg(feature = "paged-soft-line-resolve")]
 mod markdown_soft_line_resolve;
-// 切片只能消费内部真实测量证明；公开Range不授予原字形范围的交付权限。
+// Glyph slices consume actual internal measurement proofs. A public Range does
+// not grant authority to publish glyphs from an unrelated or unfinished run.
 #[cfg(feature = "paged-safe-glyph-slices")]
 mod markdown_safe_glyph_slice;
 #[cfg(feature = "paged-safe-glyph-slices")]
@@ -181,7 +186,8 @@ pub use markdown_soft_line_resolve::{
     MarkdownEmergencyShapedPrefixBoundary,
 };
 
-// 分块字素仅提供同一冻结源的有限边界；默认Native路径不因该模块存在而切换。
+// Grapheme queries expose bounded facts from the same frozen source. Core does
+// not choose an editor; the plugin's production features select the paged backend.
 #[cfg(feature = "paged-graphemes")]
 mod markdown_graphemes;
 #[cfg(feature = "paged-graphemes")]
@@ -193,7 +199,8 @@ pub use markdown_graphemes::{
     MarkdownGraphemeStorageProfile, MarkdownGraphemeUnit,
 };
 
-// 默认UAX14机会独立opt-in；它不代替字素过滤、词典或Native宽度布局。
+// UAX14 opportunities remain an independent algorithm contract, not a substitute
+// for grapheme admission, dictionary handling, or measured font/layout authority.
 #[cfg(feature = "paged-line-breaks")]
 mod markdown_line_breaks;
 #[cfg(feature = "paged-line-breaks")]
@@ -222,7 +229,8 @@ pub mod markdown_workspace;
 #[path = "markdown_bidi/unicode_data.rs"]
 mod unicode_bidi_data;
 
-// UBA元数据与有界准备协议；公开查询不会创建整段String、字形或另一个文档模型。
+// Bidi queries prepare bounded metadata without creating a paragraph-sized
+// String, glyph array, or another canonical document model.
 #[cfg(feature = "native-markdown-candidate")]
 pub use markdown_bidi::{
     BidiBaseDirection, BidiError, BidiMemoryBudget, MarkdownBidiCancellation,
@@ -237,11 +245,11 @@ pub use markdown_workspace::{
     MarkdownSearchAuthority, MarkdownSearchCursor, MarkdownSearchPage, MarkdownSearchResult,
     MarkdownSessionAccess, MarkdownWorkspace, MarkdownWorkspaceEntryKind, MarkdownWorkspaceError,
     MarkdownWorkspacePage, MarkdownWorkspacePageAuthority, MarkdownWorkspacePageProgress,
-    MarkdownWorkspacePager, MarkdownWorkspaceSnapshot, OpenMarkdownNote,
-    compare_markdown_workspace_entries,
+    MarkdownWorkspacePager, MarkdownWorkspaceSnapshot, compare_markdown_workspace_entries,
 };
 
-// 原生适配层从crate根命名同一组恢复类型；该导出不建立第二协议或另一份实现。
+// Native adapters name the same recovery contracts through the crate root;
+// re-exporting them does not create another protocol or implementation.
 #[cfg(feature = "native-markdown-candidate")]
 pub use markdown_workspace::{
     MarkdownRecoveryHandoff, MarkdownRecoveryPreparation, MarkdownRecoveryRecording,
@@ -263,7 +271,8 @@ pub use markdown_document_buffer::{
     MaterializedMarkdownViewport,
 };
 
-// 有限来源与 Root Plain/Leaf 的 opt-in 出口不切换默认 Native；Pending 不能取得任何 Ready 权限。
+// Production consumers use the same bounded Root Plain/Leaf source contracts.
+// Feature exposure does not grant Pending work any authority reserved for Ready.
 #[cfg(all(feature = "s2-table-window-prototype", feature = "paged-line-compose"))]
 pub use markdown_document_buffer::MarkdownSelectionStyleInvariant;
 #[cfg(feature = "s2-table-window-prototype")]
@@ -277,7 +286,8 @@ pub use markdown_document_buffer::{
     VerifiedMarkdownRootLeafViewport, VerifiedMarkdownViewportSources,
 };
 
-// 单格草稿只公开独立权限、有限读取和提交收据；不把未提交候选冒充canonical Source。
+// Cell drafts expose separate authority, bounded reads, and commit receipts;
+// an unpublished candidate must never masquerade as the canonical Source.
 #[cfg(feature = "s2-table-window-prototype")]
 pub use markdown_document_buffer::{
     MARKDOWN_CELL_DRAFT_COMMIT_UTF16_UNITS, MARKDOWN_CELL_DRAFT_MAX_DELTA_BYTES, MarkdownCellDraft,

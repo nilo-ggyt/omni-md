@@ -10,13 +10,14 @@ pub(super) fn execute_native_markdown_file_mutation(
     expected_revision: Option<&str>,
 ) -> Result<NativeMarkdownFileMutationResult, String> {
     match mutation {
-        // Exclusive creation returns the new confined note identity for subsequent navigation.
+        // Creation returns only the confined mutation receipt; navigation opens the
+        // paged document separately instead of receiving a second owned text model.
         NativeMarkdownFileMutation::CreateNote {
             parent_directory,
             title,
         } => session
             .create_note(parent_directory, title)
-            .map(|created| NativeMarkdownFileMutationResult::NoteCreated(created.relative_path))
+            .map(|receipt| NativeMarkdownFileMutationResult::NoteCreated(receipt.relative_path))
             .map_err(|error| error.to_string()),
         // Directory creation validates its relative parent/name without allocating any note body.
         NativeMarkdownFileMutation::CreateDirectory {

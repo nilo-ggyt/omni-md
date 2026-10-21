@@ -19,6 +19,7 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 
+#[cfg(test)]
 use memmap2::{Mmap, MmapOptions};
 use thiserror::Error;
 
@@ -43,12 +44,13 @@ pub(crate) enum SnapshotError {
 /// The caller rechecks its source descriptor and path identity before publishing derived results.
 /// Cancellation is observed before acquisition and between fallback-copy chunks. Kernel clone,
 /// read, and write calls are synchronous; cancellation cannot interrupt a blocked filesystem call.
+#[cfg(test)]
 pub(crate) fn snapshot_file(
     source: &File,
     expected_bytes: u64,
     is_current: impl Fn() -> bool,
 ) -> Result<Option<Mmap>, SnapshotError> {
-    // Production always attempts the clone fast path; tests can independently force streaming below.
+    // Safety regressions exercise clone-first acquisition; production consumes the bounded backing API.
     snapshot_file_inner(source, expected_bytes, &is_current, true, None)
 }
 
@@ -249,17 +251,6 @@ impl SnapshotDirectory {
         })
     }
 
-    /// Freeze one source in this operation's namespace; returned maps never retain names or descriptors.
-    pub(crate) fn capture(
-        &mut self,
-        source: &File,
-        expected_bytes: u64,
-        is_current: &impl Fn() -> bool,
-    ) -> Result<Option<Mmap>, SnapshotError> {
-        // Exclusive access serializes the fixed private clone name while maps remain independently owned.
-        self.capture_with_strategy(source, expected_bytes, is_current, true)
-    }
-
     /// 同一查询目录内取得受控映射；取消、clone、fallback和身份验证沿原factory。
     pub(crate) fn capture_backing(
         &mut self,
@@ -291,7 +282,8 @@ impl SnapshotDirectory {
             })
     }
 
-    /// Capture with an explicit strategy only so tests can force the unsupported-filesystem fallback.
+    /// Map a finite safety-regression fixture; production never exposes a whole-document slice.
+    #[cfg(test)]
     fn capture_with_strategy(
         &mut self,
         source: &File,
@@ -322,7 +314,7 @@ impl SnapshotDirectory {
         Ok(Some(mapping))
     }
 
-    /// 只取得已冻结的匿名只读inode，供有界canonical映射和旧全片映射各自拥有VM生命周期。
+    /// Acquire the frozen unnamed inode; each consumer separately owns its bounded mapping lifetime.
     fn acquire_with_strategy(
         &mut self,
         source: &File,
@@ -371,6 +363,7 @@ impl SnapshotDirectory {
 }
 
 /// Own the complete private namespace for one standalone capture or forced-strategy regression.
+#[cfg(test)]
 fn snapshot_file_inner(
     source: &File,
     expected_bytes: u64,

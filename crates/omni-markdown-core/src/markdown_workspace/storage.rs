@@ -1,7 +1,7 @@
-//! 工作区有限冻结读取、原子保存检查与旧兼容草稿；旧全片入口等待其调用方逐项迁移。
+//! Bounded frozen workspace reads, atomic persistence, and historical recovery record validation.
 
 use super::*;
-use crate::immutable_snapshot::{SnapshotDirectory, SnapshotError, snapshot_file};
+use crate::immutable_snapshot::{SnapshotDirectory, SnapshotError};
 
 mod bounded_text;
 pub(super) use bounded_text::BoundedMarkdownText;
@@ -129,182 +129,6 @@ pub(super) fn inspect_bounded_markdown<T>(
     })
 }
 
-/// Compute legacy open-note character and line metrics without a normalized document copy.
-pub(super) fn markdown_open_metrics(text: &str) -> MarkdownOpenMetrics {
-    let bytes = text.as_bytes();
-    let mut character_count = 0usize;
-    let mut line_count = 1usize;
-    let mut saw_carriage_return = false;
-    let mut saw_crlf = false;
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        // Count one scalar per UTF-8 leading byte and merge the two bytes of CRLF into one visible character.
-        let byte = bytes[index];
-        if byte == b'\r' {
-            // A CR starts one logical line break and needs lookahead for a paired LF.
-            character_count += 1;
-            line_count += 1;
-            saw_carriage_return = true;
-            if bytes.get(index + 1) == Some(&b'\n') {
-                // A paired LF belongs to the same line break and character as this CR.
-                saw_crlf = true;
-                index += 2;
-            } else {
-                // A standalone CR consumes only its own byte.
-                index += 1;
-            }
-            continue;
-        }
-
-        if byte & 0b1100_0000 != 0b1000_0000 {
-            // Continuation bytes do not begin another Unicode scalar.
-            character_count += 1;
-        }
-        if byte == b'\n' {
-            // Only an LF not already consumed by CRLF creates another logical line.
-            line_count += 1;
-        }
-        index += 1;
-    }
-
-    let line_separator = if saw_crlf {
-        // Prefer CRLF when any such pair exists, preserving the established mixed-ending behavior.
-        "\r\n"
-    } else if saw_carriage_return {
-        // Otherwise an observed CR selects the carriage-return preference.
-        "\r"
-    } else {
-        // LF is the default for LF-only text and documents without line breaks.
-        "\n"
-    };
-    MarkdownOpenMetrics {
-        character_count,
-        line_count,
-        line_separator,
-    }
-}
-
-/// Pair caller inspection with a SHA-256 revision under one validated short-lived mapping.
-pub(super) fn inspect_mapped_markdown<T>(
-    path: &Path,
-    maximum_bytes: u64,
-    inspect: impl FnOnce(&str) -> T,
-) -> Result<InspectedMarkdown<T>, MarkdownWorkspaceError> {
-    let inspected = inspect_validated_markdown_text(path, maximum_bytes, |text| {
-        // The callback and revision observe the same borrowed bytes before identity revalidation.
-        let revision = revision_for_bytes(text.as_bytes());
-        (inspect(text), revision)
-    })?;
-    let (value, revision) = inspected.value;
-    Ok(InspectedMarkdown {
-        value,
-        revision,
-        byte_count: inspected.byte_count,
-        modified_at_ms: inspected.modified_at_ms,
-    })
-}
-
-/// Lend validated UTF-8 only during one call and reject identity changes before publishing its result.
-pub(super) fn inspect_validated_markdown_text<T>(
-    path: &Path,
-    maximum_bytes: u64,
-    inspect: impl FnOnce(&str) -> T,
-) -> Result<ValidatedMarkdownText<T>, MarkdownWorkspaceError> {
-    // Ordinary explicit reads have no search owner to cancel; all resource cleanup remains local.
-    inspect_validated_markdown_text_cancellable(
-        path,
-        maximum_bytes,
-        || {
-            // Only search supplies an external cancellation predicate.
-            true
-        },
-        inspect,
-        None,
-    )
-}
-
-/// Snapshot a mutable source safely while allowing a closing search owner to stop fallback copying.
-pub(super) fn inspect_validated_markdown_text_cancellable<T>(
-    path: &Path,
-    maximum_bytes: u64,
-    is_current: impl Fn() -> bool,
-    inspect: impl FnOnce(&str) -> T,
-    snapshots: Option<&mut SnapshotDirectory>,
-) -> Result<ValidatedMarkdownText<T>, MarkdownWorkspaceError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| {
-            // Translate a failed filesystem stage into the stable vault-storage error category.
-            MarkdownWorkspaceError::StorageUnavailable
-        })?;
-    let before = file.metadata().map_err(|_| {
-        // Translate a failed filesystem stage into the stable vault-storage error category.
-        MarkdownWorkspaceError::StorageUnavailable
-    })?;
-    if !before.is_file() {
-        // Never let a device, FIFO, or directory enter the source snapshot contract.
-        return Err(MarkdownWorkspaceError::StorageUnavailable);
-    }
-    if before.len() > maximum_bytes {
-        // Reject oversized files before establishing a mapping or invoking the inspection callback.
-        return Err(MarkdownWorkspaceError::DocumentTooLarge);
-    }
-    let identity = FileIdentity::from(&before);
-
-    // Only the distinct unnamed snapshot inode is mapped; source mutation can invalidate the result
-    // through metadata revalidation below but cannot mutate an already borrowed Rust UTF-8 slice.
-    let captured = match snapshots {
-        // A vault search reuses only its empty scratch namespace; every returned mapping owns a distinct inode.
-        Some(directory) => directory.capture(&file, before.len(), &is_current),
-        // Explicit standalone reads own and release their entire namespace within this acquisition.
-        None => snapshot_file(&file, before.len(), &is_current),
-    };
-    let snapshot = captured.map_err(|error| {
-        // Preserve expected cancellation and changed-source semantics at the workspace boundary.
-        match error {
-            // A truncated or grown source cannot satisfy this inspection's captured baseline.
-            SnapshotError::SourceChanged => MarkdownWorkspaceError::DocumentChangedDuringRead,
-            // The caller will discard superseded search results after all local resources have dropped.
-            SnapshotError::Cancelled => MarkdownWorkspaceError::SearchSuperseded,
-            // Filesystem acquisition errors remain explicit storage failures.
-            SnapshotError::Storage(_) => MarkdownWorkspaceError::StorageUnavailable,
-        }
-    })?;
-    let text = std::str::from_utf8(snapshot.as_deref().unwrap_or_default()).map_err(|_| {
-        // Invalid source bytes are rejected only after they are safely frozen in private storage.
-        MarkdownWorkspaceError::InvalidUtf8Document
-    })?;
-    let value = inspect(text);
-    if !is_current() {
-        // A closed search owner needs no further source metadata I/O or stale callback result publication.
-        return Err(MarkdownWorkspaceError::SearchSuperseded);
-    }
-
-    let after = file.metadata().map_err(|_| {
-        // Translate a failed filesystem stage into the stable vault-storage error category.
-        MarkdownWorkspaceError::StorageUnavailable
-    })?;
-    let path_after = fs::symlink_metadata(path).map_err(|_| {
-        // A failed identity recheck cannot establish that inspected or copied source bytes stayed stable.
-        MarkdownWorkspaceError::DocumentChangedDuringRead
-    })?;
-    if path_after.file_type().is_symlink()
-        || FileIdentity::from(&after) != identity
-        || FileIdentity::from(&path_after) != identity
-    {
-        // Concurrent replacement, metadata mutation, or symlink substitution invalidates all derived output.
-        return Err(MarkdownWorkspaceError::DocumentChangedDuringRead);
-    }
-    Ok(ValidatedMarkdownText {
-        value,
-        byte_count: after.len(),
-        modified_at_ms: modified_at_ms(&after),
-    })
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Descriptor and path identity snapshot, including ctime to detect changes beyond file length.
 pub(super) struct FileIdentity {
@@ -332,7 +156,8 @@ impl From<&Metadata> for FileIdentity {
     }
 }
 
-/// Compute the stable lowercase SHA-256 revision for exact persisted UTF-8 bytes.
+/// Compute the exact persisted revision for finite regression fixture bytes.
+#[cfg(test)]
 pub(super) fn revision_for_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut revision = String::with_capacity(digest.len() * 2);
@@ -484,7 +309,8 @@ pub(super) fn validate_conflict_draft_file(
     }
 }
 
-/// Persist the legacy conflict record through an exclusive private temporary file and atomic rename.
+/// Generate the one real historical format for isolated recovery regression fixtures.
+#[cfg(all(test, feature = "native-markdown-candidate"))]
 pub(super) fn write_conflict_draft(
     recovery_directory: &Path,
     relative_path: &str,
@@ -552,83 +378,6 @@ pub(super) fn write_conflict_draft(
     sync_conflict_recovery_directory(recovery_directory)
 }
 
-/// Recover one validated private record and verify its identity after decoding.
-pub(super) fn read_conflict_draft(
-    recovery_directory: &Path,
-    expected_relative_path: &str,
-) -> Result<Option<String>, MarkdownWorkspaceError> {
-    validate_conflict_draft_relative_path(expected_relative_path)?;
-    if !existing_conflict_recovery_directory(recovery_directory)? {
-        // Without a recovery directory there is no draft to load and no reason to create storage.
-        return Ok(None);
-    }
-
-    let path = conflict_draft_path(recovery_directory, expected_relative_path);
-    let path_metadata = match fs::symlink_metadata(&path) {
-        // An existing path is validated for private regular-file ownership below.
-        Ok(metadata) => metadata,
-        // A missing per-note record is a normal no-draft result.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        // Other lookup failures cannot be silently treated as absent unsaved work.
-        Err(_) => return Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-    };
-    validate_conflict_draft_file(&path_metadata)?;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|_| {
-            // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
-            MarkdownWorkspaceError::ConflictDraftCorrupted
-        })?;
-    let before = file.metadata().map_err(|_| {
-        // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
-        MarkdownWorkspaceError::ConflictDraftCorrupted
-    })?;
-    validate_conflict_draft_file(&before)?;
-    let maximum_recovery_bytes = (CONFLICT_DRAFT_HEADER_BYTES + MAX_RECOVERY_RELATIVE_PATH_BYTES)
-        as u64
-        + MAX_DOCUMENT_BYTES;
-    if before.len() < CONFLICT_DRAFT_HEADER_BYTES as u64 || before.len() > maximum_recovery_bytes {
-        // Reject impossible record sizes before mapping or trusting encoded lengths.
-        return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
-    }
-    let identity = FileIdentity::from(&before);
-
-    // Recovery files can also be modified by same-user tools. Freeze their bytes before parsing
-    // lengths or lending UTF-8 views; private permissions alone are not an immutable-inode guarantee.
-    let mapping = snapshot_file(&file, before.len(), || {
-        // Explicit recovery loading has no independently cancellable worker owner.
-        true
-    })
-    .map_err(|_| {
-        // A changed extent or unavailable snapshot cannot provide trustworthy unsaved recovery text.
-        MarkdownWorkspaceError::ConflictDraftCorrupted
-    })?;
-    let content = parse_conflict_draft(
-        mapping.as_deref().unwrap_or_default(),
-        expected_relative_path,
-    )?;
-
-    let after = file.metadata().map_err(|_| {
-        // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
-        MarkdownWorkspaceError::ConflictDraftCorrupted
-    })?;
-    let path_after = fs::symlink_metadata(&path).map_err(|_| {
-        // Unreadable, invalidly encoded, or unstable private-record bytes cannot supply recovered unsaved text.
-        MarkdownWorkspaceError::ConflictDraftCorrupted
-    })?;
-    if FileIdentity::from(&after) != identity
-        || FileIdentity::from(&path_after) != identity
-        || path_after.file_type().is_symlink()
-    {
-        // A replacement or mutation during decoding invalidates the recovered content.
-        return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
-    }
-    Ok(Some(content))
-}
-
 /// 固定header只决定合法范围与预算；此函数不借用正文，也不把未固定的源文件声明为不可变。
 pub(super) fn conflict_draft_payload_extent(
     header: &[u8],
@@ -670,64 +419,6 @@ pub(super) fn conflict_draft_payload_extent(
         return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
     }
     Ok(relative_path_end..content_end)
-}
-
-/// 固定record的精确内嵌path必须匹配请求；只返回正文范围，不分配正文String。
-pub(super) fn conflict_draft_payload_range(
-    bytes: &[u8],
-    expected_relative_path: &str,
-) -> Result<std::ops::Range<usize>, MarkdownWorkspaceError> {
-    let payload = conflict_draft_payload_extent(bytes, bytes.len())?;
-    if bytes.get(CONFLICT_DRAFT_HEADER_BYTES..payload.start)
-        != Some(expected_relative_path.as_bytes())
-    {
-        // 请求path本身是合法UTF-8，精确byte相等也验证了存储path编码；文件名哈希不足以代替此检查。
-        return Err(MarkdownWorkspaceError::ConflictDraftCorrupted);
-    }
-    Ok(payload)
-}
-
-/// 仅legacy String接口复制正文；原生恢复使用同一范围验证后直接接immutable mapping。
-pub(super) fn parse_conflict_draft(
-    bytes: &[u8],
-    expected_relative_path: &str,
-) -> Result<String, MarkdownWorkspaceError> {
-    let payload = conflict_draft_payload_range(bytes, expected_relative_path)?;
-    let content = std::str::from_utf8(
-        bytes
-            .get(payload)
-            .ok_or(MarkdownWorkspaceError::ConflictDraftCorrupted)?,
-    )
-    .map_err(|_| {
-        // legacy返回类型要求完整String，但非法UTF-8仍拒绝，不进行lossy修复。
-        MarkdownWorkspaceError::ConflictDraftCorrupted
-    })?;
-    Ok(content.to_owned())
-}
-
-/// Remove only a validated private note record and durably publish the deletion.
-pub(super) fn remove_conflict_draft(
-    recovery_directory: &Path,
-    relative_path: &str,
-) -> Result<(), MarkdownWorkspaceError> {
-    if !existing_conflict_recovery_directory(recovery_directory)? {
-        // Absent recovery storage makes removal an idempotent no-op.
-        return Ok(());
-    }
-    let path = conflict_draft_path(recovery_directory, relative_path);
-    match fs::symlink_metadata(&path) {
-        // Validate the existing record before deleting a path in private recovery storage.
-        Ok(metadata) => validate_conflict_draft_file(&metadata)?,
-        // An already absent record has the desired final state.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        // Other lookup errors must be reported so callers do not assume a draft was cleared.
-        Err(_) => return Err(MarkdownWorkspaceError::ConflictRecoveryUnavailable),
-    }
-    fs::remove_file(path).map_err(|_| {
-        // A failed private-storage stage must keep unsaved recovery persistence visibly unsuccessful.
-        MarkdownWorkspaceError::ConflictRecoveryUnavailable
-    })?;
-    sync_conflict_recovery_directory(recovery_directory)
 }
 
 /// Sync recovery directory metadata with its dedicated user-visible persistence failure.

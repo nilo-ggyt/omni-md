@@ -177,13 +177,13 @@ fn local_mutation_and_replaced_root_revoke_continuation() {
     ));
 }
 
-/// 实际原子保存必须撤销旧排名；未改字节的原生保存不应无故使分页失效。
+/// Actual mmap saves revoke old rankings; saving an unchanged root preserves its current page.
 #[cfg(feature = "native-markdown-candidate")]
 #[test]
-fn native_and_legacy_publications_revoke_old_cursor() {
+fn content_publications_revoke_old_cursor_but_clean_save_preserves_it() {
     let temporary = tempfile::tempdir().unwrap();
     for index in 0..3 {
-        // 标题命中使三种正文均保留在排名中，测试专注提交后的代次变化。
+        // Title matches keep all three notes eligible, so assertions isolate the actual save's authority change.
         fs::write(
             temporary.path().join(format!("needle-{index}.md")),
             "before",
@@ -224,11 +224,20 @@ fn native_and_legacy_publications_revoke_old_cursor() {
         .search_notes_page_cancellable("needle", 13, None, &cancelled)
         .unwrap();
     assert!(pending_last.next.is_none());
-    let original = session.open_note("needle-1.md").unwrap();
-    session
-        .save_note("needle-1.md", "legacy saved", &original.revision)
+    // Open the second note through the same production mmap path; the test no longer depends on
+    // a legacy whole-string editor to revoke an already prepared terminal search page.
+    let mut second_document = session.open_document_buffer("needle-1.md").unwrap();
+    second_document
+        .replace_utf16_range_with_selection(
+            0..6,
+            "second saved",
+            crate::MarkdownTextSelection::caret(0),
+            crate::MarkdownTextSelection::caret(12),
+        )
         .unwrap();
-    // 模拟worker发布后尚未交付的末页；没有next也必须因真实保存撤权而拒绝安装。
+    session.save_document_buffer(&mut second_document).unwrap();
+    // A completed page awaiting delivery still needs revocable authority even without a next
+    // cursor. The real second save must prevent installing results prepared against older bytes.
     assert!(!pending_last.authority.is_current(&session, "needle"));
 }
 

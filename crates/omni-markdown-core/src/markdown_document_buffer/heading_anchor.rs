@@ -273,20 +273,23 @@ impl Slugs {
             let cased = scalar.is_lowercase()
                 || scalar.is_uppercase()
                 || scalar.general_category() == GeneralCategory::TitlecaseLetter;
-            if !ignored {
-                if let Some(pending) = self.pending_sigma.take() {
-                    if !cased {
-                        // 同一量子的Σ尚在固定输出页；旧量子的Σ已在本请求独占候选文件。
-                        // 两个UTF8编码均长2字节，补写不移动任何后继正文或slug，也不借新输出目录。
-                        if pending >= start {
-                            output[(pending - start) as usize + 1] = 0x82;
-                        } else {
-                            self.file()?
-                                .write_all_at("ς".as_bytes(), pending)
-                                .map_err(storage)?;
-                            writes += 2;
-                        }
-                    }
+            // Consume the pending sigma on every non-ignorable successor, including a cased one.
+            // Only a non-cased successor converts it to final sigma; neither path retains a word copy.
+            if !ignored
+                && let Some(pending) = self.pending_sigma.take()
+                && !cased
+            {
+                if pending >= start {
+                    // A sigma from this quantum still occupies its fixed output page. Both UTF-8
+                    // forms use two bytes, so replacing the final byte cannot shift later content.
+                    output[(pending - start) as usize + 1] = 0x82;
+                } else {
+                    // Earlier output is in this query's exclusive candidate file; patch the same
+                    // certified offset without allocating another output namespace or loading its text.
+                    self.file()?
+                        .write_all_at("ς".as_bytes(), pending)
+                        .map_err(storage)?;
+                    writes += 2;
                 }
             }
             // 当前Σ既是前一个待定Σ的真实后继，也可能成为新的待定项；始终只有一个offset。
@@ -788,7 +791,8 @@ impl MarkdownHeadingAnchorRequest {
                     return Err(error);
                 }
                 let footnotes_pending = !footnotes.borrow().is_ready();
-                drop(footnotes);
+                // Parser callbacks and their temporary RefCell borrows have ended. Only this scalar
+                // pending result crosses into the next phase; no footnote body is retained here.
                 if !completed {
                     return Err(Error::UnsupportedInline);
                 }

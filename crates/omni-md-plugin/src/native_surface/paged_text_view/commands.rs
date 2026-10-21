@@ -1,4 +1,4 @@
-//! 系统已解释的编辑selector沿原permit执行；没有全局键、退出动作或新快捷键别名。
+//! Execute Cocoa's interpreted text actions under their original permits, without global keys or new shortcuts.
 
 use objc2::{ClassType, DefinedClass, runtime::Sel, sel};
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSPasteboard, NSPasteboardTypeString};
@@ -15,7 +15,7 @@ use super::{
 use crate::payload_use::PayloadUseGuard;
 
 #[derive(Clone, Copy)]
-/// 指针手势仍只有原槽：单击保caret，双击保首击真实词组种子及原Shift锚点。
+/// The existing gesture slot keeps either a caret or the first word/Shift seed; it never stores source text.
 pub(super) enum DragAnchor {
     Caret {
         anchor_utf16: usize,
@@ -27,7 +27,7 @@ pub(super) enum DragAnchor {
     },
 }
 
-/// 同一Down的有限物理事实；不持系统事件、Native对象或正文，移交时跟随原手势。
+/// Finite physical facts from one down event move with its gesture, without retaining events or native objects.
 #[derive(Clone, Copy)]
 pub(super) struct PointerMotion {
     pub down: objc2_foundation::NSPoint,
@@ -36,13 +36,14 @@ pub(super) struct PointerMotion {
 }
 
 impl DragAnchor {
-    /// 原实际发布状态只给新canonical坐标与代次；词种子必须已经经过同趟sanitizer真实映射。
-    /// 转换不读取Source、不换Input票，分别供真正移交和后继选择收据更新使用。
+    /// Use the actual published generation/coordinates and a word seed mapped by the same sanitizer.
+    /// Handoff and selection adoption share this pure conversion; neither reads Source nor recaptures Input authority.
     fn from_published_selection(
         state: super::NativeMarkdownPagedInputState,
         word_anchor: Option<WordAnchor>,
     ) -> Result<Self> {
         if !state.selection_is_directed {
+            // Multiple unordered ranges do not establish the one anchor/head pair needed by this drag.
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         match word_anchor {
@@ -55,6 +56,7 @@ impl DragAnchor {
                         to_utf16,
                         origin_utf16,
                     } => {
+                        // A mapped word group must remain inside this exact published coordinate domain.
                         if from_utf16 > to_utf16
                             || to_utf16 > state.utf16_len
                             || origin_utf16 < from_utf16
@@ -66,6 +68,7 @@ impl DragAnchor {
                     }
                 };
                 if position > state.utf16_len {
+                    // Reusing the old numeric offset after an edit would attach the gesture to unrelated text.
                     return Err(NativeMarkdownPagedTextViewError::InvalidRange);
                 }
                 Ok(Self::Word {
@@ -82,21 +85,21 @@ impl DragAnchor {
 }
 
 #[derive(Clone)]
-/// 真实child提交后仅为Cocoa仍发往旧view的Drag/Up保留弱目的地；不续旧草稿读取或解释旧事件。
+/// After child commit, forward later Cocoa drag/up callbacks weakly; never reopen its sealed draft or replay an event.
 pub(super) struct CellPointerForward {
     pub(super) parent: std::rc::Weak<objc2::rc::Retained<NativeMarkdownPagedTextView>>,
     pub(super) intent: std::rc::Weak<()>,
 }
 
-/// 原mousedown只记真实命中与弱Scene票；拖动沿原caret选择，mouseup才允许提交一次链接意图。
+/// Mouse-down records a certified hit; dragging remains selection, and only mouse-up may admit one link effect.
 pub(super) struct PressedLink {
     key: super::NativeMarkdownPagedSceneKey,
     part: std::ops::Range<usize>,
     index: usize,
 }
 
-/// 链接跟随只接受明确的 Command 单击；普通点击和选择修饰键始终保留原文字定位语义。
-/// 忽略 Caps Lock 等非手势标志，但 Shift、Option 或 Control 不能被误解释成打开目标。
+/// Only a Command-only click activates links; ordinary clicks and selection modifiers keep text-editing semantics.
+/// Ignore non-gesture flags such as Caps Lock, but never reinterpret Shift, Option, or Control as link activation.
 fn link_activation_modifiers(flags: NSEventModifierFlags) -> bool {
     flags
         & (NSEventModifierFlags::Command
@@ -106,8 +109,9 @@ fn link_activation_modifiers(flags: NSEventModifierFlags) -> bool {
         == NSEventModifierFlags::Command
 }
 
+/// Decode existing Cocoa motion semantics; the boolean distinguishes selection extension from a new caret.
 fn navigation(selector: Sel) -> Option<(Nav, bool)> {
-    // 这些都是既有Cocoa文本语义动作；方向与视觉侧仍须由原Source真实Bidi证明。
+    // Decoding does not calculate a position: the original Source/Bidi geometry must prove direction and side.
     for (normal, extending, action) in [
         (
             sel!(moveBackward:),
@@ -185,7 +189,7 @@ fn navigation(selector: Sel) -> Option<(Nav, bool)> {
             sel!(moveToEndOfParagraphAndModifySelection:),
             Nav::ParagraphEnd,
         ),
-        // 旧正式路径将这两个系统selector映射为相同Paragraph方向，不另造快捷键或算法。
+        // These Cocoa paragraph actions use the same established direction, without a second navigation algorithm.
         (
             sel!(moveParagraphBackward:),
             sel!(moveParagraphBackwardAndModifySelection:),
@@ -214,9 +218,11 @@ fn navigation(selector: Sel) -> Option<(Nav, bool)> {
         ),
     ] {
         if selector == normal {
+            // An ordinary motion collapses or moves selection under the action's existing rules.
             return Some((action, false));
         }
         if selector == extending {
+            // Extension keeps the original anchor; it is not a second independent caret movement.
             return Some((action, true));
         }
     }
@@ -232,6 +238,7 @@ fn navigation(selector: Sel) -> Option<(Nav, bool)> {
     None
 }
 
+/// Translate only supported text-edit selectors; native dispatch never gains authority from an arbitrary Sel.
 fn edit(selector: Sel) -> Option<Edit> {
     for (selector_value, action) in [
         (sel!(deleteBackward:), Edit::DeleteBackward),
@@ -253,7 +260,7 @@ fn edit(selector: Sel) -> Option<Edit> {
     None
 }
 
-/// 只有这两个既有纯滚动action可进typed入口；不把任意Sel强转成Native sender调用。
+/// Admit only the two existing page-scroll actions; never reinterpret an arbitrary Sel as a native sender ABI.
 fn page_scroll(selector: Sel) -> Option<bool> {
     if selector == sel!(scrollPageDown:) {
         Some(true)
@@ -264,7 +271,7 @@ fn page_scroll(selector: Sel) -> Option<bool> {
     }
 }
 
-/// 同一翻译入口同时供typed调用和系统分派识别；已识别动作的运行失败不代表未知selector。
+/// Typed and native dispatch share recognition; a recognized action's runtime failure is not an unknown selector.
 pub(super) fn recognizes_selector(selector: Sel) -> bool {
     navigation(selector).is_some()
         || edit(selector).is_some()
@@ -284,40 +291,45 @@ pub(super) fn recognizes_selector(selector: Sel) -> bool {
 }
 
 impl NativeMarkdownPagedTextView {
-    /// typed入口供原菜单/控制器复用；未知selector明确拒绝，只有原Native入口有action转发权限。
+    /// Reuse the original menu/controller action without granting the native forwarding ABI to safe Rust callers.
     pub fn command(&self, selector: Sel) -> Result<()> {
         self.command_internal(selector, false)
     }
 
-    /// 只有NSTextInputContext的原doCommand或队首菜单进入此解释入口；公开命令始终先过屏障。
+    /// Only the original input-context command or admitted queue-head action uses this interpreted entry.
+    /// Public commands still enter through the pending-input barrier before changing the canonical document.
     pub(super) fn command_from_input_context(&self, selector: Sel) -> Result<()> {
         self.command_internal(selector, true)
     }
 
+    /// Route one action through its original input owner, then publish its exact commit or explicit refusal.
     fn command_internal(&self, selector: Sel, from_input_context: bool) -> Result<()> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         self.cancel_cell_pointer_intent();
-        self.cancel_link_intent(); // 菜单或已解释按键都排在原click之后，旧外部激活不能越过它。
+        self.cancel_link_intent(); // New keyboard/menu work supersedes an older click before it can open an external target.
         if !recognizes_selector(selector) {
             return Err(NativeMarkdownPagedTextViewError::UnsupportedCommand);
         }
+        // Only the outer callback of the key currently being interpreted may use that key's completion chain.
         let mut origin = self.origin()?;
         origin.interpreted = from_input_context
             && self.ivars().interpreting_key.get()
             && self.ivars().input_callback_depth.get() == 1;
         let current = |epoch| epoch == origin.epoch && origin.current(self);
         if !from_input_context && origin.delegate.has_native_input_barrier() {
+            // Queue behind already admitted input using this permit; never execute against a stale caret.
             let permit = origin.input.capture(origin.epoch, &current)?;
             if !origin.delegate.defer_native_command(selector, &permit)? {
-                return Err(NativeMarkdownPagedTextViewError::Revoked); // 原屏障已失权，不能捕后继状态续权。
+                return Err(NativeMarkdownPagedTextViewError::Revoked); // A rejected original barrier cannot borrow successor input.
             }
             return Ok(());
         }
         if let Some(down) = page_scroll(selector) {
             let request = self.scene_request(&origin)?;
-            return origin.delegate.scroll_page(&request, down); // 只接纳原滚动意图，不改Input/目标列，也不重放未知action。
+            return origin.delegate.scroll_page(&request, down); // Scrolling admits this intent without editing Input or a goal column.
         }
         if selector == sel!(undo:) || selector == sel!(redo:) {
+            // History is a canonical transaction, not native text replacement or replay of a previous key.
             let permit = origin.input.capture(origin.epoch, &current)?;
             let direction = if selector == sel!(undo:) {
                 NativeMarkdownPagedInputHistory::Undo
@@ -328,6 +340,7 @@ impl NativeMarkdownPagedTextView {
             return self.finish_edit_outcome(&origin, outcome);
         }
         if selector == sel!(selectAll:) {
+            // Canonical length authorizes the selection; selecting everything does not require laying it all out.
             let permit = origin.input.capture(origin.epoch, &current)?;
             let outcome = origin.input.set_selection_intent(
                 &permit,
@@ -339,9 +352,10 @@ impl NativeMarkdownPagedTextView {
                 None,
                 &current,
             )?;
-            return self.finish_outcome(&origin, outcome); // 全选只用canonical长度，不为了选择而layout全文。
+            return self.finish_outcome(&origin, outcome); // Publish selection only; no whole-document layout or text copy.
         }
         if selector == sel!(copy:) || selector == sel!(cut:) {
+            // The bounded output producer must finish first. Failed or reentrant clipboard work cannot delete text.
             let permit = origin.input.capture(origin.epoch, &current)?;
             let request = self.scene_request(&origin)?;
             origin.delegate.copy_selection(&request)?;
@@ -349,18 +363,18 @@ impl NativeMarkdownPagedTextView {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
             if selector == sel!(cut:) {
-                // 剪贴板已完整成功后才删真实全部选择；不能只删主范围或跨过未选择的正文。
+                // Only a complete clipboard result permits deleting all selected ranges, never just the primary range.
                 let outcome = origin.input.delete_selected_ranges(&permit, &current)?;
                 return self.finish_edit_outcome(&origin, outcome);
             }
-            return Ok(()); // 只复制不制造Core事务；实际剪贴板生产者须完整成功才返回。
+            return Ok(()); // Copy alone creates no Core edit; the actual clipboard producer already completed.
         }
         if selector == sel!(paste:) || selector == sel!(pasteAsPlainText:) {
             let permit = origin.input.capture(origin.epoch, &current)?;
             let pasteboard = origin.step(self, NSPasteboard::generalPasteboard)?;
             if selector == sel!(paste:) && !origin.input.is_cell() {
-                // 正文维持文件优先；单元格只接收剪贴板文字，不能因同时存在文件URL而误入附件事务。
-                // 文件I/O延到同一Word队首，不能阻塞Native粘贴回调。
+                // Body paste keeps file precedence; a cell accepts text and must not accidentally import attachments.
+                // File IO waits in the existing input queue instead of blocking this native paste callback.
                 let paths = origin.step(self, || {
                     crate::native_surface::workspace_actions::native_markdown_pasteboard_file_paths(&pasteboard)
                 })?.map_err(NativeMarkdownPagedTextViewError::AttachmentImport)?;
@@ -370,7 +384,7 @@ impl NativeMarkdownPagedTextView {
             }
             let text = origin
                 .step(self, || {
-                    // SAFETY: 框架公开字符串类型常量在进程生命周期有效，不访问用户正文。
+                    // SAFETY: the public framework type constant lives for the process; reading it accesses no document.
                     pasteboard.stringForType(unsafe { NSPasteboardTypeString })
                 })?
                 .ok_or(NativeMarkdownPagedTextViewError::ClipboardUnavailable)?;
@@ -378,7 +392,7 @@ impl NativeMarkdownPagedTextView {
                 origin
                     .input
                     .insert_native_isolated(&permit, &text, not_found(), &current)?;
-            return self.finish_edit_commit(&origin, commit); // 新增剪贴板文字仍走原有限输入转换/事务上限。
+            return self.finish_edit_commit(&origin, commit); // Pasted text uses the existing bounded input conversion and transaction limit.
         }
         if selector == sel!(cancelOperation:) && origin.state.marked.is_some() {
             let context = self
@@ -387,8 +401,8 @@ impl NativeMarkdownPagedTextView {
                 .borrow()
                 .clone()
                 .ok_or(NativeMarkdownPagedTextViewError::ContextUnavailable)?;
-            // 保原Esc接受已显示组合的交互，只结束该客户的系统转换，不扩为取消正文/退出格。
-            // 协议unmarkText自身仍仅local-unmark；这里是业务命令，不能留下旧IME缓冲继续提交。
+            // Preserve Escape's existing composition-acceptance behavior; it neither cancels the document nor exits a cell.
+            // This explicit command finishes the original system context, unlike protocol-only local unmarkText.
             return self.finish_composition_in_context(
                 &origin.input,
                 &origin.delegate,
@@ -397,6 +411,7 @@ impl NativeMarkdownPagedTextView {
             );
         }
         if origin.input.is_cell() {
+            // These existing cell actions own focus/commit handoff; do not insert body tabs or newlines afterward.
             use super::NativeMarkdownPagedCellAction as CellAction;
             let action = if selector == sel!(cancelOperation:) {
                 Some(CellAction::Cancel)
@@ -410,7 +425,7 @@ impl NativeMarkdownPagedTextView {
             };
             if let Some(action) = action {
                 let permit = origin.input.capture(origin.epoch, &current)?;
-                // 合法客户动作可结束原Input；成功后不以旧origin强迫恢复，也不重放为字符输入。
+                // A valid cell action may end this Input; do not restore its old origin or replay it as text.
                 return origin.delegate.cell_action(action, permit);
             }
         }
@@ -423,9 +438,9 @@ impl NativeMarkdownPagedTextView {
                 .delegate
                 .defer_grapheme_delete(selector == sel!(deleteForward:), &permit)?
             {
-                return Ok(()); // 原移动尚未完成，不能按旧caret删除并取消此前已接纳的选择意图。
+                return Ok(()); // Pending movement must establish its caret before deletion, preserving admitted input order.
             }
-        } // 输入法标记仍走同步原NSTextInputClient协议，不将系统候选排入异步字符队列。
+        } // Marked input stays in the synchronous NSTextInputClient protocol, outside the ordinary character queue.
 
         if selector == sel!(delete:) {
             let permit = origin.input.capture(origin.epoch, &current)?;
@@ -458,7 +473,7 @@ impl NativeMarkdownPagedTextView {
                 Nav::WordLeft => NativeMarkdownPagedWordMotion::Left,
                 Nav::WordRight => NativeMarkdownPagedWordMotion::Right,
                 _ => unreachable!("这个分支只解释原四种 Word selector"),
-            }; // 跨原队列保留四向含义；RTL 的屏幕左右不能在传输层丢失后再由 Core 猜回。
+            }; // Preserve all four directions; Core cannot reconstruct visual RTL motion after the transport discards it.
             return origin.delegate.move_word(&request, motion, extend, permit);
         }
         if navigation(selector) == Some((Nav::SelectWord, false)) && origin.state.marked.is_none() {
@@ -478,8 +493,8 @@ impl NativeMarkdownPagedTextView {
                 },
                 None,
                 permit,
-            ); // 与原groupAt默认右侧相同；BOF/硬行首尾由原GCB决定，不预先layout整词。
-        } // marked仍交原系统组合路径，不结束组合或把provisional字符当可查询正文。
+            ); // Match the existing right-biased word lookup; Core GCBs prove BOF and hard-line boundaries.
+        } // Marked/provisional text remains with the system IME, not an ordinary source-word lookup.
         if matches!(
             edit(selector),
             Some(Edit::DeleteWordBackward | Edit::DeleteWordForward)
@@ -488,33 +503,33 @@ impl NativeMarkdownPagedTextView {
             let permit = origin.input.capture(origin.epoch, &current)?;
             let ranges = origin.input.selected_ranges(&permit, &current)?;
             if ranges.len() > 1 && ranges.iter().all(|range| !range.is_empty()) {
-                // 已知实际选择直接删除全部范围；不因Word selector重算或扩大用户已选内容。
+                // A complete nonempty selection is already explicit: delete it without expanding it to word boundaries.
                 let outcome = origin.input.delete_selected_ranges(&permit, &current)?;
                 return self.finish_edit_outcome(&origin, outcome);
             }
             if ranges.len() > 1 {
                 return Err(super::NativeMarkdownPagedInputError::SelectionGeometryRequired.into());
-            } // 混合空caret尚无整体词组计划，明确失败，不能只删其中主范围。
+            } // Mixed carets need one complete word plan; deleting only the primary range would lose user intent.
             let request = self.scene_request(&origin)?;
             return origin.delegate.delete_word(
                 &request,
                 edit(selector) == Some(Edit::DeleteWordForward),
                 permit,
-            ); // Body和Cell都交同一个原producer，不要求当前已具备LineReady。
-        } // marked仍走原组合输入/Scene处理，不读取provisional正文或擅自结束IME。
+            ); // Body and cell use their existing producer, without requiring a ready line at admission.
+        } // Marked input retains its own composition path; this branch cannot read provisional text or finish IME.
         if (selector == sel!(deleteBackward:) || selector == sel!(deleteForward:))
             && (origin.state.selection_range_count > 1 || origin.state.primary_range.length != 0)
         {
-            // 唯一空caret没有选中字节，直接交下方原命令票；完整非空/多选才需要读取范围集合。
+            // A single empty caret needs no selected-range read; only an actual selection enters this path.
             let permit = origin.input.capture(origin.epoch, &current)?;
             let ranges = origin.input.selected_ranges(&permit, &current)?;
             if ranges.iter().all(|range| !range.is_empty()) {
-                // 已知完整选择的删除不依赖命中/行几何；尚无scene也不能丢掉已解释的确定输入。
+                // Explicit selected ranges need no hit/line geometry, so pending layout cannot discard this deletion.
                 let outcome = origin.input.delete_selected_ranges(&permit, &current)?;
                 return self.finish_edit_outcome(&origin, outcome);
             }
             if ranges.len() > 1 {
-                // 混合caret需要每个真实GCB及整体计划；单replacement不能冒充多目标删除。
+                // Mixed carets require every GCB and one complete plan; one replacement cannot stand in for all targets.
                 return Err(super::NativeMarkdownPagedInputError::SelectionGeometryRequired.into());
             }
         }
@@ -525,17 +540,17 @@ impl NativeMarkdownPagedTextView {
                 Some(Edit::InsertTab) => Some(MarkdownEditingCommand::IndentMore),
                 Some(Edit::InsertBacktab) => Some(MarkdownEditingCommand::IndentLess),
                 Some(Edit::DeleteBackward) => Some(MarkdownEditingCommand::DeleteMarkupBackward),
-                _ => None, // 其余位置命令继续消费下方原Scene，不复制导航/删除算法。
+                _ => None, // Other position-dependent commands continue through the original Scene below.
             };
             if let Some(command) = source_command {
                 if command != MarkdownEditingCommand::DeleteMarkupBackward {
                     let permit = origin.input.capture(origin.epoch, &current)?;
                     if origin.delegate.defer_source_command(command, &permit)? {
-                        return Ok(()); // 等前一步真实选择后再解释原语义，不能在旧caret续行并取消已接纳移动。
+                        return Ok(()); // Interpret after the earlier selection commits, not against the superseded caret.
                     }
-                } // Backspace已由上方完整GCB队列保序，marked与Cell从未进入这段Source入口。
-                // Return/缩进不需要排版。Backspace只预取同Key的普通GCB计划；未Ready不能阻止
-                // 已适用的Core标记删除，但源/权限等真实错误不能被标记规则掩盖。
+                } // Backspace already uses the GCB queue above; cells and marked input never enter this source-edit path.
+                // Newline/indentation need no layout. Backspace may borrow a same-key ordinary GCB plan;
+                // missing geometry cannot suppress applicable markup deletion, but real Source/authority errors must survive.
                 let backward_scene = if command == MarkdownEditingCommand::DeleteMarkupBackward {
                     match self.scene() {
                         Ok(scene) => Some(scene),
@@ -579,12 +594,12 @@ impl NativeMarkdownPagedTextView {
                 return match outcome {
                     Some(outcome) => self.finish_edit_outcome(&origin, outcome),
                     None => match ordinary {
-                        Err(cause) => Err(cause), // 未处理且无GCB须报告原Pending/范围错误，不能假称成功。
+                        Err(cause) => Err(cause), // No markup rule or GCB plan handled it: preserve Pending/range failure.
                         Ok(_) => Err(NativeMarkdownPagedTextViewError::InvalidRange),
                     },
                 };
             }
-        } // marked与Cell仍沿原输入/客户动作分支，不能在此擅自结束组合或插入正文Tab。
+        } // Cell and marked input keep their own actions; this path cannot finish composition or insert a body tab.
 
         if let Some((action @ (Nav::DocumentStart | Nav::DocumentEnd), extend)) =
             navigation(selector)
@@ -597,10 +612,10 @@ impl NativeMarkdownPagedTextView {
                     &permit,
                 )?
             {
-                return Ok(()); // 先前已接纳文字和移动必须先完成，不能拿旧anchor/长度立即接管原链。
+                return Ok(()); // Previously admitted input must finish before this command uses its resulting anchor/length.
             }
-            // 真正的端点已由原Body/Cell局部长度确定，不需要先取得可见scene。非扩选直接
-            // 发布新caret；Find多选的未知主方向不能阻止这次明确意图，也不能拿旧head代替。
+            // The actual body/cell length already proves its endpoints; no visible Scene is needed.
+            // A new caret is explicit even when Find ranges have no primary direction; extension still needs the real anchor.
             let head = if action == Nav::DocumentStart {
                 0
             } else {
@@ -614,7 +629,7 @@ impl NativeMarkdownPagedTextView {
                     .anchor_utf16
             } else {
                 head
-            }; // 扩选仍保留真实anchor，不从多选历史memento猜出一个活动端。
+            }; // Extension preserves the actual anchor, never an inferred multi-selection history endpoint.
             let outcome = origin.input.set_selection_intent(
                 &permit,
                 MarkdownTextSelection {
@@ -627,7 +642,7 @@ impl NativeMarkdownPagedTextView {
             )?;
             return match outcome {
                 NativeMarkdownPagedInputOutcome::Committed(commit) => {
-                    self.finish_owned_commit(&origin, commit, true) // 同一原收据显示；解释中不会取消后继event。
+                    self.finish_owned_commit(&origin, commit, true) // Reveal through this exact commit without cancelling later key work.
                 }
                 unchanged => self.finish_outcome(&origin, unchanged),
             };
@@ -642,11 +657,11 @@ impl NativeMarkdownPagedTextView {
                 .delegate
                 .navigate_vertical(&request, action, extend)?
             {
-                return Ok(()); // 原owner已接纳同一意图；离屏时仍未提交选择，不能重放这个系统动作。
+                return Ok(()); // The original owner accepted it; an offscreen pending result is not permission to replay the action.
             }
         }
 
-        // 其他位置动作只消费同一现成scene，不能把尚未Ready的GCB/Bidi结果改成scalar近似。
+        // Remaining position actions require this exact ready Scene; scalar approximations cannot replace pending GCB/Bidi proof.
         if navigation(selector).is_some() || edit(selector).is_some() || selector == sel!(delete:) {
             let scene = self.scene()?;
             if scene.origin.state != origin.state || !origin.current(self) {
@@ -655,7 +670,7 @@ impl NativeMarkdownPagedTextView {
             if let Some((action, extend)) = navigation(selector) {
                 if origin.state.directed_selection().is_none() {
                     return Err(NativeMarkdownPagedTextViewError::Pending);
-                } // 多选没有唯一主方向，不能使用历史memento猜本次移动起点。
+                } // Unordered ranges have no unique active direction; history cannot invent this motion's origin.
                 let current = |epoch| epoch == scene.origin.epoch && scene.current(self);
                 let permit = origin.input.capture(origin.epoch, &current)?;
                 let geometry = scene.scene.navigation_geometry()?;
@@ -667,7 +682,7 @@ impl NativeMarkdownPagedTextView {
                 let stale_goal = goal.is_some_and(|goal| !geometry.permits_goal(goal));
                 let context = NativeMarkdownPagedNavigationContext {
                     geometry: geometry.clone(),
-                    // 布局变化不能继承旧换行侧；原owner也必须在Source/样式变化时清同一槽。
+                    // A layout change invalidates old line affinity; Source/style changes must clear the owner's same slot.
                     head_affinity: if stale_goal {
                         None
                     } else {
@@ -685,7 +700,7 @@ impl NativeMarkdownPagedTextView {
                 let after_geometry = scene.scene.navigation_geometry()?;
                 if !scene.current(self) || !after_geometry.same(&geometry) {
                     return Err(NativeMarkdownPagedTextViewError::Revoked);
-                } // 原计算期间排版变化不能领取新geometry继续签旧目标。
+                } // Layout changed during calculation; new geometry cannot certify an already computed old target.
                 if target.vertical_goal.is_some_and(|goal| {
                     !geometry.permits_goal(goal)
                         || target.head_affinity.is_none()
@@ -697,18 +712,18 @@ impl NativeMarkdownPagedTextView {
                     || (action.preserves_vertical_goal() && target.vertical_goal.is_none())
                 {
                     return Err(NativeMarkdownPagedTextViewError::Pending);
-                } // 原producer尚无真实换行侧/起始列时不先提交一个近似移动。
+                } // Without certified affinity/goal, keep Pending rather than committing an approximate motion.
                 if action.preserves_vertical_goal()
                     && context.vertical_goal.is_some()
                     && target.vertical_goal != context.vertical_goal
                 {
                     return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
-                } // 已有目标列只能沿原事实继续；短行的实际head列不能覆盖它。
+                } // A short line's actual head cannot replace the user's established vertical goal column.
                 if extend && target.selection.anchor_utf16 != origin.state.selection.anchor_utf16 {
                     return Err(NativeMarkdownPagedTextViewError::InvalidRange);
-                } // 扩选只能移动原活动端，不能悄悄替换用户已确定的anchor。
+                } // Extension moves only the active head, never the user's established anchor.
                 let outcome = if let Some(side) = target.bidi_side {
-                    // 真视觉侧与选择在同一原permit内发布；同offset也得到新serial/收据。
+                    // Publish visual side and selection under one permit; equal offsets still receive a new intent serial.
                     origin.input.set_visual_selection_intent(
                         &permit,
                         target.selection,
@@ -720,7 +735,7 @@ impl NativeMarkdownPagedTextView {
                         &current,
                     )?
                 } else {
-                    // 逻辑移动、垂直目标或非空collapse没有旧Bidi侧的继承权。
+                    // Logical/vertical motion and nonempty collapse have no right to inherit an obsolete Bidi side.
                     origin.input.set_selection_intent(
                         &permit,
                         target.selection,
@@ -757,7 +772,7 @@ impl NativeMarkdownPagedTextView {
         Err(NativeMarkdownPagedTextViewError::UnsupportedCommand)
     }
 
-    /// 异步词组范围已消费原permit并提交后，只用同一Commit发送原显示通知；不重签编辑before。
+    /// An asynchronous word delete already consumed its permit; notify display using that commit, not a new before-state.
     pub(in crate::native_surface) fn finish_word_delete_commit(
         &self,
         commit: &super::NativeMarkdownPagedInputCommit,
@@ -778,28 +793,29 @@ impl NativeMarkdownPagedTextView {
                 .map_err(|cause| {
                     NativeMarkdownPagedTextViewError::CommittedEffect(Box::new(cause))
                 })?;
-        } // 只借同一收据，原队列才能在Native通知后继续认证这一实际postcommit。
+        } // The original queue continues validating this same postcommit after native notification returns.
         Ok(())
     }
 
-    /// 只接受系统原action selector，安全Rust入口不能授予任意Sel对象参数调用的ABI权限。
+    /// Forward only the system's original action selector; a safe Rust caller cannot confer an arbitrary Sel's ABI.
     ///
     /// # Safety
-    /// selector必须遵守Cocoa action的单个可选sender对象签名；不能把任意getter/setter送入。
+    /// `selector` must use Cocoa's one-optional-sender action signature, never a getter or setter with another ABI.
     pub(super) unsafe fn forward_native_action(&self, selector: Sel) -> Result<()> {
         let origin = self.origin()?;
-        // SAFETY: 实际主线程view在原同步payload租约内，公开responder getter没有跨Doc借用。
+        // SAFETY: this main-thread view is protected by the synchronous payload lease; no document borrow crosses Native.
         let next = origin.step(self, || unsafe { self.nextResponder() })?;
         if let Some(next) = next {
-            // SAFETY: selector来自系统公开语义入口；同一responder链只尝试原selector一次。
+            // SAFETY: the system supplied this public action signature; try that action once on the existing responder chain.
             origin.step(self, || unsafe {
                 next.tryToPerform_with(selector, Some(self))
             })?;
-        } // CommandF/插件返回等仍由既有控制器处理，本view不注册或改写这些动作。
+        } // Find and return-to-launcher still belong to their controllers, without registering or rewriting shortcuts here.
         Ok(())
     }
 
-    /// 父Body在移焦或读父Scene前把本次实际事件交正在组合的子格；不产生第二个解释队列。
+    /// Let the composing child consume this actual event before the parent changes focus or reads its Scene.
+    /// The system input context remains the sole interpreter; the parent does not enqueue a second copy.
     pub(in crate::native_surface) fn handle_marked_mouse(&self, event: &NSEvent) -> Result<bool> {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let origin = self.origin()?;
@@ -811,11 +827,11 @@ impl NativeMarkdownPagedTextView {
         if !origin.session_current(self, origin.epoch) {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        Ok(true) // IME可以同步改变marked/selection；这次事件已经交付，不再给父正文重放。
+        Ok(true) // IME may synchronously change marked text/selection; this delivered event must not be replayed on the parent.
     }
 
-    /// 父Body只交已解释的真实格点击；子view用本次raw范围转换局部端点，不重播系统事件。
-    /// false只表示原Scene尚未Ready；任何Source/输入/资源错误仍返回，已接纳的词选择不重试。
+    /// Convert an interpreted parent cell hit through this exact raw range, without replaying the native event.
+    /// False means its original Scene is pending; Source/input/resource failures remain errors, not retried word requests.
     pub(in crate::native_surface) fn apply_cell_pointer(
         &self,
         pointer: &super::NativeMarkdownPagedCellPointer,
@@ -825,12 +841,12 @@ impl NativeMarkdownPagedTextView {
         let origin = self.origin()?;
         if !origin.input.is_cell() || origin.state.marked.is_some() {
             return Err(NativeMarkdownPagedTextViewError::Pending);
-        } // 组合输入仍归原InputContext；父点击不能越过候选或借普通Body输入伪装活动格。
-        // 双击只查询已签出的真实 raw/head/侧，不借字形；不能为了等首帧而阻塞原首词组。
-        // 三击仍必须等实际 Scene 的完整段落证明，不能把可见后缀当成整段。
+        } // Composition belongs to its original context; parent clicks cannot bypass candidates or impersonate a cell.
+        // Double-click uses the certified raw head/side, not glyphs, so the first word need not wait for a first frame.
+        // Triple-click still needs the Scene's complete paragraph proof rather than just its visible suffix.
         let request = self.scene_request(&origin)?;
-        // 父端点仍属于原canonical raw格，子输入只接受局部坐标；边界外的Shift由父owner提交后续接。
-        // 不截断端点来“适配”草稿，也不把离屏部分复制成临时字符串。
+        // Parent endpoints belong to the canonical raw cell, while child input accepts local coordinates only.
+        // The parent handles an out-of-cell Shift; never clamp it to the draft or copy offscreen text into a string.
         let local = |position: usize| {
             position
                 .checked_sub(raw_range.start)
@@ -843,8 +859,8 @@ impl NativeMarkdownPagedTextView {
         }
         let head = local(pointer.hit.head_utf16)?;
         let anchor = pointer.anchor.map(local).transpose()?;
-        // 同一Scene/输入代次约束后续一次提交；current可以重入，不能跨Native保Doc或Reader租约。
-        // 原输入许可在词组producer或实际选择中恰好消费一次，失败不会改签同一鼠标事件。
+        // The same Scene/Input generation constrains publication. Current checks may reenter, so hold no document/reader lease.
+        // Either the word producer or selection consumes the original permit once; failure cannot recapture this event.
         let current = |epoch| {
             epoch == origin.epoch
                 && origin.current(self)
@@ -854,8 +870,8 @@ impl NativeMarkdownPagedTextView {
         };
         if pointer.clicks == 2 {
             let permit = origin.input.capture(origin.epoch, &current)?;
-            // 拖词保首击词种子，Shift拖词保原有向anchor；二者由原UBA分别解释，不能混为caret。
-            // 所有坐标都从同一次raw范围换算，跨格端点应已由父owner接管，不能在这里钳到格边。
+            // Word dragging keeps the first word seed; Shift keeps the directed anchor. Original UBA treats them distinctly.
+            // Convert all endpoints through this raw range; the parent must already own any cross-cell endpoint.
             let anchor = pointer
                 .word_anchor
                 .map(|anchor| -> Result<WordAnchor> {
@@ -893,7 +909,7 @@ impl NativeMarkdownPagedTextView {
                 Some(pointer.intent.clone()),
                 permit,
             )?;
-            return Ok(true); // 原CellSource/UBA已接纳同一词请求，等待其结果不再重送本次点击。
+            return Ok(true); // CellSource/UBA admitted this word request; waiting for it does not replay the click.
         }
         let scene = match self.scene() {
             Ok(scene) => scene,
@@ -905,8 +921,8 @@ impl NativeMarkdownPagedTextView {
         }
         let current = |epoch| epoch == scene.origin.epoch && scene.current(self);
         let permit = origin.input.capture(origin.epoch, &current)?;
-        // 单击只交真实命中端点；三击使用子Source已认证段落，软换行不等同于段落边界。
-        // 段落尚未进入当前窗口时保持等待，不能把已显示的后缀当成完整段落。
+        // Single-click uses the actual hit; triple-click uses a source-certified paragraph, not a soft visual line.
+        // A paragraph outside the prepared window remains pending, without treating the displayed suffix as the whole range.
         let target = match pointer.clicks {
             0 | 1 => MarkdownTextSelection {
                 anchor_utf16: anchor.unwrap_or(head),
@@ -922,8 +938,8 @@ impl NativeMarkdownPagedTextView {
             },
             _ => return Err(NativeMarkdownPagedTextViewError::UnsupportedCommand),
         };
-        // 原亲和与本次选择同时发布；之后的预览样式重排不能抹掉本次显式头侧。
-        // 这里只改变选择，不为点按制造正文历史，也不提前宣告文件已保存。
+        // Publish affinity with the selection so later preview reflow preserves its explicit head side.
+        // This changes selection only: it creates no document history and makes no disk-save claim.
         let outcome = origin.input.set_selection_intent(
             &permit,
             target,
@@ -936,12 +952,12 @@ impl NativeMarkdownPagedTextView {
             &current,
         )?;
         self.finish_outcome(&origin, outcome)?;
-        // 不装载子view的drag槽：真实Down仍由原父view拥有，Up后迟到Ready仅完成终点选择。
+        // The parent still owns mouse-down; late readiness after up completes selection without reopening a child drag.
         Ok(true)
     }
 
-    /// 只把已解释的真实格命中交唯一父Body；来源、选择许可与Down寿命在同一同步栈核对。
-    /// 词种子和Shift锚点沿原指针槽读取，Native挂载重入后也不覆盖后继Down/Up。
+    /// Hand one interpreted cell hit to its parent Body with source, selection permit, and down-lifetime checked together.
+    /// Read word/Shift seeds from the existing slot; native mounting cannot overwrite a newer down or an accepted up.
     fn hand_cell_pointer(
         &self,
         scene: &super::SceneUse,
@@ -953,7 +969,7 @@ impl NativeMarkdownPagedTextView {
         let origin = &scene.origin;
         let pointer = self.ivars().drag_anchor.get();
         let word = clicks == 2;
-        // 链接已在上方接管；这里只传本次真实命中及原选择种子，不重播Down或合成坐标。
+        // Link handling already had its chance; this path forwards the real hit/seed, not a replayed down or invented point.
         let anchor = if dragging {
             match pointer {
                 Some(DragAnchor::Caret {
@@ -981,8 +997,8 @@ impl NativeMarkdownPagedTextView {
         } else {
             None
         };
-        // 手势若已发生正文变更就撤旧词种子；Source offset相等也不代表仍是原字符。
-        // Shift种子与词种子保持原角色，交给child或父跨格生产者后再做坐标域转换。
+        // An edit invalidates the old word seed even when its numeric offset is unchanged.
+        // Keep Shift and word roles distinct until the child or cross-cell producer converts their coordinate domain.
         let word_anchor = if word && dragging {
             let Some(DragAnchor::Word { anchor, generation }) = pointer else {
                 unreachable!("原Word手势已确认");
@@ -995,8 +1011,8 @@ impl NativeMarkdownPagedTextView {
         } else {
             anchor.filter(|_| word).map(WordAnchor::Selection)
         };
-        // 只领取当前View这一张手势身份；raw来源随payload同步交付，View不长期保存它。
-        // 下一锚点预先按真实命中准备，委托若拒绝不写入；Native移交完成后还要复核原票。
+        // Claim only this View's gesture; raw source travels with the call, without becoming retained View state.
+        // Prepare the next anchor from the real hit but publish it only after delegate acceptance and original-intent recheck.
         let intent = self.claim_cell_pointer_intent();
         let next_anchor = if word {
             DragAnchor::Word {
@@ -1025,8 +1041,8 @@ impl NativeMarkdownPagedTextView {
         if !scene.current(self) {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
-        // Input许可与Scene同一before；Body如果接纳会取得真正的Row/RequiredRow权限，不能由View造票。
-        // 返回true只表示原owner接手，是否已出现编辑框仍由实际Source/CPU帧通知决定。
+        // Input and Scene share one before-state. Body admission obtains actual Row/RequiredRow authority, not a View-made token.
+        // True means ownership was accepted; only actual Source/CPU publication can establish that an editor is visible.
         let current = |epoch| epoch == scene.origin.epoch && scene.current(self);
         let permit = scene.origin.input.capture(scene.origin.epoch, &current)?;
         if scene
@@ -1034,7 +1050,7 @@ impl NativeMarkdownPagedTextView {
             .delegate
             .cell_pointer(&scene.key.request, cell_pointer, permit)?
         {
-            // Native移交可重入；只有原Down尚未Up且没有后继手势替换时才登记拖选种子。
+            // Native handoff can reenter. Install a seed only if this down still lives and no newer gesture replaced it.
             let owns = self
                 .ivars()
                 .cell_pointer_intent
@@ -1043,20 +1059,21 @@ impl NativeMarkdownPagedTextView {
                 .is_some_and(|active| std::rc::Rc::ptr_eq(active, &intent));
             if !dragging && owns && origin.input.state()?.generation == origin.state.generation {
                 self.ivars().drag_anchor.set(Some(next_anchor));
-            } // 旧格提交可真实换代；此时后继点等Reopen的已映射首查询，不安装旧位置/旧generation。
+            } // Cell commit may change generation; Reopen must map its first query before any later endpoint can use it.
             return Ok(true);
         }
         if !dragging {
             self.cancel_cell_pointer_intent();
-        } // 非Body客户没有活动格owner，继续原普通Source选择，不把未接纳误报成功。
+        } // A non-Body client can decline cell ownership; continue normal Source selection rather than report acceptance.
         Ok(false)
     }
 
+    /// Route a real callback to the one live gesture owner before inspecting any coordinates or input state.
     pub(super) fn mouse(&self, event: &NSEvent, dragging: bool) {
         let forward = self.ivars().cell_pointer_forward.borrow().clone();
         if let Some(forward) = forward {
-            // 这是此后真实到达旧child的新回调，尚未读点/修饰键或解释选择；只交一次当前父view主线。
-            // 新Down不能继承已移交旧手势，关闭view也不再尝试读取已seal的原Input。
+            // Cocoa delivered a later callback to the retired child. Forward it once before reading points/modifiers.
+            // A new down cannot inherit that old handoff, and a closed child cannot read its sealed Input.
             if dragging
                 && let Some(parent) = forward.parent.upgrade()
                 && parent.cell_pointer_is_current(&forward.intent)
@@ -1068,10 +1085,10 @@ impl NativeMarkdownPagedTextView {
             return;
         }
         if self.ivars().closed.get() {
-            return; // 原Up已经结束弱路由，迟到回调只到物理空view，不能再读已归还Input。
+            return; // Up ended the weak route; a late callback to an empty view cannot revive released Input.
         }
-        // 原 Up 已交回槽，或真实转交刚结束而物理拆图还在原主队列中；迟到 Drag 没有新的解释权。
-        // 必须在读取 Origin/已 seal 草稿之前结束，不能依赖后继 close 来遮住这段实际生命周期。
+        // Up or handoff already ended this gesture even if native detachment is still queued.
+        // Stop before reading Origin/a sealed draft; later close cannot retroactively make such access safe.
         if dragging
             && self.ivars().drag_anchor.get().is_none()
             && self.ivars().cell_pointer_intent.borrow().is_none()
@@ -1081,8 +1098,8 @@ impl NativeMarkdownPagedTextView {
         self.handle_pointer(event, dragging);
     }
 
-    /// 原回调只解码一次有限终点；逻辑种子仍来自同一 Down，未命中的初 Down 不猜词范围。
-    /// Up 准入时仍持原 Rc，之后终点由 Body 明确记录，不能靠 Weak 活性区分结束与取消。
+    /// Decode one finite endpoint while retaining the original down's logical seed, never a guessed word group.
+    /// Body records an admitted up explicitly; a dead Weak cannot distinguish completed release from cancellation.
     fn pointer_location(
         &self,
         origin: &super::Origin,
@@ -1158,16 +1175,16 @@ impl NativeMarkdownPagedTextView {
         })
     }
 
-    /// 有限值在同一已 Ready 的真实 Scene 上只解释空间命中与原选择；同步事件和延后终点共用此主线。
-    /// 输入许可仍紧贴实际提交领取，格接纳与正文选择二者只消费一个真实用户动作。
+    /// Interpret finite pointer facts against one ready Scene for both immediate and deferred delivery.
+    /// Capture the permit beside publication so cell admission and body selection cannot consume one action twice.
     fn apply_pointer(
         &self,
         scene: &super::SceneUse,
         pointer: &super::NativeMarkdownPagedPointerLocation,
     ) -> Result<()> {
         if pointer.mouse_up && !pointer.dragging {
-            // 无实际移动的Up只结束已接纳Down。选择会激活quote/inline源码标记并改变真实几何，
-            // 若再命中原屏幕点，会把原caret错误变成邻字选区；首Down仍由原续体完整完成。
+            // A stationary up only ends its admitted down. Selection can expose quote/inline markup and change geometry;
+            // re-hitting that screen point would incorrectly select a neighbor. The down's original continuation still finishes.
             return Ok(());
         }
         let local = scene.step(self, || {
@@ -1184,7 +1201,7 @@ impl NativeMarkdownPagedTextView {
             point
         } else {
             local
-        }; // 真实拖选用已准备行，普通点击仍保持精确命中；物理点仍由原槽保存。
+        }; // Dragging uses prepared lines, while ordinary clicks keep exact hits and the slot keeps the physical point.
         let current = |epoch| epoch == scene.origin.epoch && scene.current(self);
         use super::NativeMarkdownPagedCellDragAnchor as Anchor;
         if pointer.clicks == 2 || matches!(pointer.anchor, Some(Anchor::Word(_))) {
@@ -1221,7 +1238,7 @@ impl NativeMarkdownPagedTextView {
                 {
                     self.ivars().drag_anchor.set(Some(next_anchor));
                 }
-                return Ok(()); // 真正挂载或跨格提交由同一个父 owner 完成，不再落入旧 Scene。
+                return Ok(()); // The same parent now owns mounting/cross-cell commit; never fall through to the old Scene.
             }
         }
         let (target, affinity) =
@@ -1257,11 +1274,11 @@ impl NativeMarkdownPagedTextView {
                 anchor_utf16: target.anchor_utf16,
                 generation: scene.origin.state.generation,
             }));
-        } // 已接纳 Up 只完成终点；不能凭异步完成重新装回拖动槽。
+        } // An admitted up completes its endpoint; asynchronous readiness cannot reinstall an ended drag.
         Ok(())
     }
 
-    /// 同步和延后 Word 共用实际 Scene 命中；首组只来自原生产者，目标不得重建旧首词。
+    /// Immediate and deferred word gestures share actual Scene hits; only the original producer establishes the first group.
     fn apply_word_pointer(
         &self,
         scene: &super::SceneUse,
@@ -1349,8 +1366,8 @@ impl NativeMarkdownPagedTextView {
         Ok(())
     }
 
-    /// 唯一 Body 续体在真实 Scene 发布后调用；没有保存或重送 Native 事件，也不另起命中生产者。
-    /// false 只说明原窗口尚未 Ready；新输入/坐标域或几何改变必须撤销，不能给旧终点补签。
+    /// The existing Body continuation runs after real Scene publication, without retaining/reposting a native event.
+    /// False means the original window is pending; changed Input or geometry revokes, never recertifies, an old endpoint.
     pub(in crate::native_surface) fn apply_deferred_pointer(
         &self,
         request: &super::NativeMarkdownPagedSceneRequest,
@@ -1360,7 +1377,7 @@ impl NativeMarkdownPagedTextView {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let original_up = accepted_up.is_some_and(|terminal| {
             terminal.mouse_up && std::rc::Weak::ptr_eq(&terminal.intent, &pointer.intent)
-        }); // 只消费原Body槽真实接纳的终点；首Down仍保持原角色，不从Weak死亡猜终止原因。
+        }); // Only the Body's admitted terminal endpoint can complete a down; Weak death alone is not completion evidence.
         if !pointer.mouse_up && !original_up && !self.cell_pointer_is_current(&pointer.intent) {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
@@ -1376,7 +1393,7 @@ impl NativeMarkdownPagedTextView {
         Ok(true)
     }
 
-    /// 子格越界只交本次已解码终点；来源域仍是该 child request，父亲不能把局部种子当 canonical。
+    /// Forward only this decoded out-of-cell endpoint; its child-local seed must not be mistaken for canonical coordinates.
     pub(super) fn hand_child_pointer(
         &self,
         origin: &super::Origin,
@@ -1407,7 +1424,7 @@ impl NativeMarkdownPagedTextView {
             .drag_cell_pointer_outside(&request, pointer.clone(), permit)
     }
 
-    /// Scene 尚未 Ready 时，原 permit 与已解码终点一起交给已有 Body 槽；拒绝后保持真实 Pending。
+    /// Hand the original permit and decoded endpoint to the existing Body slot; refusal preserves genuine Pending.
     pub(super) fn defer_pointer_location(
         &self,
         origin: &super::Origin,
@@ -1423,6 +1440,7 @@ impl NativeMarkdownPagedTextView {
         }
     }
 
+    /// Interpret one real down/drag under the original gesture, with marked input taking precedence over text hit-testing.
     fn handle_pointer(&self, event: &NSEvent, dragging: bool) {
         let drag_intent = dragging
             .then(|| {
@@ -1432,20 +1450,20 @@ impl NativeMarkdownPagedTextView {
                     .as_ref()
                     .map(std::rc::Rc::downgrade)
             })
-            .flatten(); // 任何Native getter之前抓原Down，后续期限不能借重入新Down补签旧事件。
+            .flatten(); // Capture the down before Native getters can reenter; a newer down cannot authorize this callback.
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
         let draining_reopen = !dragging && self.cancel_cell_pointer_intent();
-        self.cancel_link_intent(); // 后继按下或开始拖动即撤链接权限，但原Caret/Word拖选锚点继续归同一指针槽。
+        self.cancel_link_intent(); // New down or dragging retires link activation, while the same pointer slot owns caret/word selection.
         let result = (|| {
             let origin = self.origin()?;
             if origin.delegate.handle_cell_marked_mouse(event)? {
-                return Ok(()); // 活动格候选先消费原事件；父view尚未移焦、取Scene或提交草稿。
+                return Ok(()); // The composing cell consumed the event before parent focus, Scene lookup, or draft commit.
             }
             if !origin.current(self) {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
             if origin.state.marked.is_some() {
-                // IME拥有组合期间的鼠标；不在它提交后给同一个旧点击补签较新的scene。
+                // IME owns mouse delivery during composition; a resulting commit cannot recertify this old click on a newer Scene.
                 let (_, context) = self.foreground_context()?;
                 context.0.handleEvent(event);
                 if !origin.session_current(self, origin.epoch) {
@@ -1459,7 +1477,7 @@ impl NativeMarkdownPagedTextView {
             }
             if dragging {
                 if let Some(mut motion) = self.ivars().pointer_motion.get() {
-                    motion.dragged = true; // 真实Drag回调是移动事实，不能由选择或重排推算。
+                    motion.dragged = true; // Only a real drag callback proves movement; reflow or selection changes do not.
                     self.ivars().pointer_motion.set(Some(motion));
                 }
             } else {
@@ -1471,7 +1489,7 @@ impl NativeMarkdownPagedTextView {
                 }));
             }
             if draining_reopen {
-                // 旧来源仍在归槽时，新Down只交自己真实request与有限点；不能丢事件或抢第二个请求。
+                // The previous source is still returning to its owner. Queue this down's own finite point, not a second request.
                 let pointer = self.pointer_location(&origin, event, false, false)?;
                 return self.defer_pointer_location(&origin, pointer);
             }
@@ -1486,7 +1504,7 @@ impl NativeMarkdownPagedTextView {
                 ) || self.ivars().drag_anchor.get().is_none()
                 {
                     return self.defer_pointer_location(&origin, pointer);
-                } // 同一个槽保存原Down和最新Word点，未Ready首组不得被这次目标覆盖。
+                } // The one slot keeps the original down and latest word endpoint without replacing its pending first group.
             }
             let scene = match self.scene() {
                 Ok(scene) => scene,
@@ -1520,14 +1538,14 @@ impl NativeMarkdownPagedTextView {
                 } else {
                     let position = scene.scene.hit(local)?;
                     position >= selected.location && position <= selected.location + selected.length
-                }; // 已选文本内的单击仍保原选择/拖动语义，不由链接抢走该手势。
+                }; // A click inside selected text keeps its selection/drag semantics instead of being stolen by a link.
                 if !inside_selection && let Some((part, index)) = scene.scene.link_hit(local)? {
                     let anchor = scene.scene.hit(local)?;
                     if !scene.current(self) {
                         return Err(NativeMarkdownPagedTextViewError::Revoked);
                     }
-                    // Command 链接 Down 只登记原身份，不改 canonical 或提前打开目标；普通单击已走原选择主线。
-                    // 后续 Drag 可以撤链接权限后沿此 Down 继续，不能等到 Drag 才为旧锚点补造身份。
+                    // Command-link down records identity without editing canonical selection or opening early.
+                    // A later drag can cancel the link and continue from this down; it cannot invent the anchor's authority later.
                     let _intent = self.claim_cell_pointer_intent();
                     *self.ivars().link_intent.borrow_mut() = Some(std::rc::Rc::new(()));
                     *self.ivars().pressed_link.borrow_mut() = Some(PressedLink {
@@ -1539,13 +1557,13 @@ impl NativeMarkdownPagedTextView {
                         anchor_utf16: anchor,
                         generation: origin.state.generation,
                     }));
-                    return Ok(()); // 不改canonical选择，原链接publication不会被mousedown自己撤销；拖动仍走下方原选择逻辑。
+                    return Ok(()); // Keeping canonical selection unchanged preserves this publication; a drag still takes normal selection.
                 }
             }
             let pointer = self.ivars().drag_anchor.get();
             if dragging && pointer.is_none() {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
-            } // Up已清原槽；迟到Drag不能从当前选择新建一次不存在的Down。
+            } // Up already cleared the slot; a late drag cannot construct a nonexistent down from current selection.
             let word = (!dragging && clicks == 2)
                 || (dragging && matches!(pointer, Some(DragAnchor::Word { .. })));
             let local = if word && dragging {
@@ -1583,7 +1601,7 @@ impl NativeMarkdownPagedTextView {
                     if generation != origin.state.generation {
                         self.ivars().drag_anchor.set(None);
                         return Err(NativeMarkdownPagedTextViewError::Revoked);
-                    } // 正文编辑后旧点击坐标失权，不把它映射到新文稿。
+                    } // An edit revokes the old click's coordinates instead of mapping them onto a different document state.
                     Some(anchor)
                 } else {
                     let extend_anchor = if extend {
@@ -1597,7 +1615,7 @@ impl NativeMarkdownPagedTextView {
                     } else {
                         None
                     };
-                    // 原Shift锚点和首击词种子只有一种真实角色，不在同槽保无效的另一组坐标。
+                    // A Shift anchor and first-word seed are distinct roles; store only the role this gesture actually owns.
                     self.ivars().drag_anchor.set(Some(DragAnchor::Word {
                         anchor: extend_anchor.map_or(
                             WordAnchor::Word {
@@ -1628,7 +1646,7 @@ impl NativeMarkdownPagedTextView {
                     },
                     permit,
                 )? {
-                    return Ok(()); // 跨格词拖选先交原owner提交，旧Scene不能消费原permit。
+                    return Ok(()); // The original owner admitted cross-cell word selection; this old Scene cannot consume its permit again.
                 }
                 let permit = scene.origin.input.capture(scene.origin.epoch, &current)?;
                 return scene.origin.delegate.select_word(
@@ -1638,28 +1656,29 @@ impl NativeMarkdownPagedTextView {
                     permit,
                 );
             }
-            // 普通 Caret 与延后终点使用同一个真实空间/选择消费者；Word 仍在上方原链完成。
+            // Ordinary carets and deferred endpoints share one hit/selection consumer; word gestures use the path above.
             let pointer = self.pointer_location(&origin, event, dragging, false)?;
             self.apply_pointer(&scene, &pointer)?;
             Ok(())
         })();
         self.record(result);
         if let Some(intent) = drag_intent {
-            self.update_drag_scroll(event, &intent); // 只保原Down最后一个有限窗口点，原事件在回调后归还。
+            self.update_drag_scroll(event, &intent); // Retain only this down's latest finite window point, never the NSEvent.
         }
     }
 
-    /// 一个实际Down/Drag共用原view唯一手势槽；只保存身份，不保存raw票、Source或系统事件。
+    /// One actual down/drag shares this View's single identity slot, without retaining raw permits, Source, or events.
     fn claim_cell_pointer_intent(&self) -> std::rc::Rc<()> {
         let active = self.ivars().cell_pointer_intent.borrow().clone();
         active.unwrap_or_else(|| {
+            // Create only when there is no live down; subsequent drags keep the existing gesture identity.
             let intent = std::rc::Rc::new(());
             *self.ivars().cell_pointer_intent.borrow_mut() = Some(intent.clone());
             intent
         })
     }
 
-    /// 只核原View仍持这一次Down；同步栈临时Rc即使仍活，也不能在真实Up后给弱票续命。
+    /// Require this View to own the down; a temporary stack Rc cannot keep its Weak authorized after real up.
     pub(in crate::native_surface) fn cell_pointer_is_current(
         &self,
         intent: &std::rc::Weak<()>,
@@ -1675,8 +1694,8 @@ impl NativeMarkdownPagedTextView {
                 })
     }
 
-    /// 原Core发布成功后、拆child图之前移动唯一手势Rc；后续真实Drag/Up仍可能被Cocoa发给旧view。
-    /// child已seal时不能再借它的Input；只核parent实际成功结果和原槽，Up先到则明确不移交。
+    /// Move the gesture Rc after actual Core publication but before child detachment; Cocoa may still target that old view.
+    /// Never read sealed child Input: validate the parent's actual result and refuse transfer if up already ended ownership.
     pub(in crate::native_surface) fn transfer_cell_pointer_to(
         &self,
         parent: &std::rc::Rc<objc2::rc::Retained<Self>>,
@@ -1699,8 +1718,8 @@ impl NativeMarkdownPagedTextView {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         let next = DragAnchor::from_published_selection(state, mapped_word_anchor)?;
-        // 原parent仍持另一次真实Down时不能覆盖它，也不把旧child票补签给后继动作。
-        // 检查和槽移动之间没有Native/current调用，主线程无需锁或第二张手势登记图。
+        // Do not replace a different down already owned by the parent or recertify this child token for it.
+        // No Native/current callback occurs between the check and slot move; one main-thread transfer needs no lock/registry.
         if parent
             .ivars()
             .cell_pointer_intent
@@ -1730,13 +1749,13 @@ impl NativeMarkdownPagedTextView {
             parent: std::rc::Rc::downgrade(parent),
             intent: intent.clone(),
         });
-        self.transfer_drag_scroll_to(parent); // 纯手势移交结束后才处理Native期限，重入只看完整的新owner。
-        Ok(true) // 手势和同趟mapped种子已原子移交；Native detach之前没有旧局部端点或空槽间隙。
+        self.transfer_drag_scroll_to(parent); // Process the native deadline only after the complete pure-state handoff.
+        Ok(true) // The same mapped seed and gesture now have one owner, before Native can observe child detachment.
     }
 
-    /// 原词生产者已交付完整首组；只把真实范围写回仍属于同一个 Down 的唯一 Word 槽。
-    /// request 是实际选择完成后的同域请求，不能用旧 serial 或 child-local 整数给父槽续权。
-    /// Up 后允许原选词完成，但没有存活 Down 时返回 false，不造 Commit 或重新开启 Drag。
+    /// Accept the original producer's complete first group only into the same down's live Word slot.
+    /// The request is the actual post-selection domain; an old serial or child-local integer cannot authorize the parent.
+    /// Word selection may finish after up, but that does not recreate a commit or reopen an ended drag.
     pub(in crate::native_surface) fn accept_pointer_word_group(
         &self,
         request: &super::NativeMarkdownPagedSceneRequest,
@@ -1754,13 +1773,13 @@ impl NativeMarkdownPagedTextView {
             return Err(NativeMarkdownPagedTextViewError::InvalidRange);
         }
         let Some(DragAnchor::Word { anchor, generation }) = self.ivars().drag_anchor.get() else {
-            return Ok(false); // 同一 View 的 Caret 或已结束手势不能被词结果改成 Word。
+            return Ok(false); // A word result cannot turn a caret or ended gesture into a new Word drag.
         };
         if generation != origin.state.generation {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         let origin_utf16 = match anchor {
-            WordAnchor::Selection(_) => return Ok(true), // Shift 的真实标量锚点始终保持原角色。
+            WordAnchor::Selection(_) => return Ok(true), // A real Shift scalar anchor must retain its original role.
             WordAnchor::Word { head_utf16, .. }
                 if group.start <= head_utf16 && head_utf16 <= group.end =>
             {
@@ -1772,9 +1791,9 @@ impl NativeMarkdownPagedTextView {
                 origin_utf16,
             } if group == (from_utf16..to_utf16) => origin_utf16,
             _ => return Err(NativeMarkdownPagedTextViewError::Revoked),
-        }; // 首击位置只保原同组方向；真正范围始终来自刚完成的 Core 结果。
+        }; // The first point preserves within-group direction; the actual group range comes only from this Core result.
 
-        // Native 几何读取可能重入；最后只在实际原票和同一输入仍活时替换两个纯值端点。
+        // Geometry checks may reenter; replace pure endpoints only while the original gesture and Input are still current.
         if self.cell_pointer_is_current(intent) && origin.current(self) {
             self.ivars().drag_anchor.set(Some(DragAnchor::Word {
                 anchor: WordAnchor::Group {
@@ -1789,8 +1808,8 @@ impl NativeMarkdownPagedTextView {
         Ok(false)
     }
 
-    /// 草稿发布后的真实选择收据交回同一次鼠标；只替换已映射的拖选种子，不制造输入提交。
-    /// Up、新Down或键盘已撤原弱票时直接结束，不能在迟到Ready后复活手势。
+    /// Return a published draft selection to the same mouse gesture, updating only its already mapped drag seed.
+    /// Up, a new down, or keyboard retirement ends this Weak; late readiness cannot resurrect the gesture.
     pub(in crate::native_surface) fn adopt_cell_pointer_selection(
         &self,
         commit: &super::NativeMarkdownPagedInputCommit,
@@ -1801,8 +1820,8 @@ impl NativeMarkdownPagedTextView {
         if !owns() {
             return Ok(());
         }
-        // 当前View必须仍是这张已提交收据的真实输入客户；显示后果失败不能回滚已发布正文。
-        // 这里只调整指针元数据，不再发Native坐标通知或触碰原字节。
+        // This View must still own the committed Input; a display consequence cannot roll back already published text.
+        // Change pointer metadata only, without another Native coordinate notification or source-byte access.
         let origin = self.origin()?;
         commit.check_current(&|epoch| origin.session_current(self, epoch))?;
         if origin.state != commit.state || !commit.state.selection_is_directed {
@@ -1811,17 +1830,17 @@ impl NativeMarkdownPagedTextView {
         let next = DragAnchor::from_published_selection(commit.state, word_anchor)?;
         if owns() && origin.current(self) {
             self.ivars().drag_anchor.set(Some(next));
-        } // current可重入，最后一次核验仍属原手势后才允许改变原槽。
+        } // Current checks can reenter; only the original surviving gesture may update this slot.
         Ok(())
     }
 
-    /// 只撤这次格指针寿命；pending选择可结束，但后继Ready不能重新装载drag锚点。
+    /// Retire this cell gesture lifetime; pending selection can finish but later readiness cannot reinstall its drag anchor.
     pub(super) fn cancel_cell_pointer_intent(&self) -> bool {
-        let drag_scroll = self.take_drag_scroll(); // 先提取旧期限；Native invalidate只能在原槽已撤完后发生。
+        let drag_scroll = self.take_drag_scroll(); // Remove the deadline before native invalidation can reenter.
         self.ivars().pointer_motion.set(None);
         drop(self.ivars().cell_pointer_intent.borrow_mut().take());
-        self.ivars().drag_anchor.set(None); // 原Down寿命已结束，后继Drag不能借当前选择重建旧种子。
-        // 已接纳 Up 以后 View 的 Rc 可以为空；取消仍必须明确撤掉 Body 中尚未落地的终点。
+        self.ivars().drag_anchor.set(None); // The down ended; a later drag cannot reconstruct its seed from current selection.
+        // The View's Rc may already be empty after admitted up; explicitly cancel any Body endpoint still waiting to publish.
         let delegate = self
             .ivars()
             .delegate
@@ -1829,17 +1848,17 @@ impl NativeMarkdownPagedTextView {
             .as_ref()
             .and_then(std::rc::Weak::upgrade);
         let draining = delegate.is_some_and(|delegate| delegate.cancel_deferred_pointer());
-        drop(drag_scroll); // 原timer析构可重入，新Down已经有独立槽，不再被旧清理误撤。
+        drop(drag_scroll); // Timer destruction can reenter; a new down already has independent state outside this cleanup.
         draining
     }
 
-    /// 撤票只结束这个原手势的寿命；异步正文最多持Weak，无法因此保活View/Source/字体图。
+    /// End only this gesture; asynchronous work holds at most a Weak and cannot keep the View/Source/font graph alive.
     pub(super) fn cancel_link_intent(&self) {
         drop(self.ivars().pressed_link.borrow_mut().take());
         drop(self.ivars().link_intent.borrow_mut().take());
     }
 
-    /// 真正的mouseup才交接单击意图；原mousedown后出现drag、选择/几何或焦点变化均不补签。
+    /// Only actual mouse-up can hand off a click; later drag, selection, geometry, or focus changes cannot recertify it.
     pub(super) fn finish_link_mouse(&self, event: &NSEvent) {
         let forward = self.ivars().cell_pointer_forward.borrow_mut().take();
         if let Some(forward) = forward {
@@ -1848,7 +1867,7 @@ impl NativeMarkdownPagedTextView {
             {
                 parent.complete_pointer(event);
             }
-            return; // 真实Up同时归还旧child弱联系；迟到Drag不再有Input或新Down的解释权。
+            return; // Real up releases the child's weak route; late drag gains no new Input/down authority.
         }
         if self.ivars().closed.get() {
             return;
@@ -1856,12 +1875,12 @@ impl NativeMarkdownPagedTextView {
         self.complete_pointer(event);
     }
 
-    /// Up的唯一解释主线；移交后的旧child不再开自己的链接或访问草稿，仅父view结束同一手势。
+    /// Complete up once on the actual owner; a handed-off child cannot open its own link or read its sealed draft.
     fn complete_pointer(&self, event: &NSEvent) {
         let _use = PayloadUseGuard::enter(&self.ivars().depth);
-        let _drag_scroll = self.take_drag_scroll(); // 先撤期限槽，原Up完成后才invalidate旧timer，不能重入误认新Down。
-        // Up 自己也有真实终点，不能仅清槽而丢掉快于排版完成的最后一个位置。
-        // 准入发生在原 Down 仍由本 View 拥有时；之后撤 Rc 只结束拖动寿命，不撤已接纳终点。
+        let _drag_scroll = self.take_drag_scroll(); // Remove the deadline now; invalidate after up without confusing a reentrant down.
+        // Up has a real final position even when layout is slower than the gesture; clearing a slot must not lose it.
+        // Body admission occurs while this View owns the down; dropping its Rc later ends dragging, not that admitted endpoint.
         let pointer_intent = self
             .ivars()
             .cell_pointer_intent
@@ -1896,8 +1915,8 @@ impl NativeMarkdownPagedTextView {
                         return Err(NativeMarkdownPagedTextViewError::Revoked);
                     }
                     if !moved {
-                        // 保留原Up的接纳事实供尚在准备的Down/首词组使用，不重新命中已改变的几何。
-                        // 无异步owner的独立客户返回false即可；它的同步Down已经决定选择。
+                        // Preserve up for a still-preparing down/first word instead of re-hitting changed geometry.
+                        // A standalone synchronous client may decline the async slot because its down already set selection.
                         let request = self.scene_request(&origin)?;
                         let permit = origin.input.capture(origin.epoch, &|epoch| {
                             epoch == origin.epoch && origin.current(self)
@@ -1922,11 +1941,11 @@ impl NativeMarkdownPagedTextView {
                     }
                 }
                 if !self.cell_pointer_is_current(&pointer_intent) {
-                    // 真正的child提交可能已把同手势移到父view；原Up终点已交给那个唯一owner，
-                    // 不再从已seal的旧Input取新origin，也不重放这个系统事件。
+                    // Child commit may already have moved this gesture and endpoint to the parent.
+                    // Do not read a new origin from the sealed old Input or replay the event on that child.
                     return Ok(());
                 }
-                // 上方可以真实发布选择；结束通知只借提交后的当前请求，不给旧 InputState 续权。
+                // Selection may have committed above; completion borrows its actual postcommit request, not the old InputState.
                 let after = self.origin()?;
                 let request = self.scene_request(&after)?;
                 after.delegate.finish_cell_pointer(&request)
@@ -1941,11 +1960,11 @@ impl NativeMarkdownPagedTextView {
                     if let Some(parent) = forward.parent.upgrade() {
                         parent.end_pointer_metadata(&pointer_intent);
                     }
-                } // Up栈内发生真实移交也结束原父手势；后续迟到Drag不能借父Rc复活已抬起的鼠标。
+                } // A handoff during up must also end the parent's same gesture; a surviving Rc cannot revive the released mouse.
             }
             if self.ivars().cell_pointer_intent.borrow().is_none() {
                 self.record(result);
-            } // Native重入的新Down有自己的错误归属，旧Up不清新元数据或覆盖新客户反馈。
+            } // A reentrant down owns its own feedback; this old up cannot clear or report into the newer operation.
         }
         let Some(pressed) = pressed else {
             return;
@@ -1961,7 +1980,7 @@ impl NativeMarkdownPagedTextView {
             if !scene.key.same(&pressed.key) {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
-            // 按下后放开 Command 就取消跟随，不让旧手势在抬起时凭先前修饰键打开目标。
+            // Releasing Command cancels activation; mouse-up cannot rely on modifiers that were true only at down.
             let modifiers = scene.step(self, || event.modifierFlags())?;
             if !link_activation_modifiers(modifiers) {
                 self.retire_link_intent(&intent);
@@ -1969,7 +1988,7 @@ impl NativeMarkdownPagedTextView {
             }
             let point = scene.step(self, || event.locationInWindow())?;
             let local = scene.step(self, || self.convertPoint_fromView(point, None))?;
-            // 真实mouseDragged已在入口撤票；mouseup离开任何LINK可见墨迹也不得打开原按下目标。
+            // Actual dragging already retired the token; leaving visible LINK ink on up also forbids opening the down target.
             if !scene
                 .scene
                 .link_hit(local)?
@@ -1997,11 +2016,11 @@ impl NativeMarkdownPagedTextView {
             .as_ref()
             .is_none_or(|current| std::rc::Weak::ptr_eq(current, &intent))
         {
-            self.record(result); // Native清理后再核反馈归属，旧链接不能给重入新Down写旧错误。
+            self.record(result); // Recheck feedback ownership after Native cleanup so an old click cannot report into a new down.
         }
     }
 
-    /// 只结束指定的实际手势；先撤全部纯元数据，最后才归还其Native期限，重入的新Down不受旧Up影响。
+    /// End only the specified gesture: clear pure metadata before native deadline release can reenter with a new down.
     fn end_pointer_metadata(&self, intent: &std::rc::Weak<()>) -> bool {
         if !self.cell_pointer_is_current(intent) {
             return false;
@@ -2014,7 +2033,7 @@ impl NativeMarkdownPagedTextView {
         true
     }
 
-    /// 异步目标只借原手势弱票、原Scene/输入/几何和真实firstResponder；任何Native重入后重新核同票。
+    /// Validate the original weak gesture, Scene/Input/geometry, and actual first responder after each Native reentry point.
     pub(in crate::native_surface) fn link_intent_current(
         &self,
         key: &super::NativeMarkdownPagedSceneKey,
@@ -2042,17 +2061,17 @@ impl NativeMarkdownPagedTextView {
             return Ok(false);
         };
         if !origin.step(self, || window.isKeyWindow())? {
-            return Ok(false); // 另一窗口取得键盘焦点时，旧window仍可记住firstResponder，不能据此续权。
+            return Ok(false); // An inactive window may remember its responder; that does not grant current keyboard focus.
         }
         let responder = origin.step(self, || window.firstResponder())?;
         let focused = responder.is_some_and(|responder| {
             std::ptr::eq::<objc2_app_kit::NSResponder>(&*responder, self.as_super().as_super())
         });
-        drop(window); // Native临时强claim先归还，析构回调也不能发生在最后同票核验之后。
+        drop(window); // Release native temporaries before the final same-ticket check, including destructor reentry.
         Ok(focused && owns() && origin.delegate.scene_current(key) && origin.current(self))
     }
 
-    /// 只消费仍属原click的票；Native重入产生的新手势不能被旧操作的清理出口清空。
+    /// Consume only the original click's token; cleanup must not clear a newer gesture admitted by Native reentry.
     pub(in crate::native_surface) fn retire_link_intent(&self, intent: &std::rc::Weak<()>) {
         let matches = self
             .ivars()
@@ -2065,7 +2084,7 @@ impl NativeMarkdownPagedTextView {
         }
     }
 
-    /// 原真实target准备完成后才激活一次；take在系统副作用之前，失败和退激活均不重放。
+    /// Activate once after actual target resolution, consuming permission before an external effect that cannot be replayed.
     pub(in crate::native_surface) fn finish_link_activation(
         &self,
         key: &super::NativeMarkdownPagedSceneKey,
@@ -2093,8 +2112,8 @@ impl NativeMarkdownPagedTextView {
                 return Ok(false);
             }
             if scheme.is_none() {
-                // 从原URI的首个#后取encoded片段，再标准解码一次。不能对Foundation已解码值
-                // 再反转义，让%2520被误当空格；URI的有限目标仍来自同一Source发布。
+                // Decode the encoded fragment after the original URI's first # exactly once.
+                // Re-decoding Foundation's decoded value would turn %2520 into a space; this finite URI still belongs to one Source.
                 let fragment = destination.split_once('#').map(|(_, value)| value);
                 let fragment = fragment
                     .map(|value| {
@@ -2137,7 +2156,7 @@ impl NativeMarkdownPagedTextView {
                         return Ok(false);
                     }
                     scene.scene.follow_heading(fragment, intent.clone())?;
-                    return Ok(true); // 原click随唯一标题任务延续；它实际解析完成后才消费票并定位。
+                    return Ok(true); // The one heading task retains the click until actual resolution consumes it and selects the target.
                 }
                 let path = path.filter(|path| !path.is_empty()).ok_or_else(|| {
                     NativeMarkdownPagedTextViewError::RelativeNoteLink(
@@ -2147,7 +2166,7 @@ impl NativeMarkdownPagedTextView {
                 crate::native_surface::queue_native_markdown_relative_note_link(
                     self, key, intent, &path, fragment,
                 )?;
-                return Ok(true); // 队列只借原click弱票；当前栈退出后才允许旧正文保存和资源barrier切换。
+                return Ok(true); // The queue borrows this Weak; save and old-graph barrier handoff wait until this stack returns.
             }
             let local_file = url.isFileURL();
             if !self.link_intent_current(key, intent)? {
@@ -2157,7 +2176,7 @@ impl NativeMarkdownPagedTextView {
                 return Err(NativeMarkdownPagedTextViewError::RelativeNoteLink(
                     "本地笔记请使用笔记库内的相对路径".into(),
                 ));
-            } // 本地文件不能绕过原工作区限域、未保存提交及释放流程交给系统另开。
+            } // File URLs must not bypass workspace confinement, unsaved-document commit, or teardown through another app.
             let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
             if !self.link_intent_current(key, intent)? {
                 return Ok(false);
@@ -2175,25 +2194,25 @@ impl NativeMarkdownPagedTextView {
             }
         })();
         if !matches!(result, Ok(true)) {
-            self.retire_link_intent(intent); // 真queued相对导航必须等消费时take；这里先撤会让第一次click永久失权。
+            self.retire_link_intent(intent); // Queued relative/heading work consumes later; retiring it here would revoke the first click.
         }
         if let Err(cause) = result {
             self.report_link_failure(key, cause);
         }
     }
 
-    /// 仅原工作区owner显示具体链接失败；同时保存原typed原因，不能把不支持的导航伪装成成功。
+    /// Present failure only through the original workspace owner, retaining its typed cause rather than claiming unsupported success.
     pub(in crate::native_surface) fn report_link_failure(
         &self,
         key: &super::NativeMarkdownPagedSceneKey,
         cause: NativeMarkdownPagedTextViewError,
     ) {
         crate::native_surface::present_native_markdown_paged_link_error(self, &key.request, &cause);
-        self.failure(cause); // 链接失败不销毁仍可编辑的正文/Source，也不会自动重放系统副作用。
+        self.failure(cause); // Preserve the editable body/Source and the actual error; never replay the failed external effect.
     }
 
-    /// 标题结果只认查询开始时的完整Input；真实选择命令保留generation/Undo，原提交
-    /// 链负责必要fold展开、旧CPU退休和SourceTarget可见终点，不以Find重放或裸滚动代替。
+    /// Accept the heading result only under its original complete Input; selection preserves generation/undo.
+    /// The commit chain unfolds as required, retires old CPU, and reveals through SourceTarget, never Find replay or raw scrolling.
     pub(in crate::native_surface) fn navigate_to_heading(
         &self,
         expected: super::NativeMarkdownPagedInputState,
@@ -2218,7 +2237,7 @@ impl NativeMarkdownPagedTextView {
         self.finish_edit_outcome(&origin, outcome)
     }
 
-    /// 新Doc尚无首屏时也能明确回报找不到标题；只回写同一完整客户，不清空可编辑正文。
+    /// Report a missing heading before a new note's first frame, but only to the same complete client without clearing its document.
     pub(in crate::native_surface) fn report_heading_failure(
         &self,
         request: &super::NativeMarkdownPagedSceneRequest,
@@ -2287,6 +2306,6 @@ mod tests {
         ] {
             assert_eq!(navigation(unrelated), None);
             assert_eq!(edit(unrelated), None);
-        } // 插件查找、返回和应用退出仍属于原responder链，本层不新增键或冒领Host动作。
+        } // Find, return, and application exit remain on their existing responder chain; this layer adds no keys or Host actions.
     }
 }

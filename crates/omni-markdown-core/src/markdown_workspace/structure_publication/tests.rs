@@ -258,19 +258,21 @@ fn source_revalidation_failure_releases_provisional_note_and_revokes_mid_page() 
     let session = workspace.open_session().unwrap();
     let publication = WorkspaceStructurePublication::new(&session);
     let mut mid = None;
-    let result = inspect_mapped_markdown(&source, MAX_DOCUMENT_BYTES, |content| {
-        let pending = create_collision_safe_imported_note(
+    let result = inspect_bounded_markdown(&source, MAX_DOCUMENT_BYTES, |content| {
+        // The provisional target streams the original frozen windows and retains
+        // its actual rollback owner until source/path revalidation has completed.
+        let pending = create_collision_safe_imported_note_with_writer(
             &publication,
             &root,
             "Imported",
-            content.as_bytes(),
-        )
-        .unwrap();
+            content.len() as u64,
+            |file| content.copy_to(file).map_err(std::io::Error::other),
+        )?;
         assert!(pending.path.is_file());
         mid = Some(authorities(&session));
         // 修改真实源长度强制post-read identity失败，目标候选已真实创建而非虚构mutation。
         fs::write(&source, "changed source with a different byte count").unwrap();
-        pending
+        Ok(pending)
     });
     assert!(matches!(
         result,

@@ -28,10 +28,10 @@ impl Fixture {
         }
     }
 
-    /// 使用旧写入接口产生实际OMNIMD1格式，后续只走新的原生映射入口。
+    /// The private fixture writer produces the actual historical format; all reads use production mapping.
     fn draft(&self, content: &str) -> PathBuf {
         self.access
-            .update_conflict_draft("Note.md", content)
+            .write_conflict_fixture("Note.md", content)
             .expect("legacy draft bytes");
         conflict_draft_path(&self.recovery, "Note.md")
     }
@@ -757,5 +757,78 @@ fn concurrent_valid_resolutions_publish_one_immutable_marker() {
     assert_eq!(
         fs::read(fixture.root.join("Note.md")).unwrap(),
         b"external disk\n"
+    );
+}
+
+#[test]
+/// Root API types carry a real recovery handoff, with no marker before the original document is released.
+fn root_exports_support_a_complete_recovery_consumer() {
+    use crate::{
+        MarkdownRecoveryHandoff, MarkdownRecoveryPreparation, MarkdownRecoveryRecording,
+        MarkdownRecoveryResolutionOutcome, MarkdownWorkspace, MarkdownWorkspaceError,
+    };
+    // The existing private format writer seeds only this isolated fixture; public buffer/marker APIs own the handoff.
+    let temporary = tempfile::tempdir().expect("isolated external recovery consumer");
+    let root = temporary.path().join("vault");
+    let appdata = temporary.path().join("appdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("Note.md"), b"disk version\n").unwrap();
+    let workspace = MarkdownWorkspace::new(root.clone(), appdata.clone());
+    let session = workspace.open_session().unwrap();
+    session
+        .write_conflict_fixture("Note.md", "待恢复😀")
+        .unwrap();
+    let recovery_directory = appdata.join("markdown-conflict-recovery");
+    let record_path = fs::read_dir(&recovery_directory)
+        .unwrap()
+        .next()
+        .expect("one actual legacy record")
+        .unwrap()
+        .path();
+    let record_before = fs::read(&record_path).unwrap();
+
+    // The unknown historical baseline still rejects public saving; naming a ticket does not grant overwrite authority.
+    let mut document = session.open_document_buffer("Note.md").unwrap();
+    assert!(document.has_pending_legacy_recovery());
+    assert_eq!(document.original_revision(), None);
+    assert_eq!(
+        session.save_document_buffer(&mut document).err(),
+        Some(MarkdownWorkspaceError::PendingLegacyRecovery)
+    );
+    let preparation: MarkdownRecoveryPreparation = session
+        .prepare_legacy_recovery_after_reload(&document)
+        .unwrap();
+    let ticket: MarkdownRecoveryHandoff = match preparation {
+        // A real pending fixture must produce its actual handoff ticket, not merely compile the type name.
+        MarkdownRecoveryPreparation::Prepared(ticket) => ticket,
+        // Stop if recovery was silently downgraded; an ordinary document cannot stand in for this handoff.
+        MarkdownRecoveryPreparation::NotPending => panic!("legacy record must remain pending"),
+    };
+    assert_eq!(ticket.target_relative_path(), "Note.md");
+    session
+        .validate_legacy_recovery_handoff(&document, &ticket)
+        .unwrap();
+    assert_eq!(fs::read_dir(&recovery_directory).unwrap().count(), 1);
+    // This proves pure document ownership ends before handoff; the Native adapter separately proves its AppKit barrier.
+    drop(document);
+
+    let outcome: MarkdownRecoveryResolutionOutcome =
+        session.open_resolved_legacy_recovery(ticket).unwrap();
+    let recording: MarkdownRecoveryRecording = outcome.recording;
+    assert_eq!(recording, MarkdownRecoveryRecording::Recorded);
+    assert!(!outcome.document.has_pending_legacy_recovery());
+    assert!(!outcome.document.is_dirty());
+    // Only the finite synthetic oracle owns output bytes; production recovery remains mapped and bounded.
+    let mut actual = Vec::new();
+    outcome.document.write_to(&mut actual).unwrap();
+    assert_eq!(actual, b"disk version\n");
+    assert_eq!(fs::read(root.join("Note.md")).unwrap(), b"disk version\n");
+    assert_eq!(fs::read(&record_path).unwrap(), record_before);
+    assert_eq!(fs::read_dir(&recovery_directory).unwrap().count(), 2);
+    assert!(
+        !session
+            .open_document_buffer("Note.md")
+            .unwrap()
+            .has_pending_legacy_recovery()
     );
 }

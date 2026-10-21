@@ -1,8 +1,12 @@
 #![cfg(target_os = "macos")]
-//! 静态组装的 Omni MD 原生 AppKit 编辑入口；正式两种模式共用唯一分页正文。
+//! AppKit assembly for the statically registered Omni MD plugin.
 //!
-//! MarkdownDocumentBuffer 独占 canonical 文本；输入、可见字形和目录都沿原 mmap 有界读取。
-//! TextKit 参考实现保持独立，不参与正式打开、模式切换或失败回退。
+//! Source and Preview share one paged editor and canonical MarkdownDocumentBuffer.
+//! Core owns mmap-backed text, history, and confined persistence; these modules
+//! own Native input, presentation, controls, and the corresponding close barrier.
+//! TextKit editor/storage graphs are explicit reference probes, never fallback
+//! production editors. Shared weak NSString and clipboard adapters remain live
+//! production dependencies for regular-expression Find and explicit copy.
 
 use std::cell::{Cell, OnceCell, RefCell};
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
@@ -54,7 +58,8 @@ mod text_attributes;
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use text_attributes::*;
 pub use text_attributes::{native_markdown_document_fixed_font, native_markdown_document_font};
-// 旧 GlyphInfo 与 TextKit 装配仅由独立机制夹具构造；正式分页图不编译这套适配器。
+// GlyphInfo/TextKit presentation belongs to explicit reference fixtures; the
+// production paged graph neither constructs it nor falls back to it on failure.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod list_markers;
 #[cfg(feature = "native-paged-production")]
@@ -86,7 +91,8 @@ use preview_blocks::*;
 mod preview_paragraph;
 mod table_geometry;
 use table_geometry::*;
-// 默认消费者切换前，用真实 Core Ready 验证分段覆盖、缺格与分隔行的读取权限。
+// The reference table-navigation probe consumes actual Core Ready coverage;
+// it cannot grant missing cells or delimiters authority to publish content.
 #[cfg(all(
     feature = "native-table-row-append",
     any(test, feature = "native-markdown-runtime-probe")
@@ -176,6 +182,9 @@ mod input_trace;
 #[cfg(feature = "native-input-trace")]
 pub use input_trace::{arm_native_markdown_input_trace, drain_native_markdown_input_trace};
 
+// This shared adapter module is also used by production regex Find and copy.
+// Its NSTextStorage implementation is gated internally; do not gate the whole
+// module merely because its reference editor is absent from the default graph.
 mod text_storage;
 use text_storage::*;
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
@@ -194,7 +203,8 @@ pub mod paged_text_view;
 pub mod paged_viewport;
 #[cfg(feature = "native-markdown-runtime-probe")]
 mod viewport_reentry_diagnostic;
-// 光栅路径尚在真实编辑器中验收；普通构建不包含该试验模块。
+// Font-run scratch belongs to independent reference probes. Production paged
+// painting uses its own bounded glyph and viewport-pixel owners below.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 mod font_run_scratch;
 #[cfg(all(
@@ -222,7 +232,8 @@ mod frozen_native_source;
     feature = "native-markdown-runtime-probe"
 ))]
 mod frozen_native_string;
-// 普通Native路径没有冻结值构造者；仅真实诊断图与同源单测需要其观察合同。
+// Frozen-value experiments are absent from the production editor; only explicit
+// diagnostic graphs and source-preserving unit tests consume these contracts.
 #[cfg(any(
     test,
     all(
@@ -334,7 +345,8 @@ const NATIVE_MARKDOWN_WIDTH: f64 = 1_120.0;
 const NATIVE_MARKDOWN_HEIGHT: f64 = 720.0;
 const NATIVE_MARKDOWN_HEADER_HEIGHT: f64 = sidebar_geometry::HEADER_HEIGHT;
 const NATIVE_MARKDOWN_SIDEBAR_WIDTH: f64 = 248.0;
-// 留出常驻保存位置与分页控件的空间，剩余笔记仍由同一游标逐页可达。
+// Reserve space for the persistent storage location and paging controls; the
+// same bounded cursor keeps the remaining notes reachable without a full listing.
 const MAX_VISIBLE_NATIVE_MARKDOWN_WORKSPACE_ENTRIES: usize = sidebar_geometry::MINIMUM_PAGE_ROWS;
 const MAX_SCANNED_NATIVE_MARKDOWN_WORKSPACE_ENTRIES: usize = 512;
 const MAX_NATIVE_MARKDOWN_STATUS_CHARACTERS: usize = 160;
@@ -362,8 +374,9 @@ fn enqueue_native_markdown_main_task<F>(work: F)
 where
     F: Send + FnOnce() + 'static,
 {
-    // Dispatch 持有闭包至本次主队列事务执行；其中的 Native 临时对象必须在同一事务结束时
-    // 归还，不能依赖外围应用池。调用方仍只捕获原弱身份，不增加事件或延长关闭会话。
+    // Dispatch owns the closure until this main-queue transaction runs. Drain
+    // Native temporaries in that same transaction instead of the outer app pool;
+    // callers retain original weak identities rather than keeping closed sessions alive.
     DispatchQueue::main().exec_async(move || autoreleasepool(|_| work()));
 }
 

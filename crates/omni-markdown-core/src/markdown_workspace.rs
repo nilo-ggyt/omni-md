@@ -85,30 +85,6 @@ pub struct MarkdownWorkspaceSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Legacy bounded owned note result, including optional recovered text and its disk baseline.
-pub struct OpenMarkdownNote {
-    pub relative_path: String,
-    pub title: String,
-    pub content: String,
-    pub revision: String,
-    pub byte_count: u64,
-    pub character_count: usize,
-    pub line_count: usize,
-    pub line_separator: &'static str,
-    pub modified_at_ms: i64,
-    pub recovered_conflict: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Legacy display metrics computed in the same validated read as the note body.
-struct MarkdownOpenMetrics {
-    character_count: usize,
-    line_count: usize,
-    line_separator: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 /// Exact persisted revision and filesystem metadata after a completed save boundary.
 pub struct MarkdownSaveReceipt {
     pub revision: String,
@@ -378,48 +354,15 @@ impl MarkdownSessionAccess {
         Ok(MarkdownWorkspaceSnapshot { directories, notes })
     }
 
-    /// Open the legacy String-backed note and overlay a validated conflict draft when present.
-    pub fn open_note(
-        &self,
-        relative_path: &str,
-    ) -> Result<OpenMarkdownNote, MarkdownWorkspaceError> {
-        let mut note = self.open_disk_note(relative_path)?;
-        if let Some(recovered_content) =
-            read_conflict_draft(&self.conflict_recovery_directory, &note.relative_path)?
-        {
-            // A valid private draft supplies unsaved text while retaining the disk revision as its conflict baseline.
-            let recovered_metrics = markdown_open_metrics(&recovered_content);
-            note.byte_count = recovered_content.len() as u64;
-            note.character_count = recovered_metrics.character_count;
-            note.line_count = recovered_metrics.line_count;
-            note.line_separator = recovered_metrics.line_separator;
-            note.content = recovered_content;
-            note.recovered_conflict = true;
-        }
-        Ok(note)
-    }
-
-    /// Explicitly choose the disk version and clear its legacy recovery draft only after a successful read.
-    pub fn reload_note_from_disk(
-        &self,
-        relative_path: &str,
-    ) -> Result<OpenMarkdownNote, MarkdownWorkspaceError> {
-        let note = self.open_disk_note(relative_path)?;
-        remove_conflict_draft(&self.conflict_recovery_directory, &note.relative_path)?;
-        Ok(note)
-    }
-
-    /// Persist a bounded legacy draft without requiring the original note to still exist.
-    pub fn update_conflict_draft(
+    /// Seed the historical on-disk format only for isolated recovery regression fixtures.
+    #[cfg(all(test, feature = "native-markdown-candidate"))]
+    fn write_conflict_fixture(
         &self,
         relative_path: &str,
         content: &str,
     ) -> Result<(), MarkdownWorkspaceError> {
-        validate_conflict_draft_relative_path(relative_path)?;
-        if content.len() as u64 > MAX_DOCUMENT_BYTES {
-            // Reject oversized unsaved content before touching its previous recovery record.
-            return Err(MarkdownWorkspaceError::DocumentTooLarge);
-        }
+        // Keep the one real format writer for test acquisition; production only reads
+        // existing records through the bounded recovery protocol and never rewrites them.
         write_conflict_draft(
             &self.conflict_recovery_directory,
             relative_path,
@@ -428,57 +371,24 @@ impl MarkdownSessionAccess {
         )
     }
 
-    /// Explicitly discard the validated legacy recovery record for one note identifier.
-    pub fn clear_conflict_draft(&self, relative_path: &str) -> Result<(), MarkdownWorkspaceError> {
-        validate_conflict_draft_relative_path(relative_path)?;
-        remove_conflict_draft(&self.conflict_recovery_directory, relative_path)
-    }
-
-    /// Validate and inspect one disk note, producing the legacy owned text and its exact revision.
-    fn open_disk_note(
-        &self,
-        relative_path: &str,
-    ) -> Result<OpenMarkdownNote, MarkdownWorkspaceError> {
-        let path = resolve_existing_markdown(&self.canonical_root, relative_path)?;
-        let relative_path = relative_markdown_path(&self.canonical_root, &path)?;
-        let title = markdown_title(&path)?;
-        let mapped = inspect_mapped_markdown(&path, MAX_DOCUMENT_BYTES, |text| {
-            // The legacy API deliberately copies one bounded current note and derives display metrics from the same validated bytes.
-            let metrics = markdown_open_metrics(text);
-            (text.to_owned(), metrics)
-        })?;
-        let (content, metrics) = mapped.value;
-        Ok(OpenMarkdownNote {
-            relative_path,
-            title,
-            content,
-            revision: mapped.revision,
-            byte_count: mapped.byte_count,
-            character_count: metrics.character_count,
-            line_count: metrics.line_count,
-            line_separator: metrics.line_separator,
-            modified_at_ms: mapped.modified_at_ms,
-            recovered_conflict: false,
-        })
-    }
-
     /// Create a heading note with bounded collision retries and exclusive file creation.
     pub fn create_note(
         &self,
         relative_directory: &str,
         requested_title: &str,
-    ) -> Result<OpenMarkdownNote, MarkdownWorkspaceError> {
-        // 公开入口始终使用真实目录sync；故障注入仅由同模块私有测试调用。
+    ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
+        // The public operation always performs real directory durability. Only
+        // the existing in-module filesystem regression can supply its private failure boundary.
         self.create_note_with_directory_sync(relative_directory, requested_title, sync_directory)
     }
 
-    /// 同一次结构操作的私有目录持久化边界，不新增公开flag或运行时重试。
+    /// One creation operation retains its actual directory-sync and publication owners.
     fn create_note_with_directory_sync(
         &self,
         relative_directory: &str,
         requested_title: &str,
         mut synchronize_directory: impl FnMut(&Path) -> Result<(), MarkdownWorkspaceError>,
-    ) -> Result<OpenMarkdownNote, MarkdownWorkspaceError> {
+    ) -> Result<MarkdownNoteMutationReceipt, MarkdownWorkspaceError> {
         // 先声明撤权边界，所有后建文件/rollback guard先drop；纯预校验不激活。
         let publication = WorkspaceStructurePublication::new(self);
         let result = (|| {
@@ -516,7 +426,10 @@ impl MarkdownSessionAccess {
             // 新笔记已真实发布；后续sync/open失败也不能让旧搜索末项继续代表原目录。
             publication.changed();
             synchronize_directory(&directory)?;
-            self.open_note(&relative_markdown_path(&self.canonical_root, &path)?)
+            // Creation publishes only a compact receipt. Validate the actual file through
+            // bounded source reads; opening an editor and owning its text are separate operations.
+            let created = inspect_bounded_markdown(&path, MAX_DOCUMENT_BYTES, |_| Ok(()))?;
+            mutation_receipt(&self.canonical_root, &path, created.revision)
         })();
         // 闭包内的pending/inspect guard此时已全部析构，不能提前取未确认标量。
         publication.finish(result)
@@ -1168,115 +1081,6 @@ impl MarkdownSessionAccess {
     ) -> Result<PathBuf, MarkdownWorkspaceError> {
         resolve_existing_markdown(&self.canonical_root, relative_path)
     }
-
-    /// Preserve the legacy optimistic-save contract, retaining conflicting text in private recovery storage.
-    pub fn save_note(
-        &self,
-        relative_path: &str,
-        content: &str,
-        expected_revision: &str,
-    ) -> Result<MarkdownSaveReceipt, MarkdownWorkspaceError> {
-        // 公开生产入口始终执行真实目录持久化；没有全局故障开关或新增公开测试API。
-        self.save_note_with_directory_sync(
-            relative_path,
-            content,
-            expected_revision,
-            sync_directory,
-        )
-    }
-
-    /// 单次私有持久化参数沿用原生保存的测试边界，验证真实rename后的失败撤权时点。
-    fn save_note_with_directory_sync(
-        &self,
-        relative_path: &str,
-        content: &str,
-        expected_revision: &str,
-        synchronize_directory: impl FnOnce(&Path) -> Result<(), MarkdownWorkspaceError>,
-    ) -> Result<MarkdownSaveReceipt, MarkdownWorkspaceError> {
-        if content.len() as u64 > MAX_DOCUMENT_BYTES {
-            // Reject oversized content before opening or altering any note or draft.
-            return Err(MarkdownWorkspaceError::DocumentTooLarge);
-        }
-        let path = resolve_existing_markdown(&self.canonical_root, relative_path)?;
-        let canonical_relative_path = relative_markdown_path(&self.canonical_root, &path)?;
-        let current = inspect_bounded_markdown(&path, MAX_DOCUMENT_BYTES, |_| {
-            // 旧显式保存入口也复用有界disk基线读取，不额外把整文件驻留为校验临时值。
-            Ok(())
-        })?;
-        if current.revision != expected_revision {
-            // A preexisting external revision is preserved and the unsaved local text becomes a recovery draft.
-            write_conflict_draft(
-                &self.conflict_recovery_directory,
-                &canonical_relative_path,
-                content,
-                &self.save_sequence,
-            )?;
-            return Err(MarkdownWorkspaceError::SaveConflict);
-        }
-        let original_permissions = path
-            .metadata()
-            .map_err(|_| {
-                // Translate a failed filesystem stage into the stable vault-storage error category.
-                MarkdownWorkspaceError::StorageUnavailable
-            })?
-            .permissions();
-        let parent = path
-            .parent()
-            .ok_or(MarkdownWorkspaceError::InvalidRelativePath)?;
-        ensure_within_root(&self.canonical_root, parent)?;
-
-        // Stream and sync complete bytes under rollback ownership before making a final revision check.
-        let mut temporary = create_temporary_markdown_save(parent, &self.save_sequence)?;
-        temporary
-            .file
-            .set_permissions(original_permissions)
-            .map_err(|_| {
-                // Translate a failed filesystem stage into the stable vault-storage error category.
-                MarkdownWorkspaceError::StorageUnavailable
-            })?;
-        temporary.file.write_all(content.as_bytes()).map_err(|_| {
-            // Translate a failed filesystem stage into the stable vault-storage error category.
-            MarkdownWorkspaceError::StorageUnavailable
-        })?;
-        temporary.file.sync_all().map_err(|_| {
-            // Translate a failed filesystem stage into the stable vault-storage error category.
-            MarkdownWorkspaceError::StorageUnavailable
-        })?;
-
-        let rechecked = inspect_bounded_markdown(&path, MAX_DOCUMENT_BYTES, |_| {
-            // 发布临时文件前重新流式核同一磁盘摘要，失败保持原有冲突保护。
-            Ok(())
-        })?;
-        if rechecked.revision != expected_revision {
-            // A revision change during streaming similarly preserves the external file and persists the local draft.
-            write_conflict_draft(
-                &self.conflict_recovery_directory,
-                &canonical_relative_path,
-                content,
-                &self.save_sequence,
-            )?;
-            return Err(MarkdownWorkspaceError::SaveConflict);
-        }
-        // Atomic publication transfers the temporary name; then rebind and replace active buffer ownership.
-        fs::rename(&temporary.path, &path).map_err(|_| {
-            // Translate a failed filesystem stage into the stable vault-storage error category.
-            MarkdownWorkspaceError::StorageUnavailable
-        })?;
-        temporary.disarm();
-        // rename已发布同路径正文，先撤旧搜索，即使后续持久化返回Err；目录排序键仍可继续。
-        self.invalidate_content_search();
-        synchronize_directory(parent)?;
-
-        let metadata = path.metadata().map_err(|_| {
-            // Translate a failed filesystem stage into the stable vault-storage error category.
-            MarkdownWorkspaceError::StorageUnavailable
-        })?;
-        Ok(MarkdownSaveReceipt {
-            revision: revision_for_bytes(content.as_bytes()),
-            byte_count: content.len() as u64,
-            modified_at_ms: modified_at_ms(&metadata),
-        })
-    }
 }
 
 #[cfg(feature = "native-markdown-candidate")]
@@ -1862,23 +1666,6 @@ fn create_collision_safe_note_copy<'publication, 'session>(
         }
     }
     Err(MarkdownWorkspaceError::NameCollisionLimitExceeded)
-}
-
-/// Create an exclusive imported note candidate with bounded numeric collision suffixes.
-#[cfg(test)]
-fn create_collision_safe_imported_note<'publication, 'session>(
-    publication: &'publication WorkspaceStructurePublication<'session>,
-    parent: &Path,
-    source_title: &str,
-    content: &[u8],
-) -> Result<PendingVaultFile<'publication, 'session>, MarkdownWorkspaceError> {
-    create_collision_safe_imported_note_with_writer(
-        publication,
-        parent,
-        source_title,
-        content.len() as u64,
-        |file| file.write_all(content),
-    )
 }
 
 /// 导入的命名与碰撞策略只有这一处；每次成功取得目标FD后才调用同一个冻结源writer。
