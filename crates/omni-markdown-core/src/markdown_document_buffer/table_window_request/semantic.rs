@@ -355,7 +355,8 @@ impl MarkdownTableWindowRequest {
                 }
             }
             Phase::Queries => {
-                // 有限projection Parser的输入额外计量；这些节点峰值仍须实际整产品验收，不外推150MB。
+                // Charge bounded projection-parser input separately. These nodes still require
+                // actual whole-product peak measurements; local accounting proves no product budget.
                 self.queries =
                     Some(self.with_input(document, false, table_window_reference_queries)?);
                 work.parser_input_bytes = self

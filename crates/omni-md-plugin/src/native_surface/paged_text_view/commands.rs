@@ -2177,6 +2177,8 @@ impl NativeMarkdownPagedTextView {
                     "本地笔记请使用笔记库内的相对路径".into(),
                 ));
             } // File URLs must not bypass workspace confinement, unsaved-document commit, or teardown through another app.
+            // Existing external-link policy delegates registered non-file schemes to macOS.
+            // Relative notes and file URLs must still use the confined workspace routes above.
             let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
             if !self.link_intent_current(key, intent)? {
                 return Ok(false);
@@ -2186,7 +2188,11 @@ impl NativeMarkdownPagedTextView {
             if !self.link_intent_current(key, intent)? {
                 return Ok(false);
             }
+            // Consume this exact gesture before the sole system handoff. A false result or
+            // later browser failure cannot authorize replaying an external side effect.
             self.retire_link_intent(intent);
+            // True reports NSWorkspace acceptance only; page loading and browser cleanup
+            // require separate external evidence and are never inferred from this return.
             if workspace.openURL(&url) {
                 Ok(false)
             } else {

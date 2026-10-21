@@ -1,5 +1,7 @@
-//! 光标属于原NSView的AppKit cursor rect，不另存URL、链接表或tracking area。
-//! Ready仅授语义；登记还须同完整CPU发布与原Source/Font/Input，退场同步撤区。
+//! Cursors belong to the original NSView cursor rectangles; retain no URL, link table, or tracking
+//! area.
+//! Semantic Ready alone is insufficient: registration requires the same complete CPU publication and
+//! Source/font/Input, with synchronous region retirement.
 
 use super::*;
 use dispatch2::MainThreadBound;
@@ -7,8 +9,10 @@ use objc2_app_kit::NSCursor;
 use objc2_foundation::NSIntersectionRect;
 
 impl NativeMarkdownPagedTextView {
-    /// 先读本次有限sealed几何，再结束全部Scene/Reader强借用；Native重入可以真正退休旧图。
-    /// 临时Vec仅含Copy矩形，数量不超过当前Scene已有LINK part数，不是第二份链接语义或缓存。
+    /// Read bounded sealed geometry before ending every strong Scene/reader borrow, allowing Native
+    /// reentry to actually retire the old graph.
+    /// The temporary vector contains Copy rectangles bounded by existing Scene LINK parts, never a
+    /// second semantic link cache.
     pub(super) fn install_link_cursor_rects(&self) -> Result<()> {
         let (ticket, key, weak_scene, mut areas) = {
             let Some(origin) = self.display_origin()? else {
@@ -44,11 +48,13 @@ impl NativeMarkdownPagedTextView {
             }
             let key = scene.key.clone();
             let weak_scene = Rc::downgrade(&scene.scene);
-            drop(scene); // 包括Origin里的Body/Input强claim；后面所有AppKit调用均不持原Reader。
+            drop(scene); // Release Origin's Body/Input claims too; subsequent AppKit calls hold no original reader.
             (ticket, key, weak_scene, areas)
         };
-        // 正文和各格都已投到同一View坐标；BiDi/负advance的源序不保证按x递增。
-        // 在原必要的Copy集合上原地排序，不再借Scene反复扫描part，也不分配第二份集合。
+        // Body and Cells already share View coordinates; bidi or negative advances mean Source order
+        // need not increase in x.
+        // Sort the existing necessary Copy collection in place, without repeated Scene-part scans or a
+        // second allocation.
         areas.sort_unstable_by(|left, right| {
             left.origin
                 .y
@@ -61,8 +67,10 @@ impl NativeMarkdownPagedTextView {
             let area = areas[index];
             if used != 0 {
                 let previous = &mut areas[used - 1];
-                // 只合并完全相同y域中实际相交或接边的x；跨行、不同格裁剪后的
-                // 高度或纵坐标不同就保持独立，不把链接间的普通文字空隙变成手形。
+                // Merge only touching/overlapping x intervals with exactly identical y extents.
+                // Different lines, Cell clipping heights,
+                // or vertical coordinates remain separate so ordinary text gaps between links never
+                // gain a hand cursor.
                 if previous.origin.y == area.origin.y
                     && previous.size.height == area.size.height
                     && area.origin.x <= previous.origin.x + previous.size.width
@@ -83,13 +91,13 @@ impl NativeMarkdownPagedTextView {
                 .upgrade()
                 .ok_or(NativeMarkdownPagedTextViewError::Revoked)?;
             scene.validate_ready(&current)
-        }; // 每次调用返回前归还临时Scene，绝不把它捕获进Native操作闭包。
+        }; // Each validation returns its temporary Scene before Native work; no Scene enters the Native operation closure.
         let result = (|| {
             validate()?;
             let cpu = self.ivars().cpu.borrow().clone();
             let Some(cpu) = cpu else { return Ok(()) };
             let published = cpu.cursor_publication_current(self, &key, &current);
-            validate()?; // 原Source/Font首错优先于Native图关系的撤权。
+            validate()?; // Original Source/font failure takes precedence over revocation of a Native relationship.
             if !published? {
                 return Ok(());
             }
@@ -102,8 +110,10 @@ impl NativeMarkdownPagedTextView {
                 self.addCursorRect_cursor(clip, &text)
             })?;
             let hand = cursor_step(&validate, &current, NSCursor::pointingHandCursor)?;
-            // IBeam底区完全包含各手形子区；每行已合并相交段，各格又按原clip分隔。
-            // 不能将行尾空白或隐藏Markdown语法补为链接，也不按URL相同跨行合并。
+            // The I-beam base contains hand-cursor subregions; overlapping segments merge per line
+            // while original clips separate Cells.
+            // Neither trailing whitespace nor hidden Markdown becomes a link, and equal URLs do not
+            // merge regions across lines.
             for area in areas {
                 let area = NSIntersectionRect(area, clip);
                 if area.size.width > 0.0 && area.size.height > 0.0 {
@@ -121,8 +131,10 @@ impl NativeMarkdownPagedTextView {
         })();
         match result {
             Err(NativeMarkdownPagedTextViewError::Revoked) => {
-                // 与CPU旧候选共享同一严格弱票：普通bool拒绝不等于正常退休。
-                // 保原资源首因后，只认真实客户/Input/几何换代，不让cleanup后的空serial冒充权限。
+                // Share the CPU candidate's strict weak ticket; a false boolean alone does not
+                // establish ordinary retirement.
+                // Preserve resource failure first, then accept only actual client/Input/geometry
+                // succession; an empty serial after cleanup grants no authority.
                 match validate() {
                     Ok(()) | Err(NativeMarkdownPagedTextViewError::Revoked) => {}
                     Err(cause) => return Err(cause),
@@ -138,8 +150,10 @@ impl NativeMarkdownPagedTextView {
         }
     }
 
-    /// 原CPU同步栈仍持Source；沿已有主队列只交弱View与弱key，退栈后才进入AppKit。
-    /// 不增加serial、观察者或另一条队列；过时通知只结束，不为后继Input补签旧光标。
+    /// While synchronous CPU work holds Source, queue weak View/key identities only and enter AppKit
+    /// after that stack returns.
+    /// Create no new serial, observer, or queue; obsolete notices end without authorizing old cursor
+    /// regions under successor Input.
     pub(super) fn queue_link_cursor_refresh(&self, key: &NativeMarkdownPagedSceneKey) {
         let mtm = self.mtm();
         let weak = MainThreadBound::new(objc2::rc::Weak::from(self), mtm);
@@ -157,8 +171,10 @@ impl NativeMarkdownPagedTextView {
         });
     }
 
-    /// 通知只针对原实际完整图；没有额外paint或强制reset/set cursor。
-    /// 先结束Scene强借用再查询窗口，Source仍由原Weak在Native操作前后逐次短借核验。
+    /// Notify only for the original actual complete frame, without additional painting or forced cursor
+    /// reset/set.
+    /// End the Scene strong borrow before window queries; original weak identity lends Source briefly
+    /// around each Native operation for validation.
     fn refresh_link_cursor_rects(&self, key: &NativeMarkdownPagedSceneKey) -> Result<()> {
         let (ticket, weak_scene) = {
             let Some(origin) = self.display_origin()? else {
@@ -205,7 +221,8 @@ impl NativeMarkdownPagedTextView {
         })();
         match result {
             Err(NativeMarkdownPagedTextViewError::Revoked) => {
-                // AppKit通知也可交付后继编辑；先保原资源错误，再只退休真实完整票的换代。
+                // AppKit notification may deliver successor edits; preserve original resource failures
+                // before accepting actual complete-ticket succession.
                 match validate() {
                     Ok(()) | Err(NativeMarkdownPagedTextViewError::Revoked) => {}
                     Err(cause) => return Err(cause),
@@ -221,8 +238,10 @@ impl NativeMarkdownPagedTextView {
     }
 }
 
-/// validate只在各次Native调用前后短借原Source/Font；operation执行时不持这些资源。
-/// 后验先交真实Source首错，才交普通撤权，避免悬停把磁盘/字体失败洗成空光标。
+/// Validation briefly borrows original Source/font around Native calls; the operation itself retains
+/// neither resource.
+/// Post-validation returns actual Source failure before ordinary revocation, so hovering cannot hide
+/// disk/font failures as an empty cursor.
 fn cursor_step<T>(
     validate: &impl Fn() -> Result<()>,
     current: &impl Fn() -> bool,

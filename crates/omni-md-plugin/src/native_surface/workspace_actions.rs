@@ -1128,7 +1128,8 @@ impl NativeMarkdownCurrentNoteIntent {
     }
 }
 
-/// URL的path已由Foundation解码；这里只执行相对当前笔记目录的dot-segment规则，最终文件仍由原session限域。
+/// Foundation already decoded the URL path. Resolve dot segments relative to this note directory; the
+/// original session still confines the actual file.
 #[cfg(feature = "native-paged-production")]
 fn relative_note_link_path(note: &str, path: &str) -> Result<String, String> {
     use std::path::Component;
@@ -1154,7 +1155,8 @@ fn relative_note_link_path(note: &str, path: &str) -> Result<String, String> {
         .ok_or_else(|| "笔记链接没有有效的目标路径".into())
 }
 
-/// 真相对链接只排一个弱续体；fragment作为同次切换的有限值，不能在新文稿安装后重取旧URI。
+/// A relative link queues one weak continuation. Its finite fragment belongs to this switch and cannot
+/// be recaptured from the old URI after installing another note.
 #[cfg(feature = "native-paged-production")]
 pub(super) fn queue_native_markdown_relative_note_link(
     view: &super::paged_text_view::NativeMarkdownPagedTextView,
@@ -1195,7 +1197,8 @@ pub(super) fn queue_native_markdown_relative_note_link(
     if !view.link_intent_current(key, click)? || !note.current() {
         return Err(LinkError::Revoked);
     }
-    // Native Weak本身也不能保活原正文；跨主队列只转运原弱key/click、文件身份和有限相对目标。
+    // Native weak references cannot retain the original body; the main queue carries only original weak
+    // key/click, note identity, and finite relative destination.
     let pending = MainThreadBound::new(
         (
             Weak::from(view),
@@ -1228,26 +1231,27 @@ pub(super) fn queue_native_markdown_relative_note_link(
                         .map(|surface| surface.session.clone())
                 })
                 .ok_or(LinkError::Revoked)?;
-            // 先确认真实Markdown文件和symlink限域，再触及当前未保存草稿；不为无效路径拆掉旧图。
+            // Verify the actual Markdown file and symlink confinement before touching the unsaved
+            // draft; invalid paths cannot tear down its existing graph.
             session
                 .resolve_note_for_system_action(target)
                 .map_err(|cause| LinkError::RelativeNoteLink(cause.to_string()))?;
             if !view.link_intent_current(key, click)? || !note.current() {
                 return Ok(false);
             }
-            view.retire_link_intent(click); // 先消费原票，再允许保存/退出；错误只回报，不重放已经接纳的切换。
+            view.retire_link_intent(click); // Consume original authority before save/teardown; report failure without replaying an admitted switch.
             Ok(true)
         })();
         match result {
             Ok(true) => {
-                drop(view); // 不把临时Native claim保到旧图resource barrier，否则会阻塞它自己的真实dealloc。
+                drop(view); // Release the temporary Native claim before the old-graph barrier so it cannot block its own actual deallocation.
                 if let Err(cause) = switch_native_markdown_note(target, fragment.clone())
                     && let Some(view) = weak.load()
                 {
                     view.report_link_failure(key, LinkError::RelativeNoteLink(cause));
                 }
             }
-            Ok(false) => view.retire_link_intent(click), // 后继输入/焦点/关闭只撤原click，不给当前新笔记续权。
+            Ok(false) => view.retire_link_intent(click), // Successor input/focus/close revokes only the original click, never granting it authority over the new note.
             Err(cause) => {
                 view.retire_link_intent(click);
                 view.report_link_failure(key, cause);
@@ -1257,7 +1261,8 @@ pub(super) fn queue_native_markdown_relative_note_link(
     Ok(())
 }
 
-/// 失败文案只能写回这个真实View/Doc的原工作区；不向后继窗口或另一个打开的同名笔记发旧错误。
+/// Report failure only to this actual View/document's original workspace, never a successor window or
+/// another open note with the same name.
 #[cfg(feature = "native-paged-production")]
 pub(super) fn present_native_markdown_paged_link_error(
     view: &super::paged_text_view::NativeMarkdownPagedTextView,

@@ -1,5 +1,7 @@
-//! 标题链接只沿同一文档的真实 Global 事实推进；正文不整篇读取，重复 slug 不建内存目录。
-//! 请求仅持原 root 弱身份；匿名文件归请求独占，成功、失败及取消均先显式关闭再交终点。
+//! Heading links advance through actual Global facts of the same document, without loading its whole
+//! text or building an in-memory duplicate-slug index.
+//! The request retains weak original-root identity and exclusively owns anonymous scratch, explicitly
+//! closing it on success, failure, or cancellation before returning a target.
 
 use super::*;
 use crate::markdown_viewport_presentation::{
@@ -29,7 +31,8 @@ const PAGE: usize = 1024;
 const FRAGMENT_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-/// 所有错误仅含结构类别或系统错误号；fragment、标题及路径不进入错误文案。
+/// Errors retain structural categories or system errno only; fragments, headings, and paths never enter
+/// error messages.
 pub enum MarkdownHeadingAnchorError {
     #[error("标题链接的正文来源不可用：{0}")]
     Source(#[from] MarkdownDocumentBufferError),
@@ -63,6 +66,7 @@ pub enum MarkdownHeadingAnchorError {
 
 type Error = MarkdownHeadingAnchorError;
 
+/// Preserve the actual storage category and errno without file paths or heading payload.
 fn storage(error: io::Error) -> Error {
     Error::Storage {
         kind: error.kind(),
@@ -71,7 +75,8 @@ fn storage(error: io::Error) -> Error {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// 实际输入、复制、文件 I/O 与控制转换分别计量；不把一次 Parser 调用冒充逐 token fuel。
+/// Account actual input, copying, file I/O, and control transitions separately; one parser call is not
+/// claimed as per-token fuel accounting.
 pub struct MarkdownHeadingAnchorWork {
     pub source_bytes: usize,
     pub copied_bytes: usize,
@@ -84,17 +89,22 @@ pub struct MarkdownHeadingAnchorWork {
 #[derive(Clone, Debug)]
 struct SourceIdentity {
     root: Option<Weak<MarkdownPieceTreeNode>>,
-    // 空源没有 root；借原文档已有派生读窗的 Weak 区分独立空文档，不新增资源或强保缓存。
+    // An empty Source has no root; weak identity of its existing derived read window distinguishes
+    // empty documents without a new resource or retained cache.
     empty_owner: Option<Weak<Mutex<super::read_cache::Utf16ReadCache>>>,
     generation: u64,
     bytes: usize,
 }
 
 impl SourceIdentity {
+    /// Capture original weak allocation identity and immutable generation/length facts.
     fn new(document: &MarkdownDocumentBuffer) -> Self {
-        // 非空源的piece root已具备真实分配身份；只降为Weak，不复制索引，也不持源字节。
-        // 空源没有树节点，沿文档原有读缓存的Weak品牌区分两个同长度、同代次的独立文档。
-        // 读缓存本身仍由文档释放，本票据不能延长它、mmap或历史的寿命。
+        // A nonempty piece root already has actual allocation identity; downgrade it without copying
+        // the index or retaining Source bytes.
+        // For empty Sources, the existing read-cache weak brand distinguishes separate documents with
+        // equal length and generation.
+        // The document still releases its read cache; this ticket extends neither that cache, mmap, nor
+        // history lifetime.
         Self {
             root: document.root.as_ref().map(Arc::downgrade),
             empty_owner: document
@@ -106,11 +116,14 @@ impl SourceIdentity {
         }
     }
 
-    /// 空文档同样保版本/长度；非空文档必须是原 allocation，Undo 回同一 root 也不复活旧票。
+    /// Empty documents retain version/length checks; nonempty ones require the original allocation, and
+    /// undo to the same root cannot revive an old ticket.
     fn require(&self, document: &MarkdownDocumentBuffer) -> Result<(), Error> {
         document.original_backing_health()?;
-        // 先核源的真实健康，再核品牌；相同文本、相同长度和相同generation都不能冒充原文档。
-        // Undo即使恢复相同root，也已发生新代次；旧导航结果不会重新变成可消费权限。
+        // Check actual Source health before its brand; equal text, length, or generation cannot
+        // impersonate the original document.
+        // Undo advances generation even when restoring the same root, so an old navigation result never
+        // regains authority.
         let root_matches = match (&self.root, &document.root) {
             (Some(expected), Some(actual)) => Weak::ptr_eq(expected, &Arc::downgrade(actual)),
             (None, None) => self.empty_owner.as_ref().is_some_and(|owner| {
@@ -129,18 +142,22 @@ impl SourceIdentity {
 }
 
 #[derive(Clone, Debug)]
-/// 仅同一真实标题 Fact 才可签发；调用者不能从 fragment 或任意偏移构造导航权限。
+/// Only the same actual heading Fact may issue this target; fragments or arbitrary offsets cannot
+/// construct navigation authority.
 pub struct MarkdownHeadingAnchorTarget {
     source: SourceIdentity,
     position: usize,
 }
 
 impl MarkdownHeadingAnchorTarget {
-    /// 位置是原标题物理行首的 canonical UTF-16；显示及折叠展开仍由真实 Native 选择请求决定。
+    /// The position is canonical UTF-16 at the original heading's physical line start; actual Native
+    /// selection still owns display and fold expansion.
     pub fn position_for(&self, document: &MarkdownDocumentBuffer) -> Result<usize, Error> {
         self.source.require(document)?;
-        // 终点由原Fact的物理行首转换而来；这里再次沿当前树确认UTF16边界仍合法。
-        // 不依据slug长度、可见文字或折叠高度反推Source位置，显示端仍消费自己的真实选择意图。
+        // Convert the original Fact's physical line start and revalidate its UTF-16 boundary through
+        // the current tree.
+        // Never infer Source position from slug length, visible text, or folded height; display
+        // consumes its own actual selection intent.
         document.byte_offset_for_utf16(self.position)?;
         Ok(self.position)
     }
@@ -160,11 +177,15 @@ pub enum MarkdownHeadingAnchorStep {
     },
 }
 
-/// 文件中每条已提交记录只有长度和最终 slug；未提交标题固定在末端，不保任何内存索引。
+/// Committed file records contain length and final slug only; one unpublished heading stays at the
+/// tail, without an in-memory index.
 struct Slugs {
-    // committed之前是已完成唯一化的顺序记录；之后只有当前未发布候选，没有第二个内存目录。
-    // base_end保原base末端，candidate_end可以随数值后缀变化；不会在RAM重建整条长slug。
-    // scan/compared只描述当前固定页比较，不是某个视口、正文行号或可见范围。
+    // Before committed are sequential finalized unique records; after it is only the current
+    // unpublished candidate, with no second memory index.
+    // base_end retains the original base end while candidate_end follows numeric suffix changes,
+    // without reconstructing a long slug in RAM.
+    // scan/compared describe this fixed-page comparison only, not a viewport, document line number, or
+    // visible range.
     file: Option<File>,
     committed: u64,
     base_end: u64,
@@ -176,15 +197,19 @@ struct Slugs {
     suffix: u64,
     maximum: u64,
     irrelevant: bool,
-    // 可见标题跨所有行内域连续参与Unicode默认lowercase；只留一个待定Σ，不缓存后继marks。
+    // Visible heading text uses continuous Unicode default lowercasing across inline domains, retaining
+    // one pending sigma without caching subsequent marks.
     previous_cased: bool,
     pending_sigma: Option<u64>,
 }
 
 impl Slugs {
+    /// Initialize finite scratch bookkeeping from the admitted fragment bound without opening a file.
     fn new(maximum: usize) -> Self {
-        // 上限来自已经校验的fragment字节长度，而不是文档长度；更长的最终ID不可能命中它。
-        // 此处不打开文件。空fragment直接到文档首部，没有标题时也不会产生临时FD。
+        // The bound comes from validated fragment bytes, not document length; a longer final ID cannot
+        // match that fragment.
+        // Open no file here. An empty fragment targets document start; a document without headings
+        // creates no scratch FD.
         Self {
             file: None,
             committed: 0,
@@ -202,17 +227,22 @@ impl Slugs {
         }
     }
 
+    /// Borrow only this query's already-created scratch descriptor; missing ownership is an internal
+    /// error.
     fn file(&self) -> Result<&File, Error> {
         self.file.as_ref().ok_or(Error::ArithmeticOverflow)
     }
 
-    /// tempfile 创建的是 0600 匿名文件；只在出现首个标题时创建，不接收外部路径。
+    /// Create a private 0600 anonymous temporary only for the first actual heading, never from an
+    /// external path.
     fn begin(&mut self) -> Result<(), Error> {
         if self.file.is_none() {
             self.file = Some(tempfile::tempfile().map_err(storage)?);
         }
-        // 当前候选只在已有记录之后追加；若上一长标题已被剪枝，覆盖其未发布尾部即可。
-        // 重置本标题的比较与大小写状态，不清空已经提交的唯一ID历史。
+        // Append a candidate after committed records; a pruned long heading leaves only an unpublished
+        // tail that may be overwritten.
+        // Reset this heading's comparison/lowercase state without discarding committed unique-ID
+        // history.
         self.base_end = self
             .committed
             .checked_add(8)
@@ -229,9 +259,12 @@ impl Slugs {
         Ok(())
     }
 
+    /// Append certified visible bytes only while the candidate can still match this fragment.
     fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        // 只有已经完成语义证明的可见片段可到这里；markup后续闭合不能改变先前输出的意义。
-        // irrelevant是本候选的终结事实，后继片段不分配更大缓冲、不写无用文件字节。
+        // Accept only visible fragments with completed semantic proof; later markup closure cannot
+        // change the meaning of already emitted output.
+        // irrelevant terminates this candidate: later fragments allocate no larger buffers and write no
+        // useless scratch bytes.
         if self.irrelevant {
             return Ok(());
         }
@@ -241,8 +274,10 @@ impl Slugs {
             .ok_or(Error::ArithmeticOverflow)?
             > self.maximum
         {
-            // 唯一化只追加后缀；已证 base 比目标更长时永不影响任何可等于该目标的更短 ID。
-            // 语义投影仍须先完整证明，不能拿尚待闭合的源字面前缀直接做这个剪枝。
+            // Uniqueness adds suffixes only; a proven base longer than the fragment cannot affect any
+            // shorter ID that might equal it.
+            // Complete semantic projection must precede pruning; an unclosed literal Source prefix
+            // cannot authorize it.
             self.irrelevant = true;
             return Ok(());
         }
@@ -256,14 +291,18 @@ impl Slugs {
         Ok(())
     }
 
-    /// 默认Unicode lowercase只有最终Σ需要语言无关上下文；所有可见片段共用这个原文件状态。
-    /// 先写同宽σ，真正后继/标题末端才决定ς；任意长Case_Ignorable后缀只占一个文件偏移。
+    /// Unicode default lowercase needs language-independent context for final sigma; all visible
+    /// fragments share this original file state.
+    /// Write equal-width normal sigma first, deciding final sigma only at an actual successor/heading
+    /// end; arbitrarily long ignorable suffixes retain one offset.
     fn append_visible(&mut self, text: &str) -> Result<(usize, usize), Error> {
         if self.irrelevant {
             return Ok((0, 0));
         }
-        // 调用者每次只交至多260字节完整UTF8；lowercase扩展也留在这一固定输出页。
-        // 过滤发生在默认大小写上下文之后：被删掉的标点仍可能终结或延续Greek词形判断。
+        // Each caller supplies at most 260 complete UTF-8 bytes; lowercase expansion still fits this
+        // fixed output page.
+        // Filter after default lowercase context: removed punctuation may still end or extend the Greek
+        // word context.
         let mut output = [0u8; 1024];
         let mut length = 0;
         let mut writes = 0;
@@ -292,8 +331,10 @@ impl Slugs {
                     writes += 2;
                 }
             }
-            // 当前Σ既是前一个待定Σ的真实后继，也可能成为新的待定项；始终只有一个offset。
-            // 原小写σ/ς不做上下文改写，避免把lowercase误实现成Unicode casefold。
+            // The current capital sigma may resolve its predecessor and become the new pending scalar;
+            // retain only one offset.
+            // Existing lowercase sigma forms remain unchanged; lowercasing must not become Unicode case
+            // folding.
             if scalar == 'Σ' && self.previous_cased {
                 self.pending_sigma = Some(start + length as u64);
             }
@@ -315,12 +356,14 @@ impl Slugs {
             }
         }
         self.append(&output[..length])?;
-        // 首次越过目标上限只撤销候选，不写当前输出页；此前Σ补写确已发生，仍按真实2字节报告。
+        // Crossing the fragment bound discards the candidate without writing this output page; any
+        // earlier sigma patch still counts its actual two bytes.
         let appended = if self.irrelevant { 0 } else { length };
         Ok((writes + appended, length))
     }
 
-    /// 真标题结束才授权最终Σ；语义域、视口页或文件片尾均没有这个权限。
+    /// Only actual heading end finalizes sigma; semantic-domain, viewport-page, or file-chunk ends do
+    /// not.
     fn finish_visible(&mut self) -> Result<usize, Error> {
         let Some(pending) = self.pending_sigma.take() else {
             return Ok(0);
@@ -334,12 +377,15 @@ impl Slugs {
         Ok(2)
     }
 
+    /// Measure candidate bytes from original scratch offsets, excluding its record header.
     fn length(&self) -> u64 {
-        // 记录头的8字节永远不参与ID比较；长度直接取原文件水位，不扫描或复制候选正文。
+        // The eight-byte record header never enters ID comparison; derive length from file offsets
+        // without scanning or copying candidate text.
         self.candidate_end - self.committed - 8
     }
 
-    /// 同一最终 slug 不能重复；每次仅比较一个固定页，必要重扫以真实 I/O 计费而不建 HashMap。
+    /// Final slugs are unique; compare one fixed page per turn and charge actual repeated I/O rather
+    /// than building a HashMap.
     fn collision_step(&mut self) -> Result<(MarkdownHeadingAnchorWork, bool), Error> {
         let mut work = MarkdownHeadingAnchorWork {
             structural_transitions: 1,
@@ -349,8 +395,10 @@ impl Slugs {
             return Ok((work, true));
         }
         if self.compared == 0 {
-            // 先读已提交记录的真实长度。不同长度的ID不能相等，直接跳到下一条原记录。
-            // 等长时才读取两个固定页；未提交尾部没有记录头，不能被当作历史条目扫描。
+            // Read the committed record length first; unequal lengths cannot match, so skip directly to
+            // the next original record.
+            // Read both fixed pages only for equal lengths; the uncommitted headerless tail must not be
+            // scanned as history.
             let mut bytes = [0; 8];
             self.file()?
                 .read_exact_at(&mut bytes, self.scan)
@@ -367,8 +415,10 @@ impl Slugs {
             }
             self.equal = true;
         }
-        // 每个量子只比较至多1KiB，不因一次长ID碰撞把整个候选搬回内存。
-        // 即使早期页已失配，仍按原长度前进到记录边界，后续扫描不会进入记录中间。
+        // Compare at most 1 KiB per quantum without loading a complete candidate for a long-ID
+        // collision.
+        // Even after an early mismatch, advance to the actual record boundary so subsequent scans
+        // cannot start inside a record.
         let count = (self.record_len - self.compared).min(PAGE as u64) as usize;
         let mut previous = [0; PAGE];
         let mut candidate = [0; PAGE];
@@ -386,12 +436,15 @@ impl Slugs {
             return Ok((work, false));
         }
         if self.equal {
-            // 原 base 只写一次；新后缀替换此前候选后缀，不把整条长 slug 搬回 RAM。
+            // Write the base once and replace only its candidate suffix, without returning a whole long
+            // slug to RAM.
             if self.suffix == 0 {
                 self.base_end = self.candidate_end;
             }
-            // GitHub式碰撞依原出现顺序追加最小可用数字；显式写出的a-1也占用同一ID空间。
-            // 数字后缀仍与所有既有最终ID重新比较，不能只为同base保一个不准确的计数器。
+            // Resolve collisions in appearance order with the smallest available numeric suffix; an
+            // explicitly written a-1 occupies that same ID space.
+            // Recompare each numeric suffix against all existing final IDs; a per-base counter alone
+            // cannot prove uniqueness.
             self.suffix = self
                 .suffix
                 .checked_add(1)
@@ -413,9 +466,12 @@ impl Slugs {
         Ok((work, false))
     }
 
+    /// Publish one complete unique record header only after matching has finished.
     fn commit(&mut self) -> Result<(), Error> {
-        // 只有真实唯一化及fragment比较均结束才写记录头；失败候选不成为后继标题的占用项。
-        // pwrite失败直接结束原请求，不重放一个结局未知的提交，也不提前移动committed。
+        // Write a record header only after actual uniqueness and fragment comparison complete; failed
+        // candidates cannot reserve IDs for later headings.
+        // A pwrite failure ends the original request without replaying an uncertain commit or advancing
+        // committed early.
         self.file()?
             .write_all_at(&self.length().to_le_bytes(), self.committed)
             .map_err(storage)?;
@@ -423,11 +479,13 @@ impl Slugs {
         Ok(())
     }
 
-    /// 所有终态显式 close；close 的未知后果不重试，Drop 仅负责遗弃请求的最后兜底。
+    /// All terminal paths close explicitly; uncertain close outcomes never retry, while Drop only
+    /// compensates an abandoned request.
     fn close(&mut self) -> Result<(), Error> {
         if let Some(file) = self.file.take() {
             let fd = file.into_raw_fd();
-            // SAFETY: fd 是本匿名文件刚转移的唯一所有权；只调用一次，之后不再读写或重试它。
+            // SAFETY: This anonymous file just transferred sole FD ownership; close once, then never
+            // read, write, or retry that descriptor.
             if unsafe { libc::close(fd) } != 0 {
                 return Err(storage(io::Error::last_os_error()));
             }
@@ -436,9 +494,12 @@ impl Slugs {
     }
 }
 
-// 每个阶段归同一个请求；一次advance只推进当前有限步骤，不在这里驱动UI事件循环。
-// 短标题有明确2KiB Parser边界，长标题则保真实流式投影；两者最终共用同一个唯一化文件。
-// References/Footnotes只回答当前标题的真实依赖，Unknown不会被折叠成Missing。
+// All phases belong to one request; advance performs a bounded current step without driving the UI
+// event loop.
+// Short headings have an explicit 2-KiB parser bound; long headings stream their actual projection.
+// Both share one uniqueness file.
+// References/footnotes answer only actual dependencies of this heading; Unknown must never become
+// Missing.
 enum Phase {
     Scan,
     Copy { range: Range<usize>, next: usize },
@@ -453,15 +514,19 @@ enum Phase {
     Done,
 }
 
-/// 请求不持正文/历史/映射强引用；巨标题只有原 Fact、固定页和匿名文件，不形成全文 String。
+/// The request retains no text/history/mapping owner; giant headings use their original Fact, fixed
+/// pages, and anonymous scratch without a whole-text string.
 pub struct MarkdownHeadingAnchorRequest {
     source: SourceIdentity,
-    // fragment是唯一外部连续值，已在入口限制到16KiB；请求完成时立即清空其容量。
+    // The sole external contiguous value is the fragment, limited to 16 KiB on entry and released
+    // immediately on completion.
     fragment: String,
     global: Option<GlobalFrontier>,
     phase: Phase,
-    // small仅属于≤2KiB的完整标题；物理前缀、语义seed和Parser必须来自同一Global事实。
-    // 它不是整段落备用缓存，长标题从构造之初就走磁盘投影，不能回退到这里扩容。
+    // small contains one complete heading up to 2 KiB; its physical prefix, semantic seed, and parser
+    // must derive from the same Global fact.
+    // This is no paragraph fallback cache: long headings use disk projection from admission and cannot
+    // fall back here by growing capacity.
     small: Vec<u8>,
     small_leaf: Option<VerifiedGlobalLeafBlock>,
     paragraph: Option<InlineParagraphContext>,
@@ -485,7 +550,8 @@ impl std::fmt::Debug for MarkdownHeadingAnchorRequest {
 }
 
 impl MarkdownDocumentBuffer {
-    /// fragment 已由 URL 边界做一次 percent decode；这里不重解码、不把标题文本当 fragment 规范化。
+    /// The URL boundary decoded the fragment once; do not decode again or normalize heading text as
+    /// though it were that fragment.
     pub fn heading_anchor_request(
         &self,
         fragment: &str,
@@ -494,8 +560,10 @@ impl MarkdownDocumentBuffer {
         if fragment.len() > FRAGMENT_LIMIT || fragment.contains(['\0', '\r', '\n']) {
             return Err(Error::InvalidFragment);
         }
-        // 工作燃料由同一真实Source长度确定；各续体不能因多次advance或新视口重置累计额度。
-        // 结构页保独立有限库存，既不把全文AST放在请求里，也不向消费者交裸坐标签发Fact。
+        // Derive cumulative fuel from the same actual Source length; repeated advances or new viewports
+        // cannot reset it.
+        // Structural pages have separate finite inventory; retain no whole-document AST and grant no
+        // Fact from bare consumer coordinates.
         let bytes = self.byte_len();
         let fuel = bytes
             .checked_mul(4096)
@@ -537,10 +605,13 @@ impl MarkdownDocumentBuffer {
 }
 
 impl MarkdownHeadingAnchorRequest {
-    /// 先撤销权限，再真正归还匿名 FD；取消后任何 advance 都保持取消，绝不恢复旧标题扫描。
+    /// Revoke authority before returning anonymous FDs; subsequent advances remain cancelled and cannot
+    /// restart old heading scans.
     pub fn cancel(&mut self) -> Result<(), Error> {
-        // 先固定取消结局，随后释放全部自有资源；清理失败不能把取消重新解释为可恢复扫描。
-        // 已存在的业务首错仍保留，新增的真实close次因由同一边界一起返回。
+        // Fix cancellation before releasing every owned resource; cleanup failure cannot turn
+        // cancellation into resumable scanning.
+        // Retain an existing primary failure and return any additional actual close failure at the same
+        // boundary.
         self.failure.get_or_insert(Error::Cancelled);
         if let Err(cleanup) = self.release() {
             let primary = self.failure.take().unwrap_or(Error::Cancelled);
@@ -554,10 +625,14 @@ impl MarkdownHeadingAnchorRequest {
         Ok(())
     }
 
+    /// Revoke parsing and attempt all independently owned scratch closes, retaining both failures.
     fn release(&mut self) -> Result<(), Error> {
-        // 先丢Source语义续体及有限文本，撤销后继解析权限，再分别尝试所有fallible close。
-        // projection与slug文件互不代为关闭；任一失败也不能提前跳过另一个真实FD。
-        // Done不代表成功：只有found或已固定failure能解释终态，不能凭清理完成制造Found。
+        // Drop Source semantic continuations and finite text first, revoking further parsing before
+        // attempting each fallible close.
+        // Projection and slug files own independent closes; failure of either cannot skip closing the
+        // other actual FD.
+        // Done alone is not success: found or a fixed failure interprets the terminal state, and
+        // completed cleanup cannot invent Found.
         self.global = None;
         self.small = Vec::new();
         self.small_leaf = None;
@@ -581,7 +656,8 @@ impl MarkdownHeadingAnchorRequest {
         }
     }
 
-    /// 真实首因与真实关闭错误一起保留；后续查询只能重复这个结局，不把清理成功当业务成功。
+    /// Preserve the actual first cause together with close failure; later calls repeat that result,
+    /// never turning cleanup success into lookup success.
     fn fail(&mut self, error: Error) -> Error {
         let primary = self.failure.take().unwrap_or(error);
         let error = match self.release() {
@@ -595,7 +671,8 @@ impl MarkdownHeadingAnchorRequest {
         error
     }
 
-    /// 每次入口先核原映射健康与 root；工作仅推进一个真实阶段，不驱动事件循环或代替 UI 显示。
+    /// Check original mapping health and root at each entry, advancing one actual phase without driving
+    /// the event loop or claiming UI display completion.
     pub fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -607,8 +684,10 @@ impl MarkdownHeadingAnchorRequest {
         if let Some(error) = self.failure.as_ref() {
             return Err(error.clone());
         }
-        // 无效预算也是这个公开请求的真实失败边界；已有scratch必须立即归还，不能只等Drop。
-        // Native使用固定合法量子，公开API调用者同样不能借换budget复活已失败的操作。
+        // An invalid budget is a real failure boundary; immediately return existing scratch instead of
+        // waiting for Drop.
+        // Native uses its fixed valid quantum; public callers also cannot revive failed work by
+        // changing budget.
         if !(4096..=64 * 1024).contains(&budget) {
             return Err(self.fail(Error::InvalidBudget));
         }
@@ -618,6 +697,7 @@ impl MarkdownHeadingAnchorRequest {
         }
     }
 
+    /// Advance one actual phase under the caller's existing quantum and original Source identity.
     fn advance_inner(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -628,8 +708,9 @@ impl MarkdownHeadingAnchorRequest {
             structural_transitions: 1,
             ..Default::default()
         };
-        // 已完成请求可重复领取同一个弱身份结果；每次仍先经过上层Source健康/代次检查。
-        // 这里不再访问关闭后的文件，也不会为同一导航重新分配或重复扫描标题。
+        // Completed requests may return the same weak result again, after the entry's original Source
+        // health/generation checks.
+        // Never access closed files or reallocate/rescan headings for the same completed navigation.
         if matches!(self.phase, Phase::Done) {
             return Ok(match &self.found {
                 Some(target) => Found {
@@ -640,12 +721,14 @@ impl MarkdownHeadingAnchorRequest {
             });
         }
         if self.fragment.is_empty() {
-            return self.finish(document, 0, work); // 空 fragment 的 URL 语义是文档首部，仍先核同源。
+            return self.finish(document, 0, work); // An empty URL fragment means document start, still under the same Source check.
         }
         match &mut self.phase {
             Phase::Scan => {
-                // 只从原全局结构前沿领取标题Fact；代码围栏、HTML和普通段落不会因裸'#'文本误入。
-                // 借页先finish再展开结构错误，真实Source回收失败保留在唯一失败链上。
+                // Accept heading Facts only from the original global structural frontier; a literal #
+                // cannot turn fenced code, HTML, or a paragraph into a heading.
+                // Finish the borrowed page before propagating structural errors, preserving actual
+                // Source reclamation failure in the single error chain.
                 let global = self.global.as_mut().ok_or(Error::ArithmeticOverflow)?;
                 let frame = document.table_source_frame(global.next_byte(), PAGE)?;
                 let borrowed = frame.bytes.len();
@@ -685,8 +768,10 @@ impl MarkdownHeadingAnchorRequest {
                 }
             }
             Phase::Copy { range, next } => {
-                // range已由完整短标题事实及2KiB上限认证；这里只复制当前小页，不重判行/容器语法。
-                // piece边界可切UTF8，全部源字节齐备后才交原Parser校验，片尾绝不是语法EOF。
+                // The complete short-heading Fact and 2-KiB limit certify range; copy only this small
+                // page without reinterpreting line/container syntax.
+                // A piece boundary may split UTF-8; pass complete Source bytes to the original parser
+                // only after acquisition, never treating a piece end as syntax EOF.
 
                 if *next == range.end {
                     self.phase = Phase::Parse;
@@ -708,7 +793,8 @@ impl MarkdownHeadingAnchorRequest {
                     .as_mut()
                     .filter(|context| !context.is_complete())
                 {
-                    // 深容器的短 Setext 必须先闭合原 capture 的真实逐行前缀，不能把片段重判为 Root。
+                    // A short Setext heading inside deep containers must complete its captured physical
+                    // prefixes before parsing; its fragment cannot be reclassified as Root.
                     let step = context
                         .advance(
                             source,
@@ -730,13 +816,17 @@ impl MarkdownHeadingAnchorRequest {
                     work.structural_transitions += measured.transitions;
                     return Ok(Progress { work });
                 }
-                // Parser只解释本标题的真实seed。Start/End界定标题事件，URL/title和原始HTML不混入可见文本。
-                // Code已经由原Parser完成trim/换行规则，Text已经完成实体/转义；这里不再写第二遍语法。
+                // Parse only this heading's actual seed. Start/End delimit heading events; URLs,
+                // titles, and raw HTML never enter visible heading text.
+                // The parser already handled code trimming/line endings and text entities/escapes; do
+                // not implement another syntax pass here.
                 let mut heading = false;
                 let mut completed = false;
                 let mut text = String::new();
-                // 两种引用有不同权威：普通链接需要目标值，脚注只需要真实定义存在性。
-                // 两个callback均只登记有限依赖，不在Parser迭代内做全源I/O或阻塞主线程到EOF。
+                // Reference roles differ: ordinary links need destination values, while footnotes need
+                // actual definition existence.
+                // Both callbacks register bounded dependencies only, without full-Source I/O or
+                // blocking the main thread through EOF during parser iteration.
                 let unresolved = std::cell::Cell::new(false);
                 let references = self.references.as_ref();
                 let fuel = self
@@ -754,7 +844,8 @@ impl MarkdownHeadingAnchorRequest {
                 let footnote_lookup = |label: &str| footnotes.borrow_mut().lookup(label);
                 let mut callback = |link: pulldown_cmark::BrokenLink<'_>| {
                     if let Some(references) = references {
-                        // 只借同一标题真实全源扫描已证的值；Missing 与尚未完成的查询不混为一类。
+                        // Borrow only values certified by this heading's actual Source scan;
+                        // distinguish Missing from unfinished queries.
                         return references.resolve(&link.reference);
                     }
                     unresolved.set(true);
@@ -771,8 +862,10 @@ impl MarkdownHeadingAnchorRequest {
                         crate::markdown_viewport_presentation::parser::markdown_presentation_options(false),
                         Some(&mut callback))
                 };
-                // 只对完整且≤2KiB的真实闭合标题使用原 Parser；绝不分片建 Parser 或放宽输入上限。
-                // 同源脚注答案来自真实全局Fact；Unknown必须先暂停，片段没有定义不代表Missing。
+                // Use the original parser only for complete closed headings up to 2 KiB, without
+                // per-fragment parsers or an enlarged input limit.
+                // Same-Source footnote answers require actual global Facts; Unknown suspends work, and
+                // absent definitions in one fragment do not mean Missing.
                 for event in parser.with_footnote_lookup(&footnote_lookup) {
                     match event {
                         Event::Start(Tag::Heading { .. }) if !heading && !completed => {
@@ -798,15 +891,17 @@ impl MarkdownHeadingAnchorRequest {
                 }
                 work.parser_input_bytes = self.small.len();
                 work.copied_bytes = text.len();
-                // 当前事件文本尚不可信时先丢弃它；真实查询完成后重跑同一小标题，不发布半正确slug。
-                // 脚注会改变原LinkStack的关闭方式，因此其Found/Missing先于最终普通链接语义发布。
+                // Discard event text whose dependencies remain unknown; retry the same bounded heading
+                // only after actual answers arrive, without publishing a partial slug.
+                // Footnotes affect original LinkStack closure, so their Found/Missing answer precedes
+                // final ordinary-link semantic publication.
                 if footnotes_pending {
                     self.phase = Phase::Footnotes;
                     return Ok(Progress { work });
                 }
                 if unresolved.get() {
                     self.phase = Phase::CollectReferences;
-                    return Ok(Progress { work }); // 本量子已运行一次 Parser；查询收集留到下一真实阶段。
+                    return Ok(Progress { work }); // This quantum already ran one parser; dependency collection belongs to the next actual phase.
                 }
                 self.small = Vec::new();
                 self.small_leaf = None;
@@ -816,8 +911,10 @@ impl MarkdownHeadingAnchorRequest {
                 self.phase = Phase::Slug { text, next: 0 };
             }
             Phase::CollectReferences => {
-                // 上一量子已经运行过Parser；依赖收集独立推进，不能把两次整块解释藏在同一收据。
-                // 查询库存只覆盖当前短标题，后置定义仍从原Source按真实先后顺序取得。
+                // The previous quantum ran the parser; advance dependency collection separately rather
+                // than hiding two whole-block parses in one receipt.
+                // Query inventory covers this short heading only; later definitions still come from the
+                // original Source in actual order.
 
                 let source =
                     std::str::from_utf8(&self.small).map_err(|_| Error::UnsupportedInline)?;
@@ -864,8 +961,10 @@ impl MarkdownHeadingAnchorRequest {
                 }
             }
             Phase::Project => {
-                // 长标题先完全闭合共享行内事实，再按源序渲染到slug文件；后文delimiter不会回改已发语义。
-                // 真实标题末端才完成最终Σ判断，文件页尾、视口尾和暂时NeedInput都没有该权限。
+                // Long headings complete shared inline facts before projecting Source order to the slug
+                // file; later delimiters cannot rewrite emitted semantics.
+                // Only actual heading end finalizes sigma, never a file-page end, viewport end, or
+                // temporary NeedInput.
 
                 let projection = self.projection.as_mut().ok_or(Error::UnsupportedInline)?;
                 let (measured, complete) = projection.advance(document, &mut self.slugs, budget)?;
@@ -877,8 +976,10 @@ impl MarkdownHeadingAnchorRequest {
                 }
             }
             Phase::Slug { text, next } => {
-                // 这里的text严格来自有界Parser输出。按完整scalar切片，大小写上下文仍由Slugs跨片保存。
-                // 最终ID与长投影共用同一过滤/碰撞路径，不按两种渲染实现各自生成一份锚点规则。
+                // This text comes strictly from bounded parser output; slice complete scalars while
+                // Slugs retains lowercase context across chunks.
+                // Final IDs and long projections share filtering/collision rules rather than separate
+                // anchor algorithms for each rendering path.
 
                 let mut end = (*next + 256).min(text.len());
                 while !text.is_char_boundary(end) {
@@ -909,8 +1010,10 @@ impl MarkdownHeadingAnchorRequest {
                 }
             }
             Phase::Compare { next, equal } => {
-                // 当前唯一候选只与外部已限制的fragment比较；相等才能发布原Fact对应的UTF16终点。
-                // 不命中则提交最终ID供后继去重，继续原Global，不从当前位置新建一个假文档Parser。
+                // Compare the sole current candidate against the bounded external fragment; equality
+                // alone permits publishing the original Fact's UTF-16 endpoint.
+                // A nonmatch commits its final ID for later uniqueness and resumes the original Global
+                // frontier, without a synthetic parser starting at this position.
 
                 if *equal && *next < self.fragment.len() {
                     let count = (self.fragment.len() - *next).min(PAGE);
@@ -937,13 +1040,16 @@ impl MarkdownHeadingAnchorRequest {
         Ok(Progress { work })
     }
 
+    /// Accept a genuine Global heading Fact and select its bounded or streamed preparation path.
     fn accept_heading(
         &mut self,
         document: &MarkdownDocumentBuffer,
         fact: GlobalFact,
     ) -> Result<(), Error> {
-        // Fact本身决定标题种类及物理首行；长度只选择有界Parser或真实流式实现，绝不改变成员资格。
-        // ATX首行可包含祖先前缀；Setext要保同一Paragraph捕获及underline确定的真实正文末端。
+        // The Fact determines heading kind and physical first line; length chooses bounded parsing or
+        // actual streaming without changing heading membership.
+        // An ATX first line may include ancestor prefixes; Setext preserves the same paragraph capture
+        // and actual body end certified by its underline.
         let (range, physical, long) = match fact {
             GlobalFact::LeafBlock(leaf) if matches!(leaf.kind(), LeafBlockKind::AtxHeading(_)) => {
                 let range = leaf.physical_start()..leaf.source_range().end;
@@ -976,7 +1082,7 @@ impl MarkdownHeadingAnchorRequest {
                                 max_transitions: fuel,
                             })
                             .map_err(Error::Global)?;
-                        drop(origins); // 同一Fact仅移交上下文；不保另一份行目录或Source强图。
+                        drop(origins); // Transfer only this Fact's context, retaining neither another line directory nor a strong Source graph.
                         self.paragraph = seed
                             .bounded_paragraph_context(InlinePlainLimits {
                                 max_byte_work: fuel,
@@ -990,10 +1096,12 @@ impl MarkdownHeadingAnchorRequest {
                     (range, physical, None)
                 }
             }
-            _ => return Ok(()), // 真代码、HTML、引用定义与普通段落均不成为标题候选。
+            _ => return Ok(()), // Actual code, HTML, reference definitions, and ordinary paragraphs do not become heading candidates.
         };
-        // 坐标转换依原树索引而非扫描标题可见文本；UTF8 emoji/组合字符不会被当作一个UTF16单元。
-        // 这里只记录来源终点，最终Source健康、选择和CPU可见位置仍在各自真正拥有层验证。
+        // Convert coordinates through the original tree index, not visible-heading scans; UTF-8
+        // emoji/combining characters are not single UTF-16 units.
+        // Record a Source endpoint only; actual owning layers still verify final Source health,
+        // selection, and visible CPU position.
         self.position = document.utf16_offset_for_byte(physical)?;
         self.slugs.begin()?;
         self.phase = if let Some(source) = long {
@@ -1009,14 +1117,17 @@ impl MarkdownHeadingAnchorRequest {
         Ok(())
     }
 
+    /// Revalidate Source, close owned scratch, then publish a weak canonical endpoint.
     fn finish(
         &mut self,
         document: &MarkdownDocumentBuffer,
         position: usize,
         work: MarkdownHeadingAnchorWork,
     ) -> Result<MarkdownHeadingAnchorStep, Error> {
-        // Found发布紧前再次核原源；全部自有临时文件必须先成功关闭，才把终点交给Native。
-        // 目标仅留Weak品牌和canonical坐标，文档、历史、mmap与字体资源都不会被导航结果强保。
+        // Recheck original Source immediately before Found; close every owned temporary successfully
+        // before handing the endpoint to Native.
+        // The target keeps weak branding and canonical coordinates only; navigation results retain no
+        // document, history, mmap, or font owner.
         self.source.require(document)?;
         let target = MarkdownHeadingAnchorTarget {
             source: self.source.clone(),
@@ -1028,7 +1139,8 @@ impl MarkdownHeadingAnchorRequest {
     }
 }
 
-/// GitHub section-link的空格/标点过滤只消费一个真实lowercase scalar；不做语言地区化或NFKC。
+/// Section-link whitespace/punctuation filtering consumes one actual lowercase scalar, without
+/// locale-specific casing or NFKC.
 fn slug_scalar(scalar: char) -> Option<char> {
     if scalar == ' ' {
         return Some('-');
@@ -1043,9 +1155,12 @@ fn slug_scalar(scalar: char) -> Option<char> {
     .then_some(scalar)
 }
 
-/// 与现有unicode-properties 0.1.4同为Unicode17：D136规定的GC集合加WordBreak三个真实集合。
-/// WordBreak的17个标点来自该版MidLetter/MidNumLet/Single_Quote；不能把所有标点或所有Mark视为可忽略。
-/// 权威：https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt 与 auxiliary/WordBreakProperty.txt。
+/// Unicode 17 Case_Ignorable follows D136 general-category sets plus three actual WordBreak classes,
+/// matching unicode-properties 0.1.4.
+/// The 17 punctuation scalars belong to MidLetter/MidNumLet/Single_Quote in that version; neither all
+/// punctuation nor all marks are ignorable.
+/// Authority: https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt and
+/// auxiliary/WordBreakProperty.txt.
 fn case_ignorable(scalar: char) -> bool {
     matches!(
         scalar.general_category(),
@@ -1078,7 +1193,8 @@ fn case_ignorable(scalar: char) -> bool {
 
 impl Drop for MarkdownHeadingAnchorRequest {
     fn drop(&mut self) {
-        // 遗弃请求没有可返回错误的边界；File RAII 仍回收唯一 FD，普通终态已在 release 中显式关闭。
+        // An abandoned request has no error-return boundary; File RAII still returns its sole FD, while
+        // ordinary terminal paths close explicitly in release.
         drop(self.slugs.file.take());
     }
 }

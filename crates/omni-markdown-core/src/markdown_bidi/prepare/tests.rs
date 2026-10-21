@@ -665,5 +665,5 @@ fn actual_file_profile_reports_each_quantum_and_final_resource_release() {
         receipt.snapshot().close_succeeded,
         source_observer.payload_released(),
         mapping.unmap_succeeded()
-    ); // 这是单组件真实预算与资源实测，不替代完整产品延迟、footprint或150MB验收。
+    ); // Actual component work and release observations do not establish whole-product latency or memory compliance.
 }

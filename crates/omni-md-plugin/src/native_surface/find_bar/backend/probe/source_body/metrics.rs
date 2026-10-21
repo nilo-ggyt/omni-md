@@ -61,5 +61,6 @@ pub(super) fn sample(stage: &str) -> Result<(), String> {
         "native_body_find memory_stage={stage} resident_bytes={resident} internal_bytes={internal} external_bytes={external} reusable_bytes={reusable} footprint_bytes={footprint} graphics_footprint_bytes={graphics} lifetime_footprint_peak_bytes={} max_resident_bytes={max_resident} isolated=true whole_product=false formal=false",
         usage.ri_lifetime_max_phys_footprint
     );
-    Ok(()) // 诊断只发布真实值；是否严格低于150MB必须由包含全部场景的独立产品验收判断。
+    // Report actual diagnostic values only; an independent complete product workload owns budget verification.
+    Ok(())
 }
