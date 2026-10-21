@@ -1,9 +1,12 @@
-// 同一有限fixture与独立HarfRust oracle；产品没有完整String、Vec字形或公开Range起点入口。
+// Use the same finite fixture and independent HarfRust oracle. Product continuation exposes
+// neither a complete text String/glyph Vec nor a start reconstructed from a public Range.
 fn emergency_expected<'a>(
     all: &'a [MarkdownShapedGlyph],
     range: &Range<usize>,
     direction: MarkdownShapingDirection,
 ) -> &'a [MarkdownShapedGlyph] {
+    // Select independent oracle glyphs by actual monotone source clusters in their visual
+    // direction, without using any tested safe-slice token's glyph-index interval.
     let (first, end) = if direction == MarkdownShapingDirection::RightToLeft {
         (
             all.partition_point(|glyph| glyph.source_utf16_cluster >= range.end),
@@ -15,13 +18,15 @@ fn emergency_expected<'a>(
             all.partition_point(|glyph| glyph.source_utf16_cluster < range.end),
         )
     };
-    &all[first..end] // oracle按真实source cluster独立找区间，不使用待测token给出的glyph下标。
+    &all[first..end] // Original source clusters, not the tested token's glyph ordinals, determine this expected slice.
 }
 fn emergency_seal_and_compare(
     fixture: &mut Fixture,
     line: MarkdownEmergencyGlyphSliceLine,
     expected: &[MarkdownShapedGlyph],
 ) {
+    // Consume the actual safe slice into the real spool builder, while checking boundary width
+    // and every glyph field against the independently selected complete oracle.
     let (boundary, slice) = line.into_parts();
     let facts = slice.facts();
     assert_eq!(facts.source_utf16, boundary.source_utf16);
@@ -52,6 +57,8 @@ fn emergency_seal_and_compare(
         y_offset: 0,
     }; 256];
     let mut read = 0;
+    // Read only the production batch limit at once; the full expected glyph array belongs
+    // exclusively to this finite independent control.
     while read < expected.len() {
         let next = (read + 256).min(expected.len());
         spool
@@ -63,7 +70,7 @@ fn emergency_seal_and_compare(
                 &mut actual[..next - read],
             )
             .unwrap();
-        assert_eq!(&actual[..next - read], &expected[read..next]); // flags与所有几何字段保留原完整oracle。
+        assert_eq!(&actual[..next - read], &expected[read..next]); // Preserve flags and every geometry field from the complete independent oracle.
         read = next;
     }
     assert_eq!(
@@ -78,6 +85,7 @@ fn emergency_seal_and_compare(
         None
     );
     spool.close().unwrap();
+    // Actual descriptor close is independent of correct glyph bytes and logical EOF.
     let resources = observer.snapshot();
     assert!(!resources.file_open && resources.close_succeeded && !resources.cleanup_failed);
 }
@@ -89,6 +97,8 @@ fn emergency_stream(
     expect_overflow: bool,
     combining_pairs: bool,
 ) -> MarkdownEmergencyGlyphSliceWork {
+    // Construct one original full-item oracle, then consume actual safe lines in FIFO order.
+    // The iteration guard fails incomplete finite inputs rather than promoting Pending to success.
     let all = oracle(fixture, text, fixture.shape.source_range());
     let original_profile = fixture.shape.profile().unwrap();
     let measure = fixture.measure(start, width);
@@ -113,6 +123,8 @@ fn emergency_stream(
         assert!(step.candidates <= 17 && step.shapes <= 1 && step.input_bytes <= 4096);
         match step.answer {
             MarkdownEmergencyGlyphSliceAnswer::ReusableLine(boundary) => {
+                // Literal combining-pair boundaries supplement production GCB validation;
+                // an overwide complete GCB is reported honestly rather than sliced to fit.
                 assert_eq!(boundary.source_utf16.start, cursor);
                 assert!(boundary.source_utf16.end > cursor);
                 if combining_pairs {
@@ -137,6 +149,8 @@ fn emergency_stream(
                 source_utf16_end,
                 source_eof,
             } => {
+                // Require complete original Source coverage and every oracle glyph exactly once.
+                // Safe reuse must preserve the original shape and perform no new input or shapes.
                 assert!(source_eof);
                 assert_eq!(source_utf16_end, fixture.source.utf16_len());
                 assert_eq!(cursor, source_utf16_end);
@@ -164,6 +178,8 @@ fn emergency_stream(
 
 #[test]
 fn emergency_long_unbroken_ascii_work_is_one_original_shape_and_linear_candidates() {
+    // Two finite input sizes exercise actual safe continuation and complete output. Printed
+    // timing includes the independent oracle and real temporary spools, not native editing work.
     for count in [4096, 8192] {
         let text = format!("前\n{}", "7".repeat(count));
         let mut fixture = Fixture::new(&text, 2..count + 2, MarkdownShapingDirection::LeftToRight);
@@ -181,10 +197,12 @@ fn emergency_long_unbroken_ascii_work_is_one_original_shape_and_linear_candidate
             work.lines,
             now.elapsed().as_micros()
         );
-    } // 时间包括独立oracle与临时spool控制，不冒充整产品延迟或内存验收。
+    } // This elapsed time is not whole-product latency or memory acceptance.
 }
 #[test]
 fn emergency_rtl_nonzero_source_and_combining_clusters_reuse_without_tail_shapes() {
+    // Nonzero global coordinates, RTL visual order, and combining pairs retain the actual
+    // original glyph array; no tail shape may be manufactured merely to continue a safe line.
     let text = format!("前\n{}", "0123456789".repeat(512));
     let end = text.encode_utf16().count();
     let mut fixture = Fixture::new(&text, 2..end, MarkdownShapingDirection::RightToLeft);
@@ -196,6 +214,8 @@ fn emergency_rtl_nonzero_source_and_combining_clusters_reuse_without_tail_shapes
 }
 #[test]
 fn emergency_one_huge_grapheme_is_actual_overflow_and_never_sliced() {
+    // The entire finite combining chain is one actual GCB. One explicit overflowing line must
+    // preserve it rather than produce apparently fitting fragments.
     let text = format!("a{}", "\u{301}".repeat(4096));
     let mut fixture = Fixture::new(&text, 0..4097, MarkdownShapingDirection::LeftToRight);
     let work = emergency_stream(&mut fixture, &text, 0, 1, true, false);
@@ -205,6 +225,8 @@ fn emergency_one_huge_grapheme_is_actual_overflow_and_never_sliced() {
 
 #[test]
 fn emergency_internal_ligature_candidate_keeps_actual_owned_reshape_path() {
+    // This real ligature sample selects an interior cluster endpoint. The complete-prefix/tail
+    // constructor must actually reshape both sides; safe-array reuse cannot impersonate that work.
     let text = "ffi".repeat(64);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let measure = fixture.measure(0, 1);
@@ -242,10 +264,12 @@ fn emergency_internal_ligature_candidate_keeps_actual_owned_reshape_path() {
     let release = observer.snapshot();
     assert_eq!(release.active_jobs, 0);
     assert_eq!(release.jobs_created, release.jobs_released);
-} // 此路径明确仍会整形真实tail，不宣称所有unsafe文本的总工作已线性。
+} // This path still shapes an actual tail; it is not evidence of linear total work for every unsafe input.
 
 #[test]
 fn emergency_original_measure_and_source_identity_are_not_replaceable() {
+    // A second same-source measure and an independent same-byte Source each lack the original
+    // selected authority. First rejection must retire this operation rather than allow recapture.
     let text = "7".repeat(128);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let measure = fixture.measure(0, 5000);
@@ -288,6 +312,8 @@ fn emergency_original_measure_and_source_identity_are_not_replaceable() {
 }
 #[test]
 fn emergency_cancel_source_errno_and_last_real_mapping_release_are_observed() {
+    // Keep the existing reclaim-failure injection, then also cancel. Original backing failure
+    // must win both step and close, while actual final Source/mapping release remains observable.
     let text = "7".repeat(8192);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let measure = fixture.measure(0, 5000);
@@ -331,6 +357,8 @@ fn emergency_cancel_source_errno_and_last_real_mapping_release_are_observed() {
 #[test]
 #[cfg(target_os = "macos")]
 fn emergency_cjk_real_font_keeps_true_uax_limits_without_faking_eof_or_recreating_shape() {
+    // Own the finite Chinese file and use the actual read-only system font mapping. This is a
+    // Core font/shape control, not AppKit painting, native font-cache release, or product RSS evidence.
     let text = "中".repeat(512);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("紧急中文真实字体.md");
@@ -346,6 +374,8 @@ fn emergency_cjk_real_font_keeps_true_uax_limits_without_faking_eof_or_recreatin
     let observer = bytes.resource_observer();
     let font = MarkdownLayoutFont::resolve(bytes.blob(), "HiraginoSansGB-W3", &[]).unwrap();
     let font_authority = font.authority();
+    // Preserve actual Hani/zh shaping and paragraph context, then complete the original shape,
+    // cluster index, and line-break index once for all independent starting positions.
     let options = MarkdownShapingOptions {
         direction: MarkdownShapingDirection::LeftToRight,
         script: *b"Hani",
@@ -391,6 +421,8 @@ fn emergency_cjk_real_font_keeps_true_uax_limits_without_faking_eof_or_recreatin
     let all = oracle(&fixture, &text, 0..512);
     let mut candidates = 0;
     for start in 0..512 {
+        // Each original measure has a genuine CJK break limit. Ending that one-character scope
+        // proves whole-Source EOF only for the actual last character, not every prefix.
         let measure = fixture.measure(start, 1);
         let mut job = MarkdownEmergencyGlyphSliceJob::new(&measure, &mut fixture.shape).unwrap();
         loop {
@@ -433,6 +465,8 @@ fn emergency_cjk_real_font_keeps_true_uax_limits_without_faking_eof_or_recreatin
                 if source_utf16_end == start + 1 && source_eof == (start == 511))
         );
         let work = job.work(&measure, &mut fixture.shape).unwrap();
+        // Reuse consumes no new shape/input; these Core work observations do not replace the
+        // independently checked complete glyphs or eventual real font-mapping teardown.
         assert_eq!(work.shape_calls, 0);
         assert_eq!(work.new_shape_input_bytes, 0);
         candidates += work.candidates;
@@ -442,6 +476,7 @@ fn emergency_cjk_real_font_keeps_true_uax_limits_without_faking_eof_or_recreatin
     assert_eq!(fixture.shape.profile().unwrap().input_scalars, 512);
     drop(fixture);
     drop(bytes);
+    // Only actual final font owners may return the mapped bytes and backing descriptor.
     assert!(
         observer.mapping_drop_completed()
             && observer.unmap_succeeded()
@@ -453,6 +488,8 @@ fn emergency_cjk_real_font_keeps_true_uax_limits_without_faking_eof_or_recreatin
 
 #[test]
 fn emergency_clean_cancel_permanently_drops_selector_and_releases_real_sources() {
+    // Normal cancellation without injected backing failure permanently retires this selector.
+    // Final Source/unmap success requires dropping the actual original measure and fixture too.
     let text = "7".repeat(128);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let measure = fixture.measure(0, 5000);

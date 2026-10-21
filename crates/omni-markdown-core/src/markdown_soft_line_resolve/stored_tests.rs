@@ -1,13 +1,17 @@
-// 这里借真实JobProvider控制selector共用性；不把它冒称为实际Store目录或其释放证据。
+// Exercise the shared selector through its actual JobProvider. This control is not an actual
+// Store directory and establishes no evidence of that directory's resource release.
 #[test]
 fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail() {
+    // Walk real selected prefixes under one original permit, using independent complete
+    // HarfRust glyphs for each line in both directions. Remainder coordinates promise no tail shape.
     for direction in [
         MarkdownShapingDirection::LeftToRight,
         MarkdownShapingDirection::RightToLeft,
     ] {
         let text = format!("前\n{}", "ffi".repeat(128));
         let mut fixture = Fixture::new(&text, 2..2 + 128 * 3, direction);
-        // UTF8与UTF16总长不同，真实item取明确UTF16端点，不能用字节长度冒充全局坐标。
+        // UTF-8 and UTF-16 lengths differ here. The actual item has explicit UTF-16 endpoints;
+        // byte length cannot stand in for global source coordinates.
         let end = fixture.shape.source_range().end;
         let backing = fixture.document.original_backing_observer().unwrap();
         let source_drop = fixture.source.resource_observer();
@@ -38,6 +42,8 @@ fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail(
             assert!(step.shapes <= 1 && step.input_bytes <= 4096 && step.glyphs <= 256);
             match step.answer {
                 MarkdownEmergencyGlyphSliceAnswer::ShapedPrefix(boundary) => {
+                    // Require the real signed child's original Source and exact boundary before
+                    // comparing every glyph, advance, and flags against the independent oracle.
                     assert_eq!(boundary.source_utf16.start, cursor);
                     let expected = oracle(&fixture, &text, boundary.source_utf16.clone());
                     let mut provider = JobGlyphProvider::new(&mut fixture.shape, None);
@@ -68,6 +74,8 @@ fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail(
                             .is_none()
                     );
                     let mut clusters = prefix.cluster_index(&permit, &mut provider).unwrap();
+                    // Build and query the actual child-bound index; the original stored item's
+                    // index cannot donate a same-range cluster answer to this new prefix.
                     while clusters.status() != MarkdownGlyphClusterStatus::Ready {
                         prefix
                             .step_clusters(&permit, &mut provider, &mut clusters, 7)
@@ -85,12 +93,14 @@ fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail(
                         matches!(cluster, MarkdownGlyphClusterAnswer::Known(Some(value))
                         if value.source_utf16 == boundary.source_utf16)
                     );
-                    drop(clusters); // 真实child索引先归还；不能只关闭签包就假称全部派生FD已释放。
+                    drop(clusters); // Return the actual child index first; closing only the packet proves no release of independent derived descriptors.
                     actual_bytes += byte_offset(&text, boundary.source_utf16.end)
                         - byte_offset(&text, boundary.source_utf16.start);
                     let waiting = stream
                         .step(&permit, &mut provider, &mut fixture.breaks, tiny())
                         .unwrap();
+                    // Taking ownership is not destruction. A still-live child enforces real
+                    // backpressure without clearing its payload or creating another line job.
                     assert_eq!(
                         waiting.answer,
                         MarkdownEmergencyGlyphSliceAnswer::PendingPrefixConsumer
@@ -104,6 +114,8 @@ fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail(
                 MarkdownEmergencyGlyphSliceAnswer::PrefixComplete {
                     source_utf16_end, ..
                 } => {
+                    // Full fixture coverage is independent of per-line correctness; no source
+                    // bytes may disappear between successful prefix handoffs.
                     assert_eq!(source_utf16_end, end);
                     assert_eq!(cursor, end);
                     break;
@@ -113,13 +125,15 @@ fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail(
             }
         }
         assert_eq!(new_bytes, actual_bytes);
-        assert_eq!(new_bytes, end - 2); // 此有限ASCII链每行只输入实际prefix，不重读剩余tail。
+        assert_eq!(new_bytes, end - 2); // Each finite ASCII line ingests only its actual prefix, without reshaping the remaining tail.
         assert_eq!(lines, end - 2);
         let facts = stream.close().unwrap();
         assert!(facts.peak_active_jobs <= 2 && !facts.cleanup_failed);
         assert_eq!(facts.jobs_created, facts.jobs_released);
         drop(measure);
         drop(fixture);
+        // Resource success follows actual owner Drop; logical cancellation or a transfer alone
+        // cannot establish Source payload release and backing unmap.
         assert!(source_drop.payload_released());
         assert!(backing.unmap_succeeded() && !backing.failed());
     }
@@ -127,6 +141,8 @@ fn resolution_permit_prefix_stream_preserves_global_glyphs_without_shaping_tail(
 
 #[test]
 fn resolution_permit_rejects_safe_choice_and_foreign_original_measure() {
+    // The actual selector's safe choice needs no unsafe-prefix permit. A second same-source
+    // measure also cannot supply the nonce belonging to an already admitted stream.
     let mut safe = Fixture::new("123 456", 0..7, MarkdownShapingDirection::LeftToRight);
     let measure = safe.measure(0, 100_000);
     assert!(matches!(
@@ -164,6 +180,8 @@ fn resolution_permit_rejects_safe_choice_and_foreign_original_measure() {
 
 #[test]
 fn resolution_permit_source_errno_precedes_cancel_and_releases_actual_payloads() {
+    // Retain the existing reclaim-failure injection to check Source health before cancellation.
+    // This is an injected production error path, not observation of spontaneous filesystem EIO.
     let text = "ffi".repeat(16);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let backing = fixture.document.original_backing_observer().unwrap();
@@ -202,11 +220,13 @@ fn resolution_permit_source_errno_precedes_cancel_and_releases_actual_payloads()
     drop(measure);
     drop(fixture);
     assert!(source_drop.payload_released());
-    assert!(backing.unmap_succeeded() && backing.failed()); // 真实失败不被释放成功洗掉。
+    assert!(backing.unmap_succeeded() && backing.failed()); // Actual release success must not erase the recorded failure.
 }
 
 #[test]
 fn original_selector_cannot_rebind_to_later_item_of_same_measure() {
+    // A real measure may continue into its next original item, but a resolver captured before
+    // that transition still owns only its original selected seed/provider identity.
     let mut fixture = Fixture::new("abcdef", 0..3, MarkdownShapingDirection::LeftToRight);
     let mut measure = fixture.measure(0, 100_000);
     let mut resolver = MarkdownSoftLineResolveJob::new(&measure, &mut fixture.shape).unwrap();
@@ -247,11 +267,14 @@ fn original_selector_cannot_rebind_to_later_item_of_same_measure() {
         ))
     ));
     assert_eq!(resolver.resource_observer().snapshot().jobs_created, 0);
-    // 原selector只拥有第一项的票；合法continue不授权它用第二项重解释旧选择，即使没有新shape。
+    // Valid measure continuation does not authorize the old selector to reinterpret its prior
+    // choice under the second item, even before it creates another child shape.
 }
 
 #[test]
 fn signed_prefix_foreign_measure_rejection_drops_real_child_and_cannot_reauthorize() {
+    // Form one actual Ready prefix before supplying a foreign permit. Rejection must destroy
+    // that concrete child and leave the packet permanently unable to read under its old permit.
     let text = "ffi".repeat(8);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     let measure = fixture.measure(0, 1);
@@ -300,7 +323,7 @@ fn signed_prefix_foreign_measure_rejection_drops_real_child_and_cannot_reauthori
             MarkdownSoftLineMeasureError::JobMismatch
         ))
     ));
-    assert_eq!(resources.snapshot().active_jobs, 0); // 真正child已Drop，不能以撤权限标量代替此收据。
+    assert_eq!(resources.snapshot().active_jobs, 0); // The concrete child actually dropped; revocation alone would not establish this receipt.
     assert!(matches!(
         prefix.glyph(
             &permit,

@@ -1,8 +1,10 @@
-//! 同一原Ready数组的紧急续行；共享原selector，不按剩余全文反复创建Measure或shaper。
+//! Continue emergency lines from the same original Ready glyph array. Share the original
+//! selector instead of repeatedly measuring or shaping the entire remaining source.
 use super::*;
 use crate::{MarkdownSafeGlyphSlice, MarkdownSafeGlyphSliceError};
 
-/// 只报告原数组切片与真实源范围；没有伪造的tail flags并集或Native布局Ready。
+/// Facts for the original glyph slice and actual source range only, without a fabricated tail
+/// flags union or any claim that Native layout is Ready.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownEmergencyGlyphSliceBoundary {
     pub source_utf16: std::ops::Range<usize>,
@@ -11,7 +13,8 @@ pub struct MarkdownEmergencyGlyphSliceBoundary {
     pub x_advance_26_6: i64,
     pub glyphs: usize,
 }
-/// 只描述已实际整形的前缀。remainder是尚待消费的源坐标，没有tail字形数或flags承诺。
+/// Describe only the actually shaped prefix. Remainder contains unconsumed source coordinates,
+/// with no promise of tail glyph count, flags, or Ready shaping output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownEmergencyShapedPrefixBoundary {
     pub source_utf16: std::ops::Range<usize>,
@@ -38,16 +41,19 @@ pub enum MarkdownEmergencyGlyphSliceAnswer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownEmergencyGlyphSliceStep {
     pub input_bytes: usize,
-    /// 原重排步骤实际消费的标量；安全复用路径保持零，不按字形数换算。
+    /// Actual scalars consumed by original reshape work; safe reuse stays zero rather than
+    /// converting glyph counts into fabricated scalar consumption.
     pub input_scalars: usize,
-    /// 本轮新 Job 的真实上下文读取，沿原解析步骤交回，不重复算入正文输入。
+    /// Actual adjacent-context reads of newly created jobs, forwarded from the original resolver
+    /// turn separately from its text input.
     pub context_bytes: usize,
     pub glyphs: usize,
     pub candidates: usize,
     pub shapes: usize,
     pub answer: MarkdownEmergencyGlyphSliceAnswer,
 }
-/// 原始item只整形一次；后续真实新输入和shape单独计数，不能把元数据查询冒充零工作。
+/// Count original-item shaping separately from subsequent actual input and shaping. Metadata
+/// candidate work remains visible rather than being described as zero work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarkdownEmergencyGlyphSliceWork {
     pub original_input_scalars: usize,
@@ -59,6 +65,8 @@ pub struct MarkdownEmergencyGlyphSliceWork {
 }
 impl MarkdownEmergencyGlyphSliceWork {
     fn add(&mut self, step: &MarkdownSoftLineResolveStep) -> Result<()> {
+        // Preserve checked cumulative work from the same resolver turns. Overflow is an error,
+        // not a wrapped low count that could falsely imply bounded processing.
         self.new_shape_input_bytes = self
             .new_shape_input_bytes
             .checked_add(step.input_bytes)
@@ -74,7 +82,8 @@ impl MarkdownEmergencyGlyphSliceWork {
         Ok(())
     }
 }
-/// 非Clone；消费后才得到原安全切片。公开Boundary副本不能用作后继起点权限。
+/// Not Clone; consumption transfers the actual safe slice. Public boundary copies cannot
+/// authorize a successor start position.
 pub struct MarkdownEmergencyGlyphSliceLine {
     boundary: MarkdownEmergencyGlyphSliceBoundary,
     slice: MarkdownSafeGlyphSlice,
@@ -90,7 +99,8 @@ impl MarkdownEmergencyGlyphSliceLine {
     }
 }
 
-/// worker局部单item续行；只保一个待交付切片和原selector有限状态，不新建glyph索引。
+/// Worker-local continuation of one item, retaining one pending slice and finite original
+/// selector state without creating another glyph index.
 pub struct MarkdownEmergencyGlyphSliceJob {
     inner: MarkdownSoftLineResolveJob,
     line: Option<MarkdownEmergencyGlyphSliceLine>,
@@ -99,7 +109,8 @@ pub struct MarkdownEmergencyGlyphSliceJob {
     work: MarkdownEmergencyGlyphSliceWork,
 }
 impl MarkdownEmergencyGlyphSliceJob {
-    /// 原Measure必须实际选中NeedsEmergencyBreak；自然断点走已有安全工厂，不造任意Range。
+    /// The original Measure must actually select emergency resolution. Natural breaks use their
+    /// existing safe factory, rather than an arbitrary Range admitted by this constructor.
     pub fn new(
         measure: &MarkdownSoftLineMeasureJob,
         original: &mut MarkdownShapingJob,
@@ -140,7 +151,8 @@ impl MarkdownEmergencyGlyphSliceJob {
             },
         })
     }
-    /// 显式只交付真实行前缀；原new仍保留完整tail对照合同，不暗改旧调用方。
+    /// Explicitly deliver actual line prefixes only. The separate complete-prefix/tail contract
+    /// of new remains intact; selecting this mode does not silently alter another caller's result.
     pub fn new_prefix_only(
         measure: &MarkdownSoftLineMeasureJob,
         original: &mut MarkdownShapingJob,
@@ -166,10 +178,13 @@ impl MarkdownEmergencyGlyphSliceJob {
         measure: &MarkdownSoftLineMeasureJob,
         original: &mut MarkdownShapingJob,
     ) -> Result<MarkdownEmergencyGlyphSliceWork> {
+        // Work observations require the same original measure/job authority as actual processing.
         self.inner.guard(measure, original)?;
         Ok(self.work)
     }
     fn fail<T>(&mut self, error: MarkdownSoftLineResolveError) -> Result<T> {
+        // Revoke and drop this owner's pending slice and real selector payload first. A backing
+        // failure revealed during that cleanup retains precedence over the outer error.
         drop(self.line.take());
         drop(self.inner.payload.take());
         if let Some(errno) = self
@@ -190,6 +205,8 @@ impl MarkdownEmergencyGlyphSliceJob {
         breaks: &mut MarkdownLayoutBreakJob,
         budget: MarkdownSoftLineResolveBudget,
     ) -> Result<MarkdownEmergencyGlyphSliceStep> {
+        // Every failed bounded turn retires this same operation, without keeping a reusable
+        // shell that could later borrow another measure's authority.
         let result = self.advance(measure, original, clusters, breaks, budget);
         match result {
             Ok(value) => Ok(value),
@@ -205,6 +222,8 @@ impl MarkdownEmergencyGlyphSliceJob {
         budget: MarkdownSoftLineResolveBudget,
     ) -> Result<MarkdownEmergencyGlyphSliceStep> {
         self.inner.guard(measure, original)?;
+        // A zero budget is an invalid turn, not an excuse to return an unchanged successful
+        // answer or bypass the original-owner guard.
         if budget.input_bytes == 0
             || budget.input_scalars == 0
             || budget.glyphs == 0
@@ -219,14 +238,16 @@ impl MarkdownEmergencyGlyphSliceJob {
                 ));
             }
             self.prefix_outstanding = false;
-        } // 只有实际child析构后才开始下一行；不保N个Job，也不把交接当资源已归还。
+        } // Start the next line only after actual child destruction; handoff alone neither frees resources nor permits retaining many jobs.
         if let Some(line) = self.line.as_mut() {
             line.slice.require(original)?;
             return Ok(empty_step(MarkdownEmergencyGlyphSliceAnswer::ReusableLine(
                 line.boundary.clone(),
             )));
-        } // 重复观察同一行不重复签票或累计计数；须take_line后才能推进内部起点。
+        } // Reobserving one line issues no new slice or work count; only take_line advances the private source start.
         if let Some((end, eof)) = self.complete {
+            // Ending this selected prefix does not manufacture source EOF; the stored scalar
+            // records whether its actual endpoint equals the original Source's complete length.
             return Ok(empty_step(
                 MarkdownEmergencyGlyphSliceAnswer::PrefixComplete {
                     source_utf16_end: end,
@@ -244,8 +265,11 @@ impl MarkdownEmergencyGlyphSliceJob {
             .as_ref()
             .ok_or(MarkdownSoftLineResolveError::Poisoned)?;
         let answer = if matches!(payload.stage, Stage::ShapedPrefix) {
+            // This branch has one actual Ready child and only coordinates for unresolved remainder.
             MarkdownEmergencyGlyphSliceAnswer::ShapedPrefix(prefix_boundary(payload)?)
         } else if matches!(payload.stage, Stage::Reusable) {
+            // Safe reuse still requires the original selector choice, GCB, cluster, Source/Font,
+            // and actual glyph array. Dependency Pending cannot be relabeled as a safe slice.
             let choice = MarkdownEmergencyResolvedChoice::new(payload)?;
             match MarkdownSafeGlyphSlice::from_emergency_selection(
                 &choice, measure, original, breaks, clusters,
@@ -287,7 +311,7 @@ impl MarkdownEmergencyGlyphSliceJob {
                 MarkdownSoftLineResolveAnswer::EmptySource => {
                     return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
                 }
-            } // unsafe/cluster内部沿原真实prefix+tail路径，不能包装成安全复用或声称线性工作。
+            } // Unsafe/interior-cluster candidates keep actual reshape results; they are not safe reuse or universal linear-work evidence.
         };
         self.inner.guard(measure, original)?;
         Ok(MarkdownEmergencyGlyphSliceStep {
@@ -300,7 +324,8 @@ impl MarkdownEmergencyGlyphSliceJob {
             answer,
         })
     }
-    /// FIFO消费当前已核GCB行。下一起点仅在此内部更新，不接受公开Range或外部Start票。
+    /// Consume the current GCB-verified line in FIFO order. Update the next start privately;
+    /// no public Range or externally constructed Start ticket can replace this transition.
     pub fn take_line(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -341,7 +366,8 @@ impl MarkdownEmergencyGlyphSliceJob {
             Err(error) => self.fail(error),
         }
     }
-    /// 取走真正Ready的前缀Job。下一步须先消费并释放它，余文仍由本selector私有cursor推进。
+    /// Transfer the actually Ready prefix job. Consume and release it before the next turn;
+    /// unresolved remainder still advances only through this selector's private cursor.
     pub fn take_shaped_prefix(
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -387,7 +413,8 @@ impl MarkdownEmergencyGlyphSliceJob {
             Err(error) => self.fail(error),
         }
     }
-    /// 仅真实Reshaped回答可交接；其余阶段不能用坐标副本构造伪新Job。
+    /// Only an actual Reshaped answer can transfer complete parts. Other phases cannot create
+    /// replacement jobs from copied coordinates.
     pub fn take_reshaped_parts(
         self,
         measure: &MarkdownSoftLineMeasureJob,
@@ -396,11 +423,15 @@ impl MarkdownEmergencyGlyphSliceJob {
         self.inner.take_parts(measure, original)
     }
     pub fn close(self) -> Result<MarkdownSoftLineResolveResources> {
+        // Drop the pending safe slice before closing the actual resolver; transferred children
+        // remain their consumers' real ownership and cannot be counted as already destroyed.
         drop(self.line);
         self.inner.close()
     }
 }
 fn empty_step(answer: MarkdownEmergencyGlyphSliceAnswer) -> MarkdownEmergencyGlyphSliceStep {
+    // Observation and consumer backpressure perform no new shaping work, while retaining their
+    // distinct actual answer instead of pretending that Pending is Ready or source EOF.
     MarkdownEmergencyGlyphSliceStep {
         input_bytes: 0,
         input_scalars: 0,
@@ -412,11 +443,14 @@ fn empty_step(answer: MarkdownEmergencyGlyphSliceAnswer) -> MarkdownEmergencyGly
     }
 }
 
-/// 相同原Job的封闭FIFO起点；来自真实GCB已选端点，不由公开Range或窗口边界恢复。
+/// Closed FIFO start for the same original Job, derived from its selected actual GCB endpoint,
+/// never reconstructed from a public Range or viewport edge.
 pub(super) fn advance_source_start(
     payload: &mut Payload,
     end: usize,
 ) -> Result<Option<(usize, bool)>> {
+    // Require genuine forward progress to the currently selected endpoint inside this original
+    // limit. Reaching the limit completes this scope; only actual Source end establishes EOF.
     if end <= payload.seed.start || end > payload.limit || end != payload.selected_end {
         return Err(MarkdownSoftLineResolveError::InconsistentCoverage);
     }
@@ -433,11 +467,14 @@ pub(super) fn advance_source_start(
     payload.kind = MarkdownSoftLineResolvedKind::Natural;
     payload.scan = GlyphFacts::default();
     payload.line_facts = GlyphFacts::default();
-    // 保留Mode::Emergency、原item/font/features/取消与nonce。原Source邻接context仍由原
-    // reshape_subrange读取；软行不产生新BOT/EOT，真实未消费tail也不产生Ready或伪GlyphProvider。
+    // Preserve emergency mode and original item/font/features/cancellation/nonce. Existing
+    // reshape_subrange still reads adjacent context from the original Source. Soft lines create
+    // no synthetic BOT/EOT, and unconsumed tail creates neither Ready nor a substitute GlyphProvider.
     Ok(None)
 }
 pub(super) fn prefix_boundary(payload: &Payload) -> Result<MarkdownEmergencyShapedPrefixBoundary> {
+    // Only the actual prefix-only stage with one Ready line and no other trial/tail can report
+    // prefix glyph facts. Its remainder coordinates carry no glyph/flags promise.
     if !payload.defer_tail
         || !matches!(payload.stage, Stage::ShapedPrefix)
         || payload.line.is_none()

@@ -1,8 +1,8 @@
-//! 原同源字形item的有限断点测量；结果只属于宽度选择阶段，不是Native软行Ready。
+//! Measure finite break candidates from original same-Source glyph items; a width choice is not a Native soft line that is ready to draw.
 //!
-//! 顺序消费真实cluster与GCB∩UAX14机会，采用首个超宽机会之前的最后合格候选。
-//! 有符号advance不单调，因此不对宽度做二分，也不跳过中间cluster。unsafe边界、缺字、
-//! 词典和跨item会明确交还后继阶段；本模块不新建shaper、不设置窗口BOT/EOT。
+//! Consume actual clusters and GCB/UAX14 intersections in order, choosing the last fitting candidate before the first overflowing opportunity.
+//! Signed advances need not be monotonic, so widths are not binary-searched and intervening clusters are not skipped.
+//! Unsafe cuts, missing glyphs, dictionary work, and item continuation retain their explicit next stages; this module creates no shaper or window BOT/EOT.
 use std::{
     ops::Range,
     sync::{
@@ -38,19 +38,20 @@ impl MarkdownSoftLineMeasureCancellation {
         Self::default()
     }
     pub fn cancel(&self) {
+        // Share one revocation request across the original line and its derived permits; this does not close separately owned producers.
         self.0.store(true, Ordering::Release);
     }
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
-    /// 唯一Store只接同一个取消请求，不能以当前同为false冒充同一长期撤权位。
+    /// Store accepts only the same cancellation request; two currently false values do not establish shared future revocation.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-/// 行首必须来自已选真实机会；本request不表达新的段落或shaper上下文。
+/// A line start comes from a real selected opportunity; this request does not create a paragraph or a new shaping context.
 #[derive(Clone)]
 pub struct MarkdownSoftLineMeasureRequest {
     pub start_utf16: usize,
@@ -88,7 +89,8 @@ pub enum MarkdownSoftLineMeasureError {
 }
 type Result<T> = std::result::Result<T, MarkdownSoftLineMeasureError>;
 
-/// 两种索引访问分别限额；一次断点查询只允许原交集检查一个实际候选。
+/// Bound the two kinds of index access independently; one break query lets the original intersection inspect one actual candidate.
+/// These are logical work limits, not elapsed-time, allocation, or kernel RSS measurements.
 #[derive(Clone, Copy, Debug)]
 pub struct MarkdownSoftLineMeasureBudget {
     pub break_queries: usize,
@@ -108,7 +110,7 @@ pub struct MarkdownSoftLineMeasuredBreak {
     pub source_utf16: Range<usize>,
     pub x_advance_26_6: i64,
     pub boundary: MarkdownLineBreakBoundary,
-    /// 位于候选后继cluster起点的原flags；不能把已选前缀中其他glyph的flags混入此值。
+    /// Original flags at the following cluster's start; flags from other glyphs in the selected prefix must not be mixed into this value.
     pub boundary_flags: u32,
 }
 
@@ -137,14 +139,14 @@ pub enum MarkdownSoftLineMeasureChoice {
     },
     NeedsDictionary(MarkdownLineBreakBoundary),
     NeedsEmergencyBreak(MarkdownSoftLineMeasuredBreak),
-    /// 真实认证前缀已经超宽；word_end仅是原已闭合词项，不是当前glyphReady范围或UAX机会。
+    /// The actual certified prefix already overflows; word_end describes the original closed word, not current ready glyph coverage or a UAX opportunity.
     #[cfg(feature = "paged-shaping-frontier")]
     NeedsFrontierEmergencyPrefix {
         source_utf16: Range<usize>,
         word_end_utf16: usize,
         measured_prefix_26_6: i64,
     },
-    /// 原状态机逐GCB和真实后继cluster flags确认的安全紧急切片；没有UAX自然机会。
+    /// An emergency slice verified by original per-GCB work and actual following-cluster flags, without a natural UAX opportunity.
     #[cfg(feature = "paged-shaping-frontier")]
     MeasuredEmergencyBreak {
         source_utf16: Range<usize>,
@@ -152,6 +154,7 @@ pub enum MarkdownSoftLineMeasureChoice {
         boundary_flags: u32,
         overflowing_grapheme: bool,
     },
+    /// The current item is consumed, but following-item glyph evidence is still needed; this is not document EOF or line readiness.
     NeedNextItem {
         source_utf16: Range<usize>,
         x_advance_26_6: i64,
@@ -194,7 +197,7 @@ struct Payload {
     word_safe: Option<frontier::WordSafeState>,
 }
 
-/// 只能由原测量内部选择派生；公开Choice本身不是重排权限，不能由调用方拼字段冒充。
+/// Derive only from the original Measure's internal selection; assembling public Choice fields cannot create reshaping authority.
 #[cfg(feature = "paged-soft-line-resolve")]
 pub(crate) struct MarkdownSoftLineResolveSeed {
     pub source: MarkdownLayoutTextSource,
@@ -211,7 +214,8 @@ pub(crate) struct MarkdownSoftLineResolveSeed {
     pub cancellation: MarkdownSoftLineMeasureCancellation,
 }
 
-/// 不保原ShapeJob、cluster/断点索引或Font强边；每次调用仍借回原实际owner核验。
+/// Retain no strong ShapeJob, cluster/break index, or Font edge; each operation reborrows the actual original owner for verification.
+/// The payload owns one immutable Source claim; failure or Drop releases that claim, while a selected result alone does not.
 pub struct MarkdownSoftLineMeasureJob {
     #[cfg(feature = "paged-soft-line-resolve")]
     identity: Arc<()>,
@@ -237,7 +241,7 @@ pub struct MarkdownSoftLineMeasureJob {
     start_issued: std::cell::Cell<bool>,
 }
 impl MarkdownSoftLineMeasureJob {
-    /// 只消费上一真实LineEnd提交后派生的单次行首票；不把普通GCB或公开Range当成UAX机会。
+    /// Consume only a single-use start ticket derived after the preceding actual LineEnd commit; an arbitrary GCB/range is not a UAX opportunity.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn after_selected_start(
         source: MarkdownLayoutTextSource,
@@ -261,14 +265,14 @@ impl MarkdownSoftLineMeasureJob {
             .payload
             .as_mut()
             .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
-        // 原new的实际Source/Font/Ready、标量端点、代次和取消门全部保留。只有已经真实
-        // 选择且写入同Store末尾LineEnd的GCB可跳过“必须为自然机会”的检查；票已按值消费。
+        // Keep all constructor checks for actual Source/Font/completion, scalar endpoints, generation, and cancellation.
+        // Only the GCB actually selected and committed as this Store's latest LineEnd bypasses the natural-opportunity check; its ticket is consumed by value.
         payload.source.health()?;
         payload.start_cursor = None;
         Ok(job)
     }
 
-    /// 只接收解析阶段私有构造的真实GCB行首；不把紧急换行写成原UAX14允许机会。
+    /// Accept only an actual GCB start privately certified by resolution; an emergency cut does not become an original UAX14 allowed opportunity.
     #[cfg(feature = "paged-soft-line-resolve")]
     pub(crate) fn after_resolved_start(
         source: MarkdownLayoutTextSource,
@@ -285,15 +289,15 @@ impl MarkdownSoftLineMeasureJob {
             .as_mut()
             .ok_or(MarkdownSoftLineMeasureError::Poisoned)?
             .start_cursor = None;
-        // new的端点/方向/实际Ready检查保留；唯一跳过的是原Unicode机会检查，因为这里只
-        // 接受已经实际解析、完整GCB且同实际tail job的sealed proof，不接受外部坐标或bool。
+        // Preserve constructor endpoint/direction/actual Ready checks. Only the original Unicode-opportunity check is bypassed:
+        // a sealed proof must certify completed resolution, a complete GCB, and this actual tail Job, rather than external coordinates or a bool.
         Ok(job)
     }
 
-    /// 绑定已经真实Ready的水平item；不会为有限窗口创建新run或推断段落边界。
+    /// Bind an actually Ready horizontal item without creating a window-specific run or inferring a paragraph boundary.
     ///
     /// # Errors
-    /// 非原Source/Font、非标量端点、空item伪尾部、非水平item或无效宽度均明确拒绝。
+    /// Reject foreign Source/Font authority, non-scalar endpoints, a false empty-item tail, nonhorizontal direction, or invalid width.
     pub fn new(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -312,7 +316,7 @@ impl MarkdownSoftLineMeasureJob {
         )
     }
 
-    /// 封闭Store适配器只借已经实际签入的数据；外部crate不能从Range实现provider。
+    /// The sealed Store adapter borrows only actually admitted data; external crates cannot implement a provider from a public range.
     pub(crate) fn new_with_provider(
         source: MarkdownLayoutTextSource,
         authority: &MarkdownLayoutTextAuthority,
@@ -326,6 +330,7 @@ impl MarkdownSoftLineMeasureJob {
             width_26_6,
             cancellation,
         } = request;
+        // Check the captured Source before caller-supplied authority or producer metadata, retaining its real failure as the leading result.
         source.health()?;
         if !source.permits(authority) {
             return Err(MarkdownSoftLineMeasureError::SourceMismatch);
@@ -333,12 +338,13 @@ impl MarkdownSoftLineMeasureJob {
         if cancellation.is_cancelled() {
             return Err(MarkdownSoftLineMeasureError::Cancelled);
         }
-        let profile = provider.require(authority, font)?; // 实际Source/Font/EOF门，Stored不伪造Job。
+        let profile = provider.require(authority, font)?; // Verify actual Source/Font/completion; a stored producer does not impersonate a Job.
         breaks.require_source(authority)?;
         if profile.generation != source.generation() {
             return Err(MarkdownSoftLineMeasureError::SourceMismatch);
         }
         let item = profile.source_utf16.clone();
+        // An item endpoint is not a new line start in a nonempty Source; continuation must instead consume the original handoff protocol.
         if width_26_6 <= 0
             || !matches!(
                 profile.direction,
@@ -350,9 +356,9 @@ impl MarkdownSoftLineMeasureJob {
         {
             return Err(MarkdownSoftLineMeasureError::InvalidRequest);
         }
-        source.byte_offset_for_utf16(start_utf16)?; // 低代理项不是行首；不能用长度元数据伪造合法标量端点。
+        source.byte_offset_for_utf16(start_utf16)?; // A low-surrogate position is not a scalar boundary; length metadata cannot authorize that start.
         let start_cursor = if start_utf16 == 0 {
-            None // 真文档起点是行首；不是任意piece或shaper窗口的起点。
+            None // The actual document origin is a line start; an arbitrary piece or shaping window origin is not.
         } else {
             Some(breaks.cursor(
                 MarkdownLayoutBreakUnit::Utf16,
@@ -362,6 +368,7 @@ impl MarkdownSoftLineMeasureJob {
         };
         let resources = source.resource_observer();
         let backing = source.original_backing_observer();
+        // Coordinate lookup may have touched real source storage; recheck health and cancellation before publishing the owning payload.
         source.health()?;
         if cancellation.is_cancelled() {
             return Err(MarkdownSoftLineMeasureError::Cancelled);
@@ -409,6 +416,7 @@ impl MarkdownSoftLineMeasureJob {
     }
 
     fn guard_provider(&self, provider: &mut dyn GlyphProvider) -> Result<()> {
+        // Keep the original backing's first errno observable even after failure has released this Measure's Source claim.
         if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
@@ -417,7 +425,7 @@ impl MarkdownSoftLineMeasureJob {
         }
         if self.origin != provider.origin() {
             return Err(MarkdownSoftLineMeasureError::JobMismatch);
-        } // 先核原opaque来源，避免外来Job字体错误抢走原身份错误；Source真实errno已在前面检查。
+        } // Check original opaque origin before a foreign Job can replace identity failure with its Font error; the actual Source errno was checked first.
         let facts = provider.require(&self.source, &self.font)?;
         if self.origin != facts.origin
             || self.item != facts.source_utf16
@@ -427,25 +435,26 @@ impl MarkdownSoftLineMeasureJob {
         {
             return Err(MarkdownSoftLineMeasureError::JobMismatch);
         }
+        // Original coverage, generation, direction, and glyph count must all remain attached to this provider before accepting its result.
         if self.cancelled || self.cancellation.is_cancelled() {
             return Err(MarkdownSoftLineMeasureError::Cancelled);
         }
         if self.payload.is_none() {
             return Err(MarkdownSoftLineMeasureError::Poisoned);
         }
-        Ok(()) // 身份/全部事实与实际健康门均要匹配，不能从旧目录长度或同名字体重新签票。
+        Ok(()) // Identity, all facts, and real health must agree; old directory lengths or an equal Font name cannot reissue authority.
     }
     fn fail(&mut self, error: &MarkdownSoftLineMeasureError) {
         #[cfg(feature = "paged-safe-glyph-slices")]
         {
             self.proof_revoked.store(true, Ordering::Release);
             self.line_alive.store(false, Ordering::Release);
-        } // 失败同时撤销当前item与整行历史收据；合法continue只撤当前item票。
+        } // Failure revokes both current-item and whole-line historical receipts; a successful continuation revokes only the current-item ticket.
         self.cancelled |= matches!(error, MarkdownSoftLineMeasureError::Cancelled);
-        drop(self.payload.take()); // 本层仅有一个Source强claim；失败即释放，不藏在返回结果或cursor中。
+        drop(self.payload.take()); // Release this layer's single strong Source claim on failure; no result or cursor secretly retains it.
     }
 
-    /// 由同一个真实已选结果签发下一阶段；未选择、取消或原job失权不能生成新seed。
+    /// Derive the next stage from that same actual selection; creation requires a selected result, an uncancelled request, and original Job authority.
     #[cfg(feature = "paged-soft-line-resolve")]
     pub(crate) fn resolve_seed(
         &self,
@@ -454,7 +463,7 @@ impl MarkdownSoftLineMeasureJob {
         self.resolve_seed_provider(&mut JobGlyphProvider::new(shape, None))
     }
 
-    /// 共用内部选项复制；调用者仍须持原provider，不能把相同字段的新目录升级成原请求。
+    /// Share internal selection copying while requiring the original provider; equal fields in a new directory cannot replace the original request.
     #[cfg(feature = "paged-soft-line-resolve")]
     fn resolve_seed_provider(
         &self,
@@ -485,7 +494,7 @@ impl MarkdownSoftLineMeasureJob {
         })
     }
 
-    /// 每次解析操作重新借原Measure与Shape核验；同字节、同宽度的新测量也不能替换nonce。
+    /// Each resolution operation reborrows the original Measure and Shape; equal bytes/width in another measurement do not replace its nonce.
     #[cfg(feature = "paged-soft-line-resolve")]
     pub(crate) fn require_resolve(
         &self,
@@ -495,7 +504,7 @@ impl MarkdownSoftLineMeasureJob {
         self.require_resolve_provider(owner, &mut JobGlyphProvider::new(shape, None))
     }
 
-    /// Job与Store走同一Source先行、nonce、真实provider门；不会重签原output身份。
+    /// Job and Store share the Source-first, nonce, and actual-provider checks without reissuing the original output identity.
     #[cfg(feature = "paged-soft-line-resolve")]
     pub(crate) fn require_resolve_provider(
         &self,
@@ -503,7 +512,7 @@ impl MarkdownSoftLineMeasureJob {
         provider: &mut dyn GlyphProvider,
     ) -> Result<()> {
         if let Some(payload) = &self.payload {
-            payload.source.health()?; // 原IO错误优先，不能被外来nonce或取消的表层错误盖住。
+            payload.source.health()?; // Original I/O failure precedes a foreign nonce or a superficial cancellation result.
         }
         if !Weak::ptr_eq(owner, &Arc::downgrade(&self.identity)) {
             return Err(MarkdownSoftLineMeasureError::JobMismatch);
@@ -511,7 +520,7 @@ impl MarkdownSoftLineMeasureJob {
         self.guard_provider(provider)
     }
 
-    /// 只有原内部unsafe或紧急选择能交给受控重排；安全已选行继续走既有selected许可。
+    /// Only the original unsafe/emergency selection enters controlled reshaping; an already safe line uses the existing selected permit.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn resolution_permit<'a>(
         &'a self,
@@ -537,11 +546,11 @@ impl MarkdownSoftLineMeasureJob {
             #[cfg(feature = "paged-shaping-frontier")]
             Some(MarkdownSoftLineMeasureChoice::NeedsFrontierEmergencyPrefix { .. }) => Ok(()),
             _ => Err(MarkdownSoftLineMeasureError::InvalidRequest),
-        } // 字体、词典、未完成和NeedNextItem都不能借该入口变成已解决的软行。
+        } // Font fallback, dictionary work, incomplete dependencies, and NeedNextItem cannot become resolved soft lines through this entry.
     }
 
-    /// 已选整行完全属于同Store的较早item时，恢复它的真实Font/来源作为重排锚点。
-    /// 调用方须先用当前provider取得resolution_permit；交接只借同一个Store一次，绝不拼造跨item正文。
+    /// When the whole selected line lies in an earlier item of this Store, restore its actual Font/origin as the reshaping anchor.
+    /// First obtain resolution_permit using the current provider; the handoff borrows one Store at a time and does not synthesize cross-item text.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn restore_selected_item(
         &mut self,
@@ -556,7 +565,7 @@ impl MarkdownSoftLineMeasureJob {
                 || !self.origin.same_provider_family(&profile.origin)
             {
                 return Err(MarkdownSoftLineMeasureError::JobMismatch);
-            } // 只有原Store的真实旧目录可交接；同源另一个Store和任意Job均没有此权限。
+            } // Only the original Store's actual earlier directory can anchor this handoff; another same-Source Store or a Job cannot.
             let payload = self
                 .payload
                 .as_ref()
@@ -583,12 +592,12 @@ impl MarkdownSoftLineMeasureJob {
                 || profile.generation != self.generation
             {
                 return Err(MarkdownSoftLineMeasureError::InvalidRequest);
-            } // 只支持选中范围完整落在这一个真实旧item；跨Font/Script的组合范围仍需自己的组合能力。
+            } // Selection must lie completely in this one actual earlier item; a range spanning Fonts/scripts still needs its own composition capability.
             #[cfg(feature = "paged-safe-glyph-slices")]
             {
                 self.proof_revoked.store(true, Ordering::Release);
                 self.proof_revoked = Arc::new(AtomicBool::new(false));
-            } // 旧current-item票撤销，整行nonce、选择、宽度和alive不变，不能重新签一张独立Measure。
+            } // Revoke old current-item tickets while retaining the line nonce, choice, width, and alive bit; no independent Measure is reissued.
             self.font = previous_font.clone();
             self.origin = profile.origin;
             self.glyph_count = profile.glyphs;
@@ -602,13 +611,13 @@ impl MarkdownSoftLineMeasureJob {
         result
     }
 
-    /// 在明确请求后继item时继续原软行；方向、字体或样式的边界不会重置原累计宽度。
+    /// Continue the original line only after it explicitly requests another item; direction, Font, and style boundaries do not reset accumulated width.
     ///
-    /// 两个真实Ready任务必须在同一Source上严格相邻。原任务只借本次核验，成功后不再
-    /// 保活它；跨item的glyph/spool仍由上层实际owner保存，本方法不伪造绘制或整行Ready。
+    /// Both actually Ready Jobs must be exactly adjacent on the same Source. The previous Job is borrowed only for this verification,
+    /// not retained afterward; the caller still owns cross-item glyphs/spools, and continuation does not imply drawing or whole-line readiness.
     ///
     /// # Errors
-    /// 非原前项、缺口、重叠、外来Source/Font、非水平item或错误阶段均永久撤销本测量。
+    /// A foreign previous item, gap, overlap, wrong Source/Font, nonhorizontal item, or invalid stage permanently revokes this measurement.
     pub fn continue_item(
         &mut self,
         previous: &mut MarkdownShapingJob,
@@ -620,8 +629,8 @@ impl MarkdownSoftLineMeasureJob {
             .continue_with(&mut JobGlyphProvider::new(next, None), next_font, breaks)
     }
 
-    /// 先核真实前项，再独占借本Measure。令牌不借provider，因而上层可先归还同一个
-    /// Store的旧item借用，再借后项；不需要两个同时可变Store引用或共享锁。
+    /// Verify the actual previous item before exclusively borrowing this Measure. The ticket does not borrow that provider,
+    /// so its Store borrow can end before borrowing the next item, without overlapping mutable Store references or a shared lock.
     pub(crate) fn prepare_continue(
         &mut self,
         previous: &mut dyn GlyphProvider,
@@ -636,7 +645,7 @@ impl MarkdownSoftLineMeasureJob {
         Ok(provider::PreparedMeasureContinuation::new(self))
     }
 
-    /// 该阶段检查由临时permit与交接共用；公开Choice的Copy字段不能作为消费前项的证明。
+    /// Temporary permits and handoffs share this stage check; public Choice fields do not prove actual consumption of the previous item.
     fn require_next_item(&self) -> Result<()> {
         let payload = self
             .payload
@@ -655,7 +664,7 @@ impl MarkdownSoftLineMeasureJob {
                 Ok(())
             }
             _ => Err(MarkdownSoftLineMeasureError::InvalidRequest),
-        } // 未测完、最终机会、重形和缺字阶段均不能被后项覆盖。
+        } // An unfinished item, final opportunity, reshaping stage, or missing Font cannot be overwritten by the next item.
     }
 
     fn continue_prepared(
@@ -665,8 +674,8 @@ impl MarkdownSoftLineMeasureJob {
         breaks: &mut MarkdownLayoutBreakJob,
     ) -> Result<()> {
         let result = (|| {
-            // prepare之后仅令牌独占借本状态；仍检查真正Source健康与取消，不能让等待
-            // 下一次Store借用期间出现的IO失败被合法相邻范围掩盖。
+            // Preparation leaves only the ticket's exclusive borrow of this state; still recheck actual Source health and cancellation.
+            // Valid adjacent coordinates cannot hide an I/O failure that arose while waiting to reborrow the Store.
             self.require_live_line()?;
             self.require_next_item()?;
             breaks.require_source(&self.source)?;
@@ -675,7 +684,7 @@ impl MarkdownSoftLineMeasureJob {
             let folded = next.folded_section();
             if !self.origin.same_provider_family(&profile.origin) {
                 return Err(MarkdownSoftLineMeasureError::JobMismatch);
-            } // Store目录只在原同一个Store内交接；同源的第二文件不是已认证历史的延续。
+            } // Stored directories hand off only within the original Store; a second same-Source file does not continue its certified history.
             let range = profile.source_utf16.clone();
             let source_len = self
                 .payload
@@ -693,20 +702,20 @@ impl MarkdownSoftLineMeasureJob {
                 )
             {
                 return Err(MarkdownSoftLineMeasureError::InvalidRequest);
-            } // 真实全局相邻坐标不得有缺口或重叠，item末尾仍不等于段落EOF。
+            } // Actual global ranges must be adjacent without gaps/overlaps; an item end still does not establish paragraph EOF.
             #[cfg(feature = "paged-line-compose")]
             if folded
                 .as_ref()
                 .is_some_and(|hidden| hidden != &range || profile.glyphs != 0)
             {
                 return Err(MarkdownSoftLineMeasureError::InvalidRequest);
-            } // 隐区只能由同 Store 的真实零 glyph 控制签入，普通 shaping item 没有跳读权限。
+            } // Only this Store's actual zero-glyph control admits a hidden range; an ordinary shaping item cannot authorize skipping text.
             self.require_live_line()?;
             #[cfg(feature = "paged-safe-glyph-slices")]
             {
                 self.proof_revoked.store(true, Ordering::Release);
                 self.proof_revoked = Arc::new(AtomicBool::new(false));
-            } // 只撤当前item票，真正整行scope保留；失败或Drop才撤整行。
+            } // Revoke only the current item's tickets and keep the actual line scope; failure or Drop revokes the whole line.
             self.font = next_font.clone();
             self.origin = profile.origin;
             self.glyph_count = profile.glyphs;
@@ -725,8 +734,8 @@ impl MarkdownSoftLineMeasureJob {
                 .selected = None;
             #[cfg(feature = "paged-line-compose")]
             if let Some(hidden) = folded {
-                // 已测 header 的累计宽度保持原值；跳过隐区内部的原机会，但必须查询其真实
-                // 末端 Mandatory。后继 cluster flags 仍走原 NeedNextItem/SelectedPermit 链。
+                // Retain the measured header's accumulated width and skip only the hidden interior's opportunities.
+                // Query the actual terminal Mandatory; following-cluster flags still use the original NeedNextItem/SelectedPermit chain.
                 let payload = self
                     .payload
                     .as_mut()
@@ -745,11 +754,12 @@ impl MarkdownSoftLineMeasureJob {
                     payload.word_safe = None;
                 }
             }
-            // cursor、候选、累计advance及last fitting不变。接缝的真实后继cluster flags
-            // 仍在下一step中读取，不把item切分位置当安全断点。
+            // Outside the explicit fold branch, keep the cursor, candidate, accumulated advance, and last fitting unchanged.
+            // The next step still reads actual following-cluster flags at the seam; item segmentation is not a safe break.
             self.guard_provider(next)
         })();
         let result = match self.require_live_line() {
+            // Preserve a real Source failure found after handoff work instead of returning a weaker metadata/cancellation outcome.
             Err(MarkdownSoftLineMeasureError::Source(error)) => Err(error.into()),
             _ => result,
         };
@@ -759,7 +769,7 @@ impl MarkdownSoftLineMeasureJob {
         result
     }
 
-    /// 只核本行已有源与纯取消标量；不能用此方法代替provider对Font/EOF的真实核验。
+    /// Check only this line's existing Source and cancellation scalars; this cannot replace provider verification of actual Font/completion authority.
     fn require_live_line(&self) -> Result<()> {
         if let Some(errno) = self.backing.as_ref().and_then(|value| value.first_errno()) {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
@@ -775,7 +785,7 @@ impl MarkdownSoftLineMeasureJob {
         Ok(())
     }
 
-    /// 本临时许可只能在实际NeedNextItem签发，且借住原Measure直到producer消费完。
+    /// Issue this temporary permit only at actual NeedNextItem, borrowing the original Measure until the producer finishes using it.
     #[cfg(feature = "paged-safe-glyph-slices")]
     pub(crate) fn measured_item_permit<'a>(
         &'a self,
@@ -786,7 +796,7 @@ impl MarkdownSoftLineMeasureJob {
         Ok(provider::MeasuredItemPermit::new(self))
     }
 
-    /// 仅原状态机实际选中的安全自然/紧急断点可签临时选择票；公开Choice副本不能重建权限。
+    /// Only a safe natural/emergency cut actually selected by the original state machine can issue this temporary permit; a public Choice copy cannot.
     #[cfg(feature = "paged-line-compose")]
     pub(crate) fn selected_permit<'a>(
         &'a self,
@@ -839,10 +849,10 @@ impl MarkdownSoftLineMeasureJob {
                 })
             }
             _ => Err(MarkdownSoftLineMeasureError::InvalidRequest),
-        } // 缺字、词典、跨item未决、unsafe和内部cluster均不因已有宽度而成为安全行尾。
+        } // A measured width does not make missing glyphs, dictionary work, pending item joins, unsafe cuts, or cluster interiors safe line ends.
     }
 
-    /// 固定量子只读原索引；Pending要求原依赖真正推进，Yielded保留本任务实际扫描位置。
+    /// Read original indexes in finite quanta; Pending requires actual dependency progress, while Yielded retains this task's scan position.
     pub fn step(
         &mut self,
         shape: &mut MarkdownShapingJob,
@@ -862,9 +872,10 @@ impl MarkdownSoftLineMeasureJob {
         breaks: &mut MarkdownLayoutBreakJob,
         budget: MarkdownSoftLineMeasureBudget,
     ) -> Result<MarkdownSoftLineMeasureStep> {
+        // Even a cached choice must pass the actual source/provider checks again before it can leave this step.
         let result = self.advance(provider, breaks, budget);
         let result = match self.payload.as_ref().map(|payload| payload.source.health()) {
-            Some(Err(error)) => Err(error.into()), // 真实共享源错误优先于本次metadata/取消出口。
+            Some(Err(error)) => Err(error.into()), // An actual shared Source failure precedes this step's metadata/cancellation result.
             _ => result.and_then(|value| {
                 self.guard_provider(provider)?;
                 Ok(value)
@@ -884,6 +895,7 @@ impl MarkdownSoftLineMeasureJob {
     ) -> Result<MarkdownSoftLineMeasureStep> {
         self.guard_provider(provider)?;
         breaks.require_source(&self.source)?;
+        // Both index dimensions must be usable; a zero quota is an invalid request rather than an invented Pending dependency.
         if budget.break_queries == 0 || budget.clusters == 0 {
             return Err(MarkdownSoftLineMeasureError::InvalidRequest);
         }
@@ -893,7 +905,7 @@ impl MarkdownSoftLineMeasureJob {
             answer: MarkdownSoftLineMeasureAnswer::Yielded,
         };
         loop {
-            self.guard_provider(provider)?; // 每个固定记录操作前检查取消；不等整个机会或长cluster结束才撤权。
+            self.guard_provider(provider)?; // Check revocation before each fixed-record operation, rather than after an entire opportunity or long cluster.
             let payload = self
                 .payload
                 .as_mut()
@@ -904,9 +916,10 @@ impl MarkdownSoftLineMeasureJob {
             }
             if payload.source.utf16_len() == 0 {
                 payload.selected = Some(MarkdownSoftLineMeasureChoice::EmptySource);
-                continue; // 仅真空源，不把任意空item或未探索前缀包装成空文档。
+                continue; // Only the actual empty Source qualifies; an empty item or unexplored prefix is not an empty document.
             }
             if let Some(cursor) = &mut payload.start_cursor {
+                // Resume the same At cursor under the break-query quota; only a Known opportunity discharges this start obligation.
                 if step.break_queries == budget.break_queries.min(MARKDOWN_SOFT_LINE_BREAK_QUERIES)
                 {
                     return Ok(step);
@@ -922,7 +935,7 @@ impl MarkdownSoftLineMeasureJob {
                     MarkdownLayoutBreakAnswer::Known(None) => {
                         return Err(MarkdownSoftLineMeasureError::InvalidRequest);
                     }
-                } // 非零起点必须是实际已确认机会，不能把script/font/window边界当已选行首。
+                } // A nonzero start needs a confirmed opportunity; a script, Font, or window boundary is not a selected line start.
                 continue;
             }
             #[cfg(feature = "paged-shaping-frontier")]
@@ -934,6 +947,7 @@ impl MarkdownSoftLineMeasureJob {
                 .as_mut()
                 .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
             if payload.candidate.is_none() {
+                // One saved cursor locates the next actual intersection; an unresolved query does not manufacture a candidate or skip ahead.
                 if step.break_queries == budget.break_queries.min(MARKDOWN_SOFT_LINE_BREAK_QUERIES)
                 {
                     return Ok(step);
@@ -970,7 +984,7 @@ impl MarkdownSoftLineMeasureJob {
                                 || candidate.kind != MarkdownLineBreakKind::Mandatory)
                         {
                             return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
-                        } // 显式隐藏意图也不能把非换段坐标伪装成 Mandatory 或文档 EOF。
+                        } // Even explicit fold intent cannot relabel a non-paragraph coordinate as Mandatory or document EOF.
                         payload.cursor = None;
                         payload.candidate = Some(candidate);
                     }
@@ -985,9 +999,10 @@ impl MarkdownSoftLineMeasureJob {
                 .ok_or(MarkdownSoftLineMeasureError::InconsistentCoverage)?;
             if candidate.needs_dictionary {
                 payload.selected = Some(MarkdownSoftLineMeasureChoice::NeedsDictionary(candidate));
-                continue; // 默认SA机会不是字典已完成的证明，不能继续签一条完整软行。
+                continue; // A default SA opportunity does not prove completed dictionary work or permit issuing a complete soft line.
             }
             let target = candidate.utf16.min(self.item.end);
+            // Prefix consumption and the following-cluster lookup share the same cluster quota, independently of break queries.
             if step.clusters == budget.clusters.min(MARKDOWN_SOFT_LINE_CLUSTERS) {
                 return Ok(step);
             }
@@ -1008,7 +1023,7 @@ impl MarkdownSoftLineMeasureJob {
                     || value.source_utf16.end > self.item.end
                 {
                     return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
-                } // 真实索引有洞是数据错误，不能伪装成一个可重形的普通边界。
+                } // A hole in the actual index is a data error, not an ordinary boundary that merely needs reshaping.
                 if value.source_utf16.start != payload.scan || value.source_utf16.end > target {
                     let at_start = value.source_utf16.start < payload.scan;
                     payload.selected = Some(MarkdownSoftLineMeasureChoice::NeedsReshape {
@@ -1024,15 +1039,16 @@ impl MarkdownSoftLineMeasureJob {
                             MarkdownSoftLineReshapeReason::BoundaryInsideCluster
                         },
                     });
-                    continue; // 真实机会在HB cluster内部，已有聚合宽度不是完整候选宽度。
+                    continue; // The actual opportunity lies inside a shaping cluster; accumulated width is not the complete candidate width.
                 }
                 if value.missing_glyphs > 0 {
                     payload.selected = Some(MarkdownSoftLineMeasureChoice::NeedsFontFallback {
                         cluster_utf16: value.source_utf16,
                         missing_glyphs: value.missing_glyphs,
                     });
-                    continue; // glyph0的advance不能代替实际回退字体的宽度。
+                    continue; // Glyph zero's advance cannot stand in for the width produced by an actual fallback Font.
                 }
+                // Preserve the signed original advance and detect overflow; clamping or taking an absolute value would change the measured prefix.
                 payload.advance = payload
                     .advance
                     .checked_add(value.x_advance_26_6)
@@ -1050,6 +1066,7 @@ impl MarkdownSoftLineMeasureJob {
                     && self.item.end != payload.source.utf16_len()
                     && !paragraph_control)
             {
+                // A fitting earlier opportunity can finish an overflowing prefix; otherwise retain it while requesting actual next-item evidence.
                 if payload.advance > self.width
                     && let Some(fit) = payload.fitting.take()
                 {
@@ -1061,8 +1078,9 @@ impl MarkdownSoftLineMeasureJob {
                         last_fitting: payload.fitting.as_ref().map(|fit| fit.measured.clone()),
                     });
                 }
-                continue; // item结束不是段落EOF；没有后继flags和完整宽度就不签新断点。
+                continue; // An item end is not paragraph EOF; do not issue a new break without following flags and complete candidate width.
             }
+            // Break safety belongs to the cluster beginning after the candidate, not to flags accumulated from the preceding glyphs.
             let (flags, boundary_cluster) = if target < self.item.end {
                 step.clusters += 1;
                 match provider.cluster(&self.source, &self.font, target)? {
@@ -1078,7 +1096,7 @@ impl MarkdownSoftLineMeasureJob {
                     _ => return Err(MarkdownSoftLineMeasureError::InconsistentCoverage),
                 }
             } else {
-                (0, target..target) // 真实 EOF 或原 zero-glyph 段落控制末端；普通 glyph item 仍要求真实后继 flags。
+                (0, target..target) // Actual EOF or an original zero-glyph paragraph control needs no successor; an ordinary item still needs real following flags.
             };
             let fit = Fit {
                 measured: MarkdownSoftLineMeasuredBreak {
@@ -1090,28 +1108,30 @@ impl MarkdownSoftLineMeasureJob {
                 boundary_cluster,
             };
             if payload.advance > self.width {
+                // Stop at the first overflowing opportunity. Without an earlier fit, return an explicit emergency stage rather than a fabricated fitting line.
                 payload.selected = Some(match payload.fitting.take() {
                     Some(previous) => selected(previous),
                     None => MarkdownSoftLineMeasureChoice::NeedsEmergencyBreak(fit.measured),
-                }); // 不按字符强切长词或宣称一个超宽词已经适合窗口。
+                }); // Do not cut a long word by arbitrary character count or claim its overflowing width fits the viewport.
                 continue;
             }
             if candidate.kind == MarkdownLineBreakKind::Mandatory {
+                // A fitting mandatory opportunity ends selection now; selected() still preserves any unsafe-boundary reshaping requirement.
                 payload.selected = Some(selected(fit));
                 continue;
             }
             payload.fitting = Some(fit);
             payload.next_query = candidate.utf16;
-            payload.candidate = None; // 下一机会继续原逻辑前缀，不重读前面的cluster或正文。
+            payload.candidate = None; // Continue the original logical prefix at the next opportunity without rereading earlier clusters/text.
         }
     }
 
-    /// 仅观察同一Source payload的真实析构；不保活本job、外部索引或字体。
+    /// Observe actual destruction of the same Source payload without keeping this Job, external indexes, or Font alive.
     #[must_use]
     pub fn resource_observer(&self) -> MarkdownLayoutTextSourceObserver {
         self.resources.clone()
     }
-    /// 取消只交还本层Source claim，不关闭由调用方独立拥有的原shaper与索引。
+    /// End this owner's lifetime and return its Source claim; the caller's independently owned original shaper and indexes remain its responsibility.
     pub fn close(self) {
         drop(self);
     }
@@ -1119,12 +1139,13 @@ impl MarkdownSoftLineMeasureJob {
 #[cfg(feature = "paged-safe-glyph-slices")]
 impl Drop for MarkdownSoftLineMeasureJob {
     fn drop(&mut self) {
-        // 只撤销派生许可；不清空任何已封口spool或原不可变字形，也不冒称资源已经析构。
+        // Revoke derived permits without clearing sealed spools or immutable glyphs, and without claiming their resources have already been destroyed.
         self.proof_revoked.store(true, Ordering::Release);
         self.line_alive.store(false, Ordering::Release);
     }
 }
 fn selected(fit: Fit) -> MarkdownSoftLineMeasureChoice {
+    // An unsafe following cluster requires original-context reshaping even when width fits; retain the complete measured width and exact boundary evidence.
     if fit.measured.boundary_flags & UNSAFE_TO_BREAK != 0 {
         MarkdownSoftLineMeasureChoice::NeedsReshape {
             boundary_utf16: fit.measured.source_utf16.end,

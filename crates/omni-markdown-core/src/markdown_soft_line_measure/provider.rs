@@ -1,7 +1,7 @@
-//! 测量只读真实字形来源的封闭借用；重排另由认证producer提供，不把存储目录冒充原Job。
+//! Borrow only an actual glyph producer for measurement; certified reshaping is a separate capability, and a stored directory does not impersonate a Job.
 use super::*;
 
-/// 外部crate不能实现此接口。crate内也只允许原Job或实际Store认证Directory的适配器实现。
+/// External crates cannot implement this contract. Internal adapters represent an original Job or a directory certified by the actual Store.
 pub(crate) mod sealed {
     pub trait Sealed {}
 }
@@ -30,13 +30,13 @@ impl PartialEq for GlyphProviderOrigin {
                 },
             ) => *a == *b && Weak::ptr_eq(left, right),
             #[cfg(feature = "paged-line-compose")]
-            _ => false, // 相同文本/范围不能让Job身份和Store签入身份互相代替。
+            _ => false, // Equal text/ranges cannot substitute a Job identity for an entry signed into a Store.
         }
     }
 }
 impl Eq for GlyphProviderOrigin {}
 
-/// 由require成功后返回的实际事实；构造这些字段本身不能替代Source/Font/EOF门。
+/// Facts returned after successful authorization; copying these fields does not replace the Source/Font/actual completion checks.
 pub(crate) struct GlyphProviderFacts {
     pub origin: GlyphProviderOrigin,
     pub source_utf16: Range<usize>,
@@ -45,32 +45,33 @@ pub(crate) struct GlyphProviderFacts {
     pub direction: MarkdownShapingDirection,
 }
 pub(crate) trait GlyphProvider: sealed::Sealed {
-    /// 只读构造时已绑定的opaque身份，不推进IO或先访问外来Font；原Source错误仍由Measure先查。
+    /// Read only the identity bound at construction, without I/O or accessing another Font; Measure checks its original Source error first.
     fn origin(&self) -> GlyphProviderOrigin;
-    /// 每次重新检查原Source健康、实际Font权限、取消和完整EOF；不返回后台借用或强owner。
+    /// Recheck original Source health, Font authority, cancellation, and the published range's actual completion witness on every call.
+    /// Return finite facts rather than a background borrow or a strong producer owner.
     fn require(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
         font: &MarkdownLayoutFontAuthority,
     ) -> Result<GlyphProviderFacts>;
-    /// 返回原逻辑cluster；未知依赖仍Pending，完整范围内部缺口必须失败。
+    /// Read an original logical cluster; unresolved dependencies remain Pending, while a hole inside complete coverage is an error.
     fn cluster(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
         font: &MarkdownLayoutFontAuthority,
         offset: usize,
     ) -> Result<MarkdownGlyphClusterAnswer>;
-    /// 只有原 Store 的已签折叠控制可省略隐区；普通 Job 不能从公开范围声明隐藏许可。
+    /// Only a fold control signed by the original Store authorizes skipping hidden text; a Job cannot derive that permission from a public range.
     #[cfg(feature = "paged-line-compose")]
     fn folded_section(&self) -> Option<Range<usize>> {
         None
     }
-    /// 原 Store 已签入的真实段落控制没有字形后继 flags；普通 shaping Job 不取得此末端能力。
+    /// An actual paragraph control signed into the Store has no following glyph flags; an ordinary shaping Job does not gain that terminal capability.
     #[cfg(feature = "paged-line-compose")]
     fn ends_paragraph_control(&self) -> bool {
         false
     }
-    /// 只由真实Store适配器从最新完整LineEnd读取；Job或普通范围没有已提交行权限。
+    /// Only the actual Store adapter can read its latest complete LineEnd; a Job or a range alone has no committed-line authority.
     #[cfg(feature = "paged-line-compose")]
     fn committed_line_start(
         &mut self,
@@ -81,7 +82,7 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
         self.require(source, font)?;
         Err(MarkdownSoftLineMeasureError::InvalidRequest)
     }
-    /// 消费下一行票之前再核同一最新LineEnd，不能把旧票用于回退重开或另一个Store。
+    /// Recheck that same latest LineEnd before consuming the next-line ticket; an old ticket cannot reopen an earlier line or another Store.
     #[cfg(feature = "paged-line-compose")]
     fn require_committed_line_start(
         &mut self,
@@ -92,7 +93,7 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
         self.require(source, font)?;
         Err(MarkdownSoftLineMeasureError::InvalidRequest)
     }
-    /// 仅真实frontier child或Store已签入同origin目录可以提供；此末端不是当前glyphReady范围。
+    /// Only an actual frontier child or a same-origin signed Store directory can supply this word end; it does not extend current glyph coverage.
     #[cfg(feature = "paged-shaping-frontier")]
     fn frontier_word_end(
         &mut self,
@@ -100,10 +101,10 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
         font: &MarkdownLayoutFontAuthority,
     ) -> Result<Option<usize>> {
         self.require(source, font)?;
-        Ok(None) // 旧Job和没有原producer证书的目录不能从公开范围补签能力。
+        Ok(None) // A producer without the original frontier certificate cannot manufacture that capability from public coordinates.
     }
-    /// 普通 Job 没有原 Bidi 分段票；只有经原 Store/Proof 核过的目录才能提供内部整形末端。
-    /// 返回值只许测量继续累计，不能成为字素、软行或紧急断点的许可。
+    /// An ordinary Job has no original Bidi segment ticket; only a directory verified by the Store/Proof can supply an internal shaping end.
+    /// This permits continued accumulation, not a grapheme, soft-line, or emergency break.
     #[cfg(feature = "paged-shaping-frontier")]
     fn bidi_shaping_end(
         &mut self,
@@ -115,13 +116,13 @@ pub(crate) trait GlyphProvider: sealed::Sealed {
     }
 }
 
-/// 重排能力只由实际原Job或已认证Store目录提供，不能用公开Range/Choice自行实现。
-/// 子范围来自原selector；实现必须保留原语言、features、字体和全局邻接context，
-/// BOT/EOT只在对应原item端点继承，真实软行不会获得新的物理段落标记。
+/// Only an actual original Job or certified Store directory supplies reshaping; a public Range/Choice cannot implement that authority.
+/// The original selector chooses subranges, retaining language, features, Font, and globally adjacent context.
+/// BOT/EOT is inherited only at corresponding original item endpoints; a soft line does not create a physical paragraph boundary.
 #[cfg(feature = "paged-soft-line-resolve")]
 pub(crate) trait ResolutionProvider: GlyphProvider {
     fn shaping_cancellation(&self) -> crate::MarkdownShapingCancellation;
-    /// 同Store可提供已认证后继item的真实首cluster flags；普通Job没有后项见证，不能把末端当EOF。
+    /// The same Store can supply certified first-cluster flags from its next item; a Job without that witness cannot treat its item end as EOF.
     fn following_item_flags(
         &mut self,
         source: &MarkdownLayoutTextAuthority,
@@ -138,7 +139,7 @@ pub(crate) trait ResolutionProvider: GlyphProvider {
     ) -> std::result::Result<MarkdownShapingJob, crate::MarkdownSoftLineResolveError>;
 }
 
-/// 公开旧API只借原Job和已有索引；构造时不创建第二索引或复制glyph数据。
+/// The public Job-backed entry points borrow the original Job and existing index; construction neither duplicates an index nor copies glyph data.
 pub(crate) struct JobGlyphProvider<'a> {
     job: &'a mut MarkdownShapingJob,
     clusters: Option<&'a mut MarkdownGlyphClusterIndex>,
@@ -161,10 +162,11 @@ impl GlyphProvider for JobGlyphProvider<'_> {
         source: &MarkdownLayoutTextAuthority,
         font: &MarkdownLayoutFontAuthority,
     ) -> Result<GlyphProviderFacts> {
+        // The out-of-range glyph read verifies the original Job's actual terminal state and authorities; the profile supplies only finite metadata.
         let profile = self.job.profile()?;
         if self.job.glyph(source, font, profile.glyph_count)?.is_some() {
             return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
-        } // 真EOF getter核Ready和两张原票，不能用profile长度冒充部分Buffer已完成。
+        } // The actual EOF getter checks Ready and both original authorities; a profile length cannot certify a partially filled Buffer.
         Ok(GlyphProviderFacts {
             origin: self.origin(),
             source_utf16: self.job.source_range(),
@@ -180,13 +182,14 @@ impl GlyphProvider for JobGlyphProvider<'_> {
         offset: usize,
     ) -> Result<MarkdownGlyphClusterAnswer> {
         self.require(source, font)?;
+        // Construction may omit the cluster index for operations that need only facts; actual cluster reads require the caller's original index.
         let value = self
             .clusters
             .as_mut()
             .ok_or(MarkdownSoftLineMeasureError::InvalidRequest)?
             .containing(self.job, offset)?;
         self.require(source, font)?;
-        Ok(value) // 索引真实IO之后仍核同原Job；失败不发布从旧页取出的Copy记录。
+        Ok(value) // Recheck the same Job after index I/O; failure prevents publication of a Copy record obtained from an old page.
     }
     #[cfg(feature = "paged-shaping-frontier")]
     fn frontier_word_end(
@@ -210,7 +213,7 @@ impl ResolutionProvider for JobGlyphProvider<'_> {
         range: Range<usize>,
     ) -> std::result::Result<MarkdownShapingJob, crate::MarkdownSoftLineResolveError> {
         Ok(self.job.reshape_subrange(source, font, range)?)
-    } // 真正原Job克隆自己已验证的样式；不重建原output身份或提前读取尚未shape的tail。
+    } // The original Job retains its validated style; no new output identity is invented and no unshaped tail is read early.
 }
 
 impl GlyphProviderOrigin {
@@ -223,12 +226,12 @@ impl GlyphProviderOrigin {
             }
             #[cfg(feature = "paged-line-compose")]
             _ => false,
-        } // 每项origin可以变化，但原Store不能被同源的第二个文件或Job替代。
+        } // Item origins may change within one Store; a second same-Source file or a Job cannot replace that Store family.
     }
 }
 
-/// 唯一原Measure的独占借用就是交接票；不保前项provider，因此不会重叠借同Store。
-/// 丢弃未消费令牌只结束借用，原NeedNextItem不变；没有隐式推进、重试或成功收据。
+/// Exclusive access to the original Measure is the handoff ticket; it does not retain the previous provider or overlap mutable Store borrows.
+/// Dropping an unused ticket ends only the borrow: NeedNextItem remains unchanged, with no implicit advancement, retry, or success receipt.
 pub(crate) struct PreparedMeasureContinuation<'a> {
     measure: &'a mut MarkdownSoftLineMeasureJob,
 }
@@ -246,7 +249,7 @@ impl<'a> PreparedMeasureContinuation<'a> {
     }
 }
 
-/// 只携带整行弱身份与实际撤权/取消标量；没有Source、字体、文件或Job强边。
+/// Carry only the line's weak identity and revocation/cancellation scalars, with no strong Source, Font, file, or Job edge.
 #[cfg(feature = "paged-safe-glyph-slices")]
 #[derive(Clone)]
 pub(crate) struct MeasuredLineScope {
@@ -255,7 +258,7 @@ pub(crate) struct MeasuredLineScope {
     pub cancellation: MarkdownSoftLineMeasureCancellation,
 }
 
-/// producer本次签入所需的固定事实；真正权限仍是不可构造的permit和实际provider核验。
+/// Fixed facts for the producer's current admission; the unforgeable permit and actual provider checks remain the authority.
 #[cfg(feature = "paged-safe-glyph-slices")]
 pub(crate) struct MeasuredItemFacts {
     pub source: MarkdownLayoutTextAuthority,
@@ -269,7 +272,7 @@ pub(crate) struct MeasuredItemFacts {
     pub line: MeasuredLineScope,
 }
 
-/// 短暂借住原Measure，不能Clone或落盘恢复；同一Store的旧借用结束后仍可借回核验。
+/// Temporarily borrow the original Measure without cloning or persistent reconstruction; the same Store can be reborrowed after its previous item borrow ends.
 #[cfg(feature = "paged-safe-glyph-slices")]
 pub(crate) struct MeasuredItemPermit<'a> {
     measure: &'a MarkdownSoftLineMeasureJob,
@@ -296,11 +299,11 @@ impl<'a> MeasuredItemPermit<'a> {
                 alive: Arc::clone(&self.measure.line_alive),
                 cancellation: self.measure.cancellation.clone(),
             },
-        }) // 事实只描述原真实消费阶段；不签最终行尾、GCB安全或Native绘制Ready。
+        }) // These facts describe actual item consumption, not a final line end, GCB safety, or Native drawing readiness.
     }
 }
 
-/// 当前provider只是原选择的权限锚点；selected可能落在更早item，不能把current当整行覆盖。
+/// The current provider anchors the original selection's authority; selection may lie in an earlier item, so current coverage is not whole-line coverage.
 #[cfg(feature = "paged-line-compose")]
 pub(crate) struct SelectedMeasureFacts {
     pub source: MarkdownLayoutTextAuthority,
@@ -310,7 +313,7 @@ pub(crate) struct SelectedMeasureFacts {
     pub line: MeasuredLineScope,
 }
 
-/// 真实自然机会与紧急GCB选择分别保留种类；紧急切片绝不伪造Allowed/Mandatory。
+/// Preserve whether the actual selection is a natural opportunity or an emergency GCB; an emergency slice never becomes Allowed/Mandatory.
 #[cfg(feature = "paged-line-compose")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SelectedMeasureKind {
@@ -321,7 +324,7 @@ pub(crate) enum SelectedMeasureKind {
     },
 }
 
-/// 仅原Measure内部选择可生成这些事实；Store仍须核原整行票和真实历史字形覆盖。
+/// Only the original Measure's internal selection produces these facts; Store must still verify the original line ticket and actual historical glyph coverage.
 #[cfg(feature = "paged-line-compose")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SelectedMeasureSelection {
@@ -331,7 +334,7 @@ pub(crate) struct SelectedMeasureSelection {
     pub kind: SelectedMeasureKind,
 }
 
-/// 原Store独立读取的固定提交事实；不保文件/正文，具体记录必须由同Store再次核验。
+/// Fixed commit facts read independently by the original Store; no file/text owner is retained, and that Store must recheck the actual record.
 #[cfg(feature = "paged-line-compose")]
 #[derive(Clone)]
 pub(crate) struct CommittedLineStart {
@@ -343,7 +346,7 @@ pub(crate) struct CommittedLineStart {
     pub x_advance_26_6: i64,
 }
 
-/// 非Clone单次票。旧Measure析构后可以保留固定事实，但不保Source、Font、Job或FD。
+/// A non-Clone, single-use ticket may outlive the old Measure with fixed facts, but retains no Source, Font, Job, or FD owner.
 #[cfg(feature = "paged-line-compose")]
 pub(crate) struct SelectedLineStart {
     source: MarkdownLayoutTextAuthority,
@@ -363,7 +366,8 @@ impl SelectedLineStart {
         start: usize,
         cancellation: &MarkdownSoftLineMeasureCancellation,
     ) -> Result<()> {
-        source.health()?; // 即使票过期、外来Store或取消，原实际源的首errno仍先报告。
+        source.health()?; // Report the actual Source's first errno before an expired ticket, foreign Store, or cancellation.
+        // Bind the single ticket to this Source generation, exact committed end, and original long-lived cancellation request.
         if authority != &self.source
             || !source.permits(&self.source)
             || source.generation() != self.committed.generation
@@ -381,8 +385,8 @@ impl SelectedLineStart {
         {
             return Err(MarkdownSoftLineMeasureError::JobMismatch);
         }
-        // Store须真实读取最新LineEnd的原record、kind、range与ordinal；源相同或
-        // 记录地址相同都不够，旧票在后来LineEnd提交后也不能重新打开旧行首。
+        // Store must read the latest LineEnd's original record, kind, range, and ordinal.
+        // Equal Source/record coordinates are insufficient; a later commit prevents an old ticket from reopening an earlier line.
         let result = provider.require_committed_line_start(authority, font, &self.committed);
         source.health()?;
         result?;
@@ -393,8 +397,8 @@ impl SelectedLineStart {
     }
 }
 
-/// 不可Clone、只在原Measure借用期有效。producer还须以同Store真实历史证明覆盖与字体，
-/// 再核实际GCB、cluster边界及L1/L2；本票绝不把公开Range升级为任意拼行许可。
+/// This non-Clone permit lives only within the original Measure borrow. The producer must prove coverage and Font from that Store's actual history,
+/// then verify the actual GCB, cluster boundary, and L1/L2; public ranges do not authorize arbitrary line assembly.
 #[cfg(feature = "paged-line-compose")]
 pub(crate) struct SelectedMeasurePermit<'a> {
     measure: &'a MarkdownSoftLineMeasureJob,
@@ -423,11 +427,12 @@ impl<'a> SelectedMeasurePermit<'a> {
                 alive: Arc::clone(&self.measure.line_alive),
                 cancellation: self.measure.cancellation.clone(),
             },
-        }) // 只复制固定元数据；需要读取历史字形时仍借唯一Store，不能保活旧Job或Font。
+        }) // Copy only fixed metadata; historical glyph access still borrows the single Store and does not keep an old Job or Font alive.
     }
-    /// Store完成真实LineEnd并最终复核本permit后才调用；同一选择只能签出一张下一行票。
+    /// Call only after Store completes its actual LineEnd and finally verifies this permit; one selection issues at most one next-line ticket.
     pub(crate) fn next_start(&self, provider: &mut dyn GlyphProvider) -> Result<SelectedLineStart> {
         let selected = self.require(provider)?;
+        // Only one actual stored selection may issue a successor start; a Job's measured Choice alone cannot certify a committed LineEnd.
         if self.measure.start_issued.get()
             || !matches!(selected.current.origin, GlyphProviderOrigin::Stored { .. })
         {
@@ -435,8 +440,10 @@ impl<'a> SelectedMeasurePermit<'a> {
         }
         let committed =
             provider.committed_line_start(&selected.source, &selected.font, &selected.selected);
+        // Reading the Store may expose a Source failure or cancellation; check the original line before consuming the returned commit facts.
         self.measure.require_live_line()?;
         let committed = committed?;
+        // Match the actual committed line against this exact selection before marking the single-use ticket as issued.
         if committed.source_utf16 != selected.selected.source_utf16
             || committed.generation != selected.current.generation
             || committed.kind != selected.selected.kind
@@ -450,17 +457,17 @@ impl<'a> SelectedMeasurePermit<'a> {
             family: selected.current.origin,
             cancellation: self.measure.cancellation.clone(),
             committed,
-        }) // 未完成/失败写入不给票；丢弃票只归还固定弱元数据，不改变旧immutable字形。
+        }) // Incomplete/failed writes issue no ticket; dropping it releases fixed weak metadata without changing immutable glyphs.
     }
 }
 
-/// 临时借住真正选中unsafe/emergency的原Measure；旧公开Choice不具有此构造权限。
-/// 每次借回目录仍须核原origin，跨item候选不会因为同Source而重新签给current目录。
+/// Temporarily borrow the original Measure that actually selected an unsafe/emergency boundary; a copied public Choice has no construction authority.
+/// Reborrowed directories must match the original origin; equal Source does not reassign a cross-item candidate to the current directory.
 #[cfg(feature = "paged-line-compose")]
 pub(crate) struct ResolutionMeasurePermit<'a> {
     measure: &'a MarkdownSoftLineMeasureJob,
 }
-/// 同一原选择的固定事实；没有Source/Font强owner，权限仍须借原permit重新核验。
+/// Fixed facts for that same original selection retain no strong Source/Font; authority is still rechecked through the original permit.
 #[cfg(feature = "paged-line-compose")]
 pub(crate) struct ResolutionMeasureFacts {
     pub source: MarkdownLayoutTextAuthority,
@@ -496,9 +503,9 @@ impl<'a> ResolutionMeasurePermit<'a> {
                 alive: Arc::clone(&self.measure.line_alive),
                 cancellation: self.measure.cancellation.clone(),
             },
-        }) // 单一整行scope不会随已测item数积累Weak集合，也不能恢复另一个测量请求。
+        }) // One line scope does not accumulate Weak sets as item count grows, and cannot reconstruct another measurement request.
     }
     pub(crate) fn measure(&self) -> &MarkdownSoftLineMeasureJob {
         self.measure
-    } // 仅供共用selector重新核原nonce，不允许构造另一Measure或改变内部起点。
+    } // The shared selector may recheck the original nonce; this does not authorize constructing another Measure or changing its start.
 }

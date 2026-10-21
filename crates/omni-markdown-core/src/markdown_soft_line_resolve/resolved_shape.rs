@@ -1,4 +1,5 @@
-//! 解析边界的唯一真实job交接；只读spool与后继Measure都消费相同的子job，不开放可替换Job借用。
+//! Transfer actual jobs at resolved boundaries. Read-only spooling and subsequent measurement
+//! consume these same children; callers never receive a replaceable mutable Job borrow.
 use std::{ops::Range, sync::Weak};
 
 use super::*;
@@ -9,7 +10,8 @@ use crate::{
     MarkdownSoftLineMeasureStep,
 };
 
-/// 只有实际解析成功的余项能构造；同坐标、同字体名或公开Boundary副本均不能产生此值。
+/// Only an actually resolved remainder creates this line-start proof. Equal coordinates, font
+/// names, or a public boundary copy cannot reconstruct its original Source/Font/shape authority.
 #[derive(Clone)]
 pub(crate) struct MarkdownResolvedLineStart {
     source: MarkdownLayoutTextAuthority,
@@ -27,6 +29,8 @@ impl MarkdownResolvedLineStart {
         breaks: &mut MarkdownLayoutBreakJob,
         at: usize,
     ) -> std::result::Result<(), MarkdownSoftLineMeasureError> {
+        // Source health outranks identity rejection. Original source authority, actual shape
+        // allocation, and both supplied/original font tickets must still belong to this same job.
         source.health()?;
         if self.source != *authority || !source.permits(authority) {
             return Err(MarkdownSoftLineMeasureError::SourceMismatch);
@@ -37,20 +41,22 @@ impl MarkdownResolvedLineStart {
         let profile = shape.profile()?;
         shape.glyph(authority, font, profile.glyph_count)?;
         shape.glyph(&self.source, &self.font, profile.glyph_count)?;
-        // FontAuthority不按名字或字段比较；两张票都必须由同一个真实job的原font owner接受。
+        // Font authority is not compared by name or copied fields. The actual job's original
+        // font owner must accept both tickets through its real EOF glyph primitive.
         if at != self.at || shape.source_range().start != at {
             return Err(MarkdownSoftLineMeasureError::InvalidRequest);
         }
         match breaks.grapheme_query(authority, at, MarkdownGraphemeQuery::IsBoundary)? {
             MarkdownGraphemeAnswer::Known(Some(boundary)) if boundary.utf16 == at => {}
             _ => return Err(MarkdownSoftLineMeasureError::InvalidRequest),
-        } // 原GCB仍须真实已知；不能把私有proof变成跳过Unicode边界检查的通用开关。
+        } // Original GCB must still be known; this private proof never bypasses Unicode boundary validation.
         source.health()?;
         Ok(())
     }
 }
 
-/// 解析后的实际prefix与可选tail；没有Clone，也没有公开字段或按坐标重建owner的构造器。
+/// Actual resolved prefix and optional tail, without Clone, public fields, or a constructor that
+/// reconstructs owners from copied coordinates.
 pub struct MarkdownSoftLineResolvedParts {
     boundary: MarkdownSoftLineResolvedBoundary,
     line: MarkdownSoftLineResolvedShape,
@@ -62,6 +68,7 @@ impl MarkdownSoftLineResolvedParts {
         line: MarkdownSoftLineResolvedShape,
         remainder: Option<MarkdownSoftLineResolvedShape>,
     ) -> Self {
+        // Accept already-owned concrete children at the sole internal handoff boundary.
         Self {
             boundary,
             line,
@@ -69,7 +76,8 @@ impl MarkdownSoftLineResolvedParts {
         }
     }
 
-    /// 消费唯一交接包。坐标副本只是事实，真正行首权限仍封在具体余项owner中。
+    /// Consume this unique handoff. Coordinate copies are facts only; actual next-line authority
+    /// remains encapsulated by the concrete remainder owner.
     pub fn into_parts(
         self,
     ) -> (
@@ -81,7 +89,8 @@ impl MarkdownSoftLineResolvedParts {
     }
 }
 
-/// worker局部实际子job；原Job为!Send，不能把本类型强行移入另一个线程或Native主线程。
+/// Worker-local actual child. Its underlying Job is !Send; do not force this value onto another
+/// worker or the Native main thread.
 pub struct MarkdownSoftLineResolvedShape {
     owned: Option<OwnedShape>,
     source: Option<MarkdownLayoutTextSource>,
@@ -99,6 +108,8 @@ impl MarkdownSoftLineResolvedShape {
         font: MarkdownLayoutFontAuthority,
         resolved_start: bool,
     ) -> Result<Self> {
+        // Retain the actual immutable Source and concrete child; weak shape identity prevents
+        // substitution without extending another original job's lifetime.
         source.health()?;
         let job = owned.job()?;
         let profile = job.profile()?;
@@ -123,6 +134,8 @@ impl MarkdownSoftLineResolvedShape {
     }
 
     fn guard(&mut self) -> Result<()> {
+        // Preserve actual backing failure even after resources have been removed. Then require
+        // the same live child allocation and its original Source/Font before exposing any fact.
         if let Some(errno) = self
             .backing
             .as_ref()
@@ -151,7 +164,8 @@ impl MarkdownSoftLineResolvedShape {
         Ok(())
     }
 
-    /// 仅本模块固定方法能借可变job；调用方无法mem::replace掉真实被登记的资源身份。
+    /// Only this module's fixed operations borrow the mutable job. Callers cannot mem::replace
+    /// its registered resource identity while retaining an old observation or proof.
     fn with_job<T>(
         &mut self,
         visit: impl FnOnce(
@@ -184,7 +198,7 @@ impl MarkdownSoftLineResolvedShape {
         if result.is_err() {
             drop(self.owned.take());
             drop(self.source.take());
-        } // 失败实际归还job和Source，不保留一个可再次签发的旧immutable权限壳。
+        } // Failure actually returns the job and Source, leaving no old immutable shell that can issue new authority.
         if let Some(errno) = self
             .backing
             .as_ref()
@@ -195,19 +209,23 @@ impl MarkdownSoftLineResolvedShape {
         result
     }
 
-    /// 只供合成控制计入真实输入与邻接context；不以工作计数代替Native验收。
+    /// Let the synthetic control account for actual input and adjacent context. These work facts
+    /// do not replace Native acceptance or prove whole-product memory behavior.
     #[cfg(all(test, feature = "paged-safe-glyph-slices"))]
     pub(super) fn profile_for_test(&mut self) -> Result<crate::MarkdownShapingProfile> {
         self.with_job(|job, _, _, _| Ok(job.profile()?))
     }
 
     pub fn source_range(&mut self) -> Result<Range<usize>> {
+        // Return coordinates only after current original-owner checks, not as transferable authority.
         self.with_job(|job, _, _, _| Ok(job.source_range()))
     }
     pub fn glyph(&mut self, ordinal: usize) -> Result<Option<MarkdownShapedGlyph>> {
+        // Read the actual child's glyph under its original Source/Font, including real EOF.
         self.with_job(|job, _, authority, font| Ok(job.glyph(authority, font, ordinal)?))
     }
-    /// 封闭Store producer核原Source/Font后读取实际Ready事实；不借出可替换的Job。
+    /// The closed Store producer verifies original Source/Font before reading actual Ready facts,
+    /// without receiving a replaceable Job borrow.
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn require_authorities(
         &mut self,
@@ -218,13 +236,15 @@ impl MarkdownSoftLineResolvedShape {
             let facts = job.profile()?;
             job.glyph(source, font, facts.glyph_count)?;
             Ok(facts)
-        }) // 真EOF原语验证两张原票；同名字体与同字节Source都不会重新绑定具体child。
+        }) // Actual EOF validates both tickets; equal font names or Source bytes cannot rebind this concrete child.
     }
     #[cfg(feature = "paged-line-compose")]
     pub(super) fn instance_identity(&self) -> Weak<()> {
+        // Identity alone retains neither the child nor any Source/font resources.
         self.shape.clone()
     }
     pub fn cluster_index(&mut self) -> Result<MarkdownGlyphClusterIndex> {
+        // Construct the real index from this child, preserving its own job nonce and authorities.
         self.with_job(|job, _, authority, font| {
             Ok(MarkdownGlyphClusterIndex::new(job, authority, font)?)
         })
@@ -234,6 +254,7 @@ impl MarkdownSoftLineResolvedShape {
         index: &mut MarkdownGlyphClusterIndex,
         budget: usize,
     ) -> Result<MarkdownGlyphClusterStep> {
+        // Advance the existing child-bound index; the index itself rejects another job's nonce.
         self.with_job(|job, _, _, _| Ok(index.step(job, budget)?))
     }
     #[cfg(feature = "paged-line-compose")]
@@ -243,9 +264,10 @@ impl MarkdownSoftLineResolvedShape {
         offset: usize,
     ) -> Result<MarkdownGlyphClusterAnswer> {
         self.with_job(|job, _, _, _| Ok(index.containing(job, offset)?))
-    } // 索引仍以实际child nonce核验，不能用原item或相同glyph的新索引替代。
+    } // The index verifies the actual child nonce; the original item or equal-glyph replacement index cannot substitute.
 
-    /// 只有真实tail自带的已解析行首可开始下一行；不接受外部start字段。
+    /// Only the actual tail's encapsulated resolved start can begin the next line; no external
+    /// start coordinate may substitute for this proof.
     pub fn measure(
         &mut self,
         breaks: &mut MarkdownLayoutBreakJob,
@@ -277,6 +299,7 @@ impl MarkdownSoftLineResolvedShape {
         breaks: &mut MarkdownLayoutBreakJob,
         budget: MarkdownSoftLineMeasureBudget,
     ) -> Result<MarkdownSoftLineMeasureStep> {
+        // Borrow the same real child for this measure's bounded turn; no fresh start ticket is captured.
         self.with_job(|job, _, _, _| Ok(measure.step(job, clusters, breaks, budget)?))
     }
 
@@ -284,6 +307,7 @@ impl MarkdownSoftLineResolvedShape {
         &mut self,
         measure: &MarkdownSoftLineMeasureJob,
     ) -> Result<MarkdownSoftLineResolveJob> {
+        // The original selected measure must accept this actual remainder job as its provider.
         self.with_job(|job, _, _, _| MarkdownSoftLineResolveJob::new(measure, job))
     }
     pub fn step_resolver(
@@ -294,6 +318,7 @@ impl MarkdownSoftLineResolvedShape {
         breaks: &mut MarkdownLayoutBreakJob,
         budget: MarkdownSoftLineResolveBudget,
     ) -> Result<MarkdownSoftLineResolveStep> {
+        // Advance through the concrete child's ownership boundary so failure retires that same child.
         self.with_job(|job, _, _, _| resolver.step(measure, job, clusters, breaks, budget))
     }
 
@@ -302,10 +327,12 @@ impl MarkdownSoftLineResolvedShape {
         resolver: MarkdownSoftLineResolveJob,
         measure: &MarkdownSoftLineMeasureJob,
     ) -> Result<MarkdownSoftLineResolvedParts> {
+        // Consume the completed resolver's genuine children, not another boundary's coordinate copy.
         self.with_job(|job, _, _, _| resolver.take_parts(measure, job))
     }
 
-    /// 原只读spool builder直接读取本真实job；无第二个shaper或新正文镜像。
+    /// The existing read-only spool builder consumes this actual job, without another shaper or
+    /// a document-text mirror.
     pub fn spool_builder(&mut self) -> Result<MarkdownShapedSpoolBuilder> {
         self.with_job(|job, _, authority, font| {
             Ok(MarkdownShapedSpoolBuilder::new(job, authority, font)?)
@@ -316,19 +343,23 @@ impl MarkdownSoftLineResolvedShape {
         builder: &mut MarkdownShapedSpoolBuilder,
         budget: usize,
     ) -> Result<MarkdownShapedSpoolStep> {
+        // Preserve the builder's actual child binding while copying only its bounded glyph batch.
         self.with_job(|job, _, _, _| Ok(builder.step(job, budget)?))
     }
     pub fn seal_spool(
         &mut self,
         builder: MarkdownShapedSpoolBuilder,
     ) -> Result<MarkdownShapedSpool> {
+        // Seal the same builder against this still-authorized child, transferring its actual output owner.
         self.with_job(|job, _, _, _| Ok(builder.seal(job)?))
     }
 
     pub fn close(self) -> Result<()> {
+        // Keep only observers across actual owner Drop, then verify its original glyph mappings
+        // and files. Independent Source/Font owners may legitimately remain elsewhere.
         let observer = self.owned.as_ref().map(|owned| owned.observer.clone());
         let backing = self.backing.clone();
-        drop(self); // 实际归还本job，不把ownership transfer计成析构。
+        drop(self); // Return this actual job; ownership transfer alone is not resource destruction.
         if let Some(errno) = backing.as_ref().and_then(|observer| observer.first_errno()) {
             return Err(MarkdownDocumentBufferError::OriginalBackingUnavailable(errno).into());
         }
@@ -347,7 +378,8 @@ impl MarkdownSoftLineResolvedShape {
     }
 }
 
-/// 只有原selector内部Reusable阶段能构造；公开边界副本或任意Range不能重签安全换行。
+/// Only the original selector's internal Reusable stage constructs this choice; a public boundary
+/// copy or arbitrary Range cannot authorize safe emergency wrapping.
 #[cfg(feature = "paged-safe-glyph-slices")]
 pub(crate) struct MarkdownEmergencyResolvedChoice<'a> {
     seed: &'a MarkdownSoftLineResolveSeed,
@@ -357,6 +389,8 @@ pub(crate) struct MarkdownEmergencyResolvedChoice<'a> {
 #[cfg(feature = "paged-safe-glyph-slices")]
 impl<'a> MarkdownEmergencyResolvedChoice<'a> {
     pub(super) fn new(payload: &'a Payload) -> Result<Self> {
+        // Borrow the actual selected seed only for this reusable stage, requiring forward
+        // progress and the already established exact width before safe-slice admission.
         if !payload.reuse_safe
             || !matches!(payload.stage, Stage::Reusable)
             || payload.selected_end <= payload.seed.start

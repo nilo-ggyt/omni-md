@@ -1,7 +1,10 @@
-//! 只有实际producer认证的词前缀可用非负后缀界；所有断点仍查原GCB与UAX14索引。
+//! Only an actual producer-certified word prefix may use a nonnegative suffix bound. All candidate
+//! boundaries still require the original grapheme and UAX14 indexes.
 use super::*;
 use crate::{MarkdownGlyphCluster, MarkdownGraphemeAnswer, MarkdownGraphemeQuery};
 
+/// Retain one actual cluster while its original boundary queries yield; a pending query neither
+/// commits width nor grants a safe line boundary.
 pub(super) struct WordClusterProbe {
     cluster: MarkdownGlyphCluster,
     grapheme_checked: bool,
@@ -9,7 +12,8 @@ pub(super) struct WordClusterProbe {
     shaping_seam: bool,
 }
 
-/// 整行只保一个安全GCB候选及最新可容纳GCB末端；跨真实前缀不保旧Job或每item证明数组。
+/// Retain one safe GCB candidate and the latest fitting GCB endpoint for the line. Continuing actual
+/// prefixes retains neither old shaping jobs nor an array of proofs for every item.
 pub(super) struct WordSafeState {
     word_end: usize,
     font: MarkdownLayoutFontAuthority,
@@ -36,7 +40,8 @@ fn emergency(start: usize, fit: WordSafeFit, overflowing: bool) -> MarkdownSoftL
 }
 
 impl MarkdownSoftLineMeasureJob {
-    /// true表示本量子已耗尽、待真实依赖或已选择；false继续原自然机会状态机。
+    /// Return true after exhausting this quantum, awaiting an actual dependency, or selecting an
+    /// answer. False returns control to the original natural-opportunity state machine.
     pub(super) fn advance_word_frontier(
         &mut self,
         provider: &mut dyn GlyphProvider,
@@ -55,14 +60,15 @@ impl MarkdownSoftLineMeasureJob {
             .candidate
             .is_some_and(|boundary| boundary.utf16 == payload.scan)
         {
-            // 自然机会可能恰好落在前一个真实字形分片末端。后继分片只补齐它的
-            // cluster flags，必须先交回原测量提交这个候选；先扫描长词会丢掉已到达
-            // 的断点与累计宽度，继而错误请求跨分片重排。
+            // A natural opportunity may be exactly at the previous actual shaping part's end.
+            // Its successor supplies the missing cluster flags; return to the original measure
+            // algorithm first. Scanning the long word now would lose this reached boundary/width
+            // and incorrectly request reshaping across parts.
             return Ok(false);
         }
         if word_end < self.item.end || word_end > payload.source.utf16_len() {
             return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
-        } // 末片允许等于真实词尾；只有当前实际provider范围有glyph，词末坐标不授额外读取。
+        } // A final part may reach actual word end; that coordinate grants no glyph reads outside this provider.
         if payload
             .word_safe
             .as_ref()
@@ -80,7 +86,7 @@ impl MarkdownSoftLineMeasureJob {
                 latest_fitting_end: None,
                 fitting: None,
                 incomplete_grapheme,
-            }); // 源已同票固定；换字体或闭合词项会撤旧紧急候选，不能跨别的字形依赖重签。
+            }); // Source stays fixed; changing font/word scope revokes prior emergency candidates rather than reauthorizing them across glyph dependencies.
         }
         loop {
             self.guard_provider(provider)?;
@@ -100,9 +106,11 @@ impl MarkdownSoftLineMeasureJob {
                         .clone()
                         .ok_or(MarkdownSoftLineMeasureError::Poisoned)?,
                 );
-                return Ok(true); // 真正消费完当前前缀才领下一项；没有把词尾坐标签成glyph尾部。
+                return Ok(true); // Request the next item only after actual prefix consumption; word-end coordinates are not glyph EOF.
             }
             if payload.word_probe.is_none() {
+                // Cluster and boundary-query budgets are independent capped dimensions. Preserve
+                // an in-flight probe when either dimension yields; neither is a wall-time/RSS bound.
                 if step.clusters == budget.clusters.min(MARKDOWN_SOFT_LINE_CLUSTERS) {
                     return Ok(true);
                 }
@@ -134,7 +142,7 @@ impl MarkdownSoftLineMeasureJob {
                             .clone()
                             .ok_or(MarkdownSoftLineMeasureError::Poisoned)?,
                     );
-                    return Ok(true); // 全域静态闭包与实际glyph必须一致，不能用.notdef宽度签紧急行。
+                    return Ok(true); // Actual glyphs must agree with certified closure; .notdef width cannot authorize an emergency line.
                 }
                 let safe = payload
                     .word_safe
@@ -146,8 +154,9 @@ impl MarkdownSoftLineMeasureJob {
                     && !safe.incomplete_grapheme
                     && cluster.flags & UNSAFE_TO_BREAK == 0
                 {
-                    // 当前真实cluster是前一个GCB的后继。其原flags才证明该切口可复用，
-                    // 不能拿前缀flags并集、item末端或缺少后继记录来推测安全。
+                    // This actual cluster succeeds the previous GCB. Its own flags establish
+                    // whether that cut can reuse glyphs; aggregate prefix flags, item endpoints,
+                    // or a missing successor record cannot establish safety.
                     let fit = WordSafeFit {
                         end: payload.scan,
                         width: payload.advance,
@@ -163,7 +172,7 @@ impl MarkdownSoftLineMeasureJob {
                                 .clone()
                                 .ok_or(MarkdownSoftLineMeasureError::Poisoned)?,
                         );
-                        return Ok(true); // 第一个完整GCB本来超宽也完整保留；不是拆字素或假适配。
+                        return Ok(true); // Preserve an overflowing first complete GCB; never split it or pretend it fits.
                     }
                 }
                 payload.word_probe = Some(WordClusterProbe {
@@ -201,7 +210,7 @@ impl MarkdownSoftLineMeasureJob {
                         return Err(MarkdownSoftLineMeasureError::InconsistentCoverage);
                     }
                 }
-                probe.grapheme_checked = true; // 原索引不可变；quota1后继不重复计量或把未知当边界。
+                probe.grapheme_checked = true; // The immutable original index lets quota-one continuations retain this completed check.
             }
             if probe.shaping_seam {
                 let probe = payload
@@ -218,12 +227,14 @@ impl MarkdownSoftLineMeasureJob {
                     .as_mut()
                     .ok_or(MarkdownSoftLineMeasureError::Poisoned)?
                     .incomplete_grapheme = true;
-                continue; // 只累计这个真实分项，不能在内部 seam 更新 fitting、首字素或 emergency。
+                continue; // Accumulate only this actual shaping fragment; its interior seam cannot update fitting/first-GCB/emergency candidates.
             }
             if step.break_queries == budget.break_queries.min(MARKDOWN_SOFT_LINE_BREAK_QUERIES) {
                 return Ok(true);
             }
             if probe.cursor.is_none() {
+                // Keep the original At-query cursor across yields after the GCB check. Unknown
+                // source dependencies do not become Allowed, Mandatory, or an empty answer.
                 probe.cursor = Some(breaks.cursor(
                     MarkdownLayoutBreakUnit::Utf16,
                     end,
@@ -258,13 +269,14 @@ impl MarkdownSoftLineMeasureJob {
                 .word_safe
                 .as_mut()
                 .ok_or(MarkdownSoftLineMeasureError::Poisoned)?;
-            safe.incomplete_grapheme = false; // 此前 IsBoundary 与 At 已核完真正外 GCB，才能恢复断点候选。
+            safe.incomplete_grapheme = false; // Actual outer GCB/At checks completed, so line-boundary candidates may resume.
             if safe.first_end.is_none() {
                 safe.first_end = Some(end);
-            } // 只有刚完成原GCB/At检查才记首字素末端；quota暂停时不提前签候选。
+            } // Record the first endpoint only after actual GCB/At completion, never during budget suspension.
             if payload.advance <= self.width {
-                // 即使这个最新切口依赖后继kern，也要保留其真实可容纳事实。安全候选可能更早，
-                // 不能为了复用原glyph而改变断点；只有同一末端可直接复用，否则仍交真实prefix重形。
+                // Keep the latest actual fitting endpoint even if its cut depends on later kerning.
+                // An earlier reusable cut cannot replace it merely to avoid reshaping. Direct reuse
+                // requires the same endpoint; otherwise retain actual prefix reshaping.
                 safe.latest_fitting_end = Some(end);
             }
             if let Some(boundary) = boundary {
@@ -273,7 +285,7 @@ impl MarkdownSoftLineMeasureJob {
                 }
                 payload.candidate = Some(boundary);
                 payload.cursor = None;
-                return Ok(false); // 真实UAX机会交回原算法；此处不捏造Allowed/Mandatory或Dictionary。
+                return Ok(false); // Return actual UAX opportunities to the original algorithm; invent no Allowed/Mandatory/Dictionary answer.
             }
             if payload.advance > self.width {
                 payload.selected = Some(match payload.fitting.take() {
@@ -285,7 +297,7 @@ impl MarkdownSoftLineMeasureJob {
                     {
                         Some(fitting) => emergency(self.start, fitting, false),
                         None if safe.first_end == Some(end) => {
-                            continue; // 尚缺首字素后继flags；下一量子/真实前缀核完后再签overflow。
+                            continue; // Await actual successor flags for the first GCB before authorizing overflow in a later quantum/prefix.
                         }
                         None => MarkdownSoftLineMeasureChoice::NeedsFrontierEmergencyPrefix {
                             source_utf16: self.start..self.item.end,
@@ -300,7 +312,7 @@ impl MarkdownSoftLineMeasureJob {
                         .clone()
                         .ok_or(MarkdownSoftLineMeasureError::Poisoned)?,
                 );
-                return Ok(true); // 此前每个GCB处都是真NoBreak，且未读同Font词后缀已证明非负。
+                return Ok(true); // Prior GCBs were actual NoBreak positions, and the unread same-font word suffix has a certified nonnegative bound.
             }
         }
     }

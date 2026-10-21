@@ -1,4 +1,5 @@
-//! 完整字形oracle仅用于有限合成输入；生产测量不复制文本或字形数组。
+//! Complete glyph oracles are confined to finite synthetic inputs. Production measurement
+//! retains neither a copied document nor an array of all glyphs.
 use super::*;
 use crate::{
     MarkdownDocumentBuffer, MarkdownGlyphClusterStatus, MarkdownLayoutFont,
@@ -10,6 +11,8 @@ const ROBOTO: &[u8] = include_bytes!(concat!(
     "/../../vendor/harfrust/benches/fonts/Roboto-Regular.ttf"
 ));
 
+// Keep the real temporary document, captured source, font-backed shaping job, and indexes
+// together so each test exercises the same ownership chain as production measurement.
 struct Fixture {
     _directory: tempfile::TempDir,
     document: MarkdownDocumentBuffer,
@@ -22,6 +25,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new(text: &str, range: Range<usize>, direction: MarkdownShapingDirection) -> Self {
+        // Capture a real isolated file before creating any layout authority. Equal bytes in
+        // another fixture therefore do not acquire this capture's source or job identity.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("软行有限控制.md");
         std::fs::write(&path, text).unwrap();
@@ -41,7 +46,8 @@ impl Fixture {
                 script: *b"Latn",
                 language: Some("en".into()),
                 points: 16.0,
-                // 此测试range在真实文档起点或明确LF之后开始；末尾仅真实EOF才是EOT。
+                // This fixture range starts at the document origin or immediately after LF.
+                // Only the actual source end supplies the end-of-text shaping flag.
                 beginning_of_text: range.start == 0
                     || text.encode_utf16().nth(range.start - 1) == Some(10),
                 end_of_text: range.end == source.utf16_len(),
@@ -49,6 +55,8 @@ impl Fixture {
             },
         )
         .unwrap();
+        // Feed the original source through bounded ingestion before asking the actual font
+        // shaper for glyphs; the test does not substitute character-count width estimates.
         while shape.status() == MarkdownShapingStatus::Ingesting {
             shape
                 .step(
@@ -77,6 +85,8 @@ impl Fixture {
         }
     }
     fn dependencies(&mut self) {
+        // Finish the real cluster and Unicode break indexes separately from measurement.
+        // Tests that intentionally need PendingDependencies call measure before this step.
         while self.clusters.status() != MarkdownGlyphClusterStatus::Ready {
             self.clusters.step(&mut self.shape, 17).unwrap();
         }
@@ -124,6 +134,8 @@ impl Fixture {
         measure: &mut MarkdownSoftLineMeasureJob,
         budget: MarkdownSoftLineMeasureBudget,
     ) -> MarkdownSoftLineMeasureChoice {
+        // Assert each public work dimension against its own quantum. These bounds describe
+        // algorithmic work, not elapsed time, resident memory, or OS resource release.
         for _ in 0..1_000_000 {
             let step = measure
                 .step(
@@ -137,6 +149,8 @@ impl Fixture {
                 step.break_queries <= budget.break_queries.min(MARKDOWN_SOFT_LINE_BREAK_QUERIES)
             );
             assert!(step.clusters <= budget.clusters.min(MARKDOWN_SOFT_LINE_CLUSTERS));
+            // Only Selected supplies a choice. A yield must advance work, and unexpected
+            // dependency waits cannot be accepted as a successfully measured line.
             match step.answer {
                 MarkdownSoftLineMeasureAnswer::Selected(choice) => return choice,
                 MarkdownSoftLineMeasureAnswer::PendingDependencies => panic!("真实依赖已经完成"),
@@ -148,6 +162,8 @@ impl Fixture {
         panic!("有限测量未完成");
     }
     fn width(&mut self, range: Range<usize>) -> i64 {
+        // Read original glyph advances independently of the cluster-prefix index under
+        // test, keeping this finite oracle separate from the measurement accumulator.
         let count = self.shape.profile().unwrap().glyph_count;
         let mut advance = 0i64;
         for index in 0..count {
@@ -160,11 +176,12 @@ impl Fixture {
                 advance += i64::from(glyph.x_advance);
             }
         }
-        advance // 独立读取原真实glyph，不消费被测cluster prefix，也不按字符猜宽。
+        advance
     }
 }
 
-/// 与被测首item共用同一capture；不同字体尺寸/方向沿真实shape任务产生，不复制oracle glyph。
+/// Shape an adjacent item from the same capture with its actual size and direction.
+/// No oracle glyphs are copied into the new job or its cluster index.
 fn following_item(
     fixture: &Fixture,
     range: Range<usize>,
@@ -218,6 +235,8 @@ fn actual_advance(
     font: &MarkdownLayoutFontAuthority,
     range: Range<usize>,
 ) -> i64 {
+    // The finite oracle reads the new job's real font output without consuming any
+    // accumulated width from the line measurer.
     let mut width = 0;
     for index in 0..shape.profile().unwrap().glyph_count {
         let glyph = shape.glyph(source, font, index).unwrap().unwrap();
@@ -225,11 +244,13 @@ fn actual_advance(
             width += i64::from(glyph.x_advance);
         }
     }
-    width // 有限测试独立读取真实字形，不消费测量器的累计值，也不按字符数量猜宽度。
+    width
 }
 
 #[test]
 fn adjacent_font_and_direction_items_keep_one_real_prefix_and_boundary() {
+    // Three actual items share one source capture but change direction and font size.
+    // Their measured prefix must survive both handoffs in original source coordinates.
     let text = "one two three four";
     let mut fixture = Fixture::new(text, 0..3, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
@@ -247,6 +268,7 @@ fn adjacent_font_and_direction_items_keep_one_real_prefix_and_boundary() {
     assert!(
         matches!(first, MarkdownSoftLineMeasureChoice::NeedNextItem { source_utf16, .. } if source_utf16 == (0..3))
     );
+    // Exhausting the first item requests its real successor; it is not document EOF.
     measure
         .continue_item(&mut fixture.shape, &mut shape2, &font2, &mut fixture.breaks)
         .unwrap();
@@ -279,6 +301,8 @@ fn adjacent_font_and_direction_items_keep_one_real_prefix_and_boundary() {
             answer => panic!("两个item接缝必须继续而非伪EOF: {answer:?}"),
         }
     }
+    // The third item supplies the successor flags and overflow needed to select the
+    // complete prefix of the first two items without losing their accumulated width.
     measure
         .continue_item(&mut shape2, &mut shape3, &font3, &mut fixture.breaks)
         .unwrap();
@@ -312,6 +336,7 @@ fn adjacent_font_and_direction_items_keep_one_real_prefix_and_boundary() {
 
 #[test]
 fn continuation_rejects_same_bytes_foreign_source_and_poison_is_permanent() {
+    // Identical text in a separately captured file cannot continue the original line.
     let text = "one two three";
     let mut fixture = Fixture::new(text, 0..3, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
@@ -330,6 +355,8 @@ fn continuation_rejects_same_bytes_foreign_source_and_poison_is_permanent() {
         error,
         MarkdownSoftLineMeasureError::Shaping(MarkdownShapingError::SourceMismatch)
     ));
+    // Rejection consumes the continuation attempt; restoring the original provider must
+    // not revive the failed measurement.
     assert!(matches!(
         measure.step(
             &mut fixture.shape,
@@ -338,11 +365,12 @@ fn continuation_rejects_same_bytes_foreign_source_and_poison_is_permanent() {
             MarkdownSoftLineMeasureBudget::default()
         ),
         Err(MarkdownSoftLineMeasureError::Poisoned)
-    )); // 拒绝候选后不能用真正原任务恢复一张已消费的行票。
+    ));
 }
 
 #[test]
 fn continuation_requires_adjacent_complete_item_and_original_previous_job() {
+    // Width accumulation may cross neither a gap nor an overlap in verified coverage.
     for gap in [true, false] {
         let text = "one two three";
         let mut fixture = Fixture::new(text, 0..3, MarkdownShapingDirection::LeftToRight);
@@ -355,13 +383,15 @@ fn continuation_requires_adjacent_complete_item_and_original_previous_job() {
         assert!(matches!(
             measure.continue_item(&mut fixture.shape, &mut next, &font, &mut fixture.breaks),
             Err(MarkdownSoftLineMeasureError::InvalidRequest)
-        )); // 缺口和重叠都不能借宽度累加跨越未验证覆盖。
+        ));
     }
     let text = "one two three";
     let mut fixture = Fixture::new(text, 0..3, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
     let mut measure = fixture.measure(0, 100_000, MarkdownSoftLineMeasureCancellation::new());
     fixture.finish(&mut measure, MarkdownSoftLineMeasureBudget::default());
+    // Matching source, range, and font facts do not replace the particular previous job
+    // whose glyphs were consumed by this measurement.
     let (_, mut impostor, _) =
         following_item(&fixture, 0..3, MarkdownShapingDirection::LeftToRight, 16.0);
     let (font, mut next, _) = following_item(
@@ -373,11 +403,13 @@ fn continuation_requires_adjacent_complete_item_and_original_previous_job() {
     assert!(matches!(
         measure.continue_item(&mut impostor, &mut next, &font, &mut fixture.breaks),
         Err(MarkdownSoftLineMeasureError::JobMismatch)
-    )); // 同Source、相同范围和字体仍不是实际已测的原前项。
+    ));
 }
 
 #[test]
 fn real_font_ltr_rtl_widths_and_tiny_quantums_match_original_glyphs() {
+    // Both visual directions and single-operation quanta must select the same original
+    // space boundary and signed width as an independent read of the actual font output.
     let text = "one two three four";
     for direction in [
         MarkdownShapingDirection::LeftToRight,
@@ -408,6 +440,8 @@ fn real_font_ltr_rtl_widths_and_tiny_quantums_match_original_glyphs() {
 
 #[test]
 fn pending_indexes_and_nonzero_paragraph_keep_original_global_coordinates() {
+    // A paragraph after LF retains global UTF-16 coordinates while its real indexes
+    // are pending; completing those dependencies must not restart it at zero.
     let text = "prefix\none two three";
     let mut fixture = Fixture::new(text, 7..text.len(), MarkdownShapingDirection::LeftToRight);
     let width = fixture.width(7..11);
@@ -439,6 +473,8 @@ fn pending_indexes_and_nonzero_paragraph_keep_original_global_coordinates() {
 
 #[test]
 fn incomplete_item_missing_dictionary_and_emergency_are_never_complete_lines() {
+    // The shaped prefix stops before source EOF, so spare width still requires the next
+    // item rather than authorizing a completed line.
     let text = "one two three";
     let mut fixture = Fixture::new(text, 0..4, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
@@ -449,6 +485,8 @@ fn incomplete_item_missing_dictionary_and_emergency_are_never_complete_lines() {
         MarkdownSoftLineMeasureChoice::NeedNextItem { source_utf16, x_advance_26_6, .. } if source_utf16 == (0..4) && x_advance_26_6 == expected_width)
     );
 
+    // Emergency breaking, missing glyphs, and dictionary segmentation each remain an
+    // explicit unfinished stage instead of being reported as an ordinary measured line.
     for (text, expected) in [("longword", 0), ("\u{e000}", 1), ("\u{0e01}\u{0e02}", 2)] {
         let mut fixture = Fixture::new(
             text,
@@ -480,6 +518,8 @@ fn incomplete_item_missing_dictionary_and_emergency_are_never_complete_lines() {
 
 #[test]
 fn source_failure_overrides_cancel_and_cached_selection_after_real_eviction() {
+    // First cache a genuine selection, then fail reclaim of an actual original-source
+    // read window. Neither cancellation nor that cached choice may hide the source EIO.
     let mut fixture = Fixture::new("one two", 0..7, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
     let cancellation = MarkdownSoftLineMeasureCancellation::new();
@@ -517,6 +557,8 @@ fn source_failure_overrides_cancel_and_cached_selection_after_real_eviction() {
 
 #[test]
 fn foreign_break_source_releases_old_indexes_and_cancel_is_permanent() {
+    // A second capture of the same document is still foreign authority. Rejection closes
+    // the break job's real backing resources and leaves no usable old index.
     let mut fixture = Fixture::new("one two", 0..7, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
     let foreign = MarkdownLayoutTextSource::capture(&fixture.document);
@@ -537,6 +579,7 @@ fn foreign_break_source_releases_old_indexes_and_cancel_is_permanent() {
         grapheme.metadata_buffer_bytes + line.metadata_buffer_bytes,
         0
     );
+    // Cancellation remains the public outcome on repeated advances of the same job.
     let cancellation = MarkdownSoftLineMeasureCancellation::new();
     let mut measure = fixture.measure(0, i64::MAX, cancellation.clone());
     cancellation.cancel();
@@ -555,7 +598,8 @@ fn foreign_break_source_releases_old_indexes_and_cancel_is_permanent() {
 
 #[test]
 fn long_original_run_uses_fixed_indexes_and_actual_last_owner_release() {
-    let text = "word ".repeat(16_384); // 80KiB有限测试源；产品不会建立此String。
+    // This finite 80 KiB source is fixture data; production does not build this String.
+    let text = "word ".repeat(16_384);
     let mut fixture = Fixture::new(&text, 0..text.len(), MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
     let mut measure = fixture.measure(0, 16 * 64 * 20, MarkdownSoftLineMeasureCancellation::new());
@@ -569,6 +613,8 @@ fn long_original_run_uses_fixed_indexes_and_actual_last_owner_release() {
         ),
         MarkdownSoftLineMeasureChoice::MeasuredBreak(_)
     ));
+    // Observe owned index buffers and mappings independently. Their byte accounting is
+    // not a measurement of whole-process RSS.
     let cluster = fixture.clusters.resource_observer();
     let breaks = fixture.breaks.resource_observer();
     let shape = fixture.shape.resource_observer();
@@ -581,6 +627,8 @@ fn long_original_run_uses_fixed_indexes_and_actual_last_owner_release() {
     assert!(
         gcb.metadata_peak_buffer_bytes <= 16 * 1024 && lb.metadata_peak_buffer_bytes <= 16 * 1024
     );
+    // The measurement still owns the captured source after the fixture is dropped.
+    // Its explicit close must release that last owner and complete the real unmap.
     drop(fixture);
     assert!(!source.payload_released() && !mapping.unmap_succeeded());
     measure.close();
@@ -601,11 +649,15 @@ fn long_original_run_uses_fixed_indexes_and_actual_last_owner_release() {
             && gcb.metadata_buffer_bytes == 0
             && lb.metadata_buffer_bytes == 0
     );
-    assert!(shape.resources_released()); // 真实shaper/Font/Source最后字段析构，不是测量器单独签全部释放。
+    // The original shaper, font, and source owners have now actually been dropped;
+    // the measurement observer alone does not certify their independent release.
+    assert!(shape.resources_released());
 }
 
 #[test]
 fn empty_invalid_width_and_low_surrogate_never_create_fake_boundaries() {
+    // Empty input has its own result. Invalid widths and a start inside a surrogate
+    // pair cannot manufacture a valid source boundary.
     let mut empty = Fixture::new("", 0..0, MarkdownShapingDirection::LeftToRight);
     empty.dependencies();
     let mut measure = empty.measure(0, 1, MarkdownSoftLineMeasureCancellation::new());
@@ -635,6 +687,8 @@ fn empty_invalid_width_and_low_surrogate_never_create_fake_boundaries() {
 
 #[test]
 fn another_shape_job_cannot_resign_a_failed_measure_and_break_health_wins_identity() {
+    // A different shaping job cannot replace the captured job, and a subsequent call
+    // with the original provider cannot revive the poisoned measurement.
     let mut original = Fixture::new("one two", 0..7, MarkdownShapingDirection::LeftToRight);
     original.dependencies();
     let mut measure = original.measure(0, i64::MAX, MarkdownSoftLineMeasureCancellation::new());
@@ -658,6 +712,8 @@ fn another_shape_job_cannot_resign_a_failed_measure_and_break_health_wins_identi
         Err(MarkdownSoftLineMeasureError::Poisoned)
     ));
 
+    // A real source reclaim failure takes precedence over the later foreign-identity
+    // check, while the break index's owned files, mappings, and buffers are released.
     original.source.visit_byte_range(0..1, |_| Ok(())).unwrap();
     original.document.fail_next_original_reclaim_for_test();
     assert_eq!(
@@ -699,7 +755,8 @@ fn prepared_continuation_checks_cancel_after_old_provider_borrow_has_ended() {
     let continuation = measure
         .prepare_continue(&mut JobGlyphProvider::new(&mut fixture.shape, None))
         .unwrap();
-    // 前项借用已经结束。模拟真正跨Store借用交接期间的取消，不能先换Font后才检查。
+    // The previous provider borrow has ended. Cancellation during this store handoff
+    // must be checked before the continuation can replace the font authority.
     cancellation.cancel();
     assert!(matches!(
         continuation.continue_with(
@@ -715,6 +772,8 @@ fn prepared_continuation_checks_cancel_after_old_provider_borrow_has_ended() {
 #[cfg(feature = "paged-safe-glyph-slices")]
 #[test]
 fn measured_item_permit_requires_real_stage_and_original_job_and_keeps_only_one_line_scope() {
+    // A permit requires an actually measured item and that item's original job.
+    // Equal source coverage from another shaping job grants no measured-item authority.
     let mut fixture = Fixture::new("one two", 0..3, MarkdownShapingDirection::LeftToRight);
     fixture.dependencies();
     let (next_font, mut next, mut next_index) =
@@ -740,7 +799,7 @@ fn measured_item_permit_requires_real_stage_and_original_job_and_keeps_only_one_
             .unwrap();
         assert_eq!(facts.measured_utf16, 0..3);
         facts.line
-    }; // 临时许可没有保存Job；借用结束后只留下固定整行弱身份与撤权原子。
+    }; // The temporary permit retains no job; only a weak line owner and revocation flag remain.
     let continuation = measure
         .prepare_continue(&mut JobGlyphProvider::new(&mut fixture.shape, None))
         .unwrap();
@@ -772,6 +831,8 @@ fn measured_item_permit_requires_real_stage_and_original_job_and_keeps_only_one_
             break;
         }
     }
+    // Continuation preserves this one line scope, but destroying its owner revokes
+    // the outstanding receipt without allowing it to keep the measurement alive.
     drop(measure);
     assert!(!line.alive.load(Ordering::Acquire));
     assert!(line.owner.upgrade().is_none());
