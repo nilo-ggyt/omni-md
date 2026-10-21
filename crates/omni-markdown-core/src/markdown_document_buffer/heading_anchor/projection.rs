@@ -1,5 +1,7 @@
-//! 一个真实超长标题的行内投影；只保存原语法游标、固定页和两位匿名掩码，不保存标题正文。
-//! 原代码/强调/链接事实先全部闭合，再按源序解码可见字符；后继 delimiter 不会改已输出前缀。
+//! Inline projection of one actual giant heading. Retains original syntax
+//! cursors, fixed pages, and an anonymous two-bit mask, never the complete heading.
+//! Code, emphasis, and link facts close before visible characters decode in source
+//! order, so a later delimiter cannot change a prefix already emitted.
 
 use super::*;
 use crate::markdown_document_buffer::{
@@ -21,7 +23,8 @@ pub(super) enum HeadingSource {
 }
 
 impl HeadingSource {
-    /// 范围只来自原闭合标题；ATX closing hashes 和 Setext underline 永不进入行内正文。
+    /// Takes ranges only from the original completed heading. ATX closing hashes
+    /// and Setext underline bytes never enter its inline content.
     fn content(&self) -> Result<Range<usize>, Error> {
         match self {
             Self::Atx(leaf) => match leaf.details() {
@@ -36,6 +39,8 @@ impl HeadingSource {
         }
     }
 
+    /// Preserve the parser options certified with this original ATX/Setext fact;
+    /// changing options during projection could alter reference and delimiter meaning.
     fn options(&self) -> pulldown_cmark::Options {
         match self {
             Self::Atx(leaf) => leaf.options(),
@@ -44,8 +49,10 @@ impl HeadingSource {
     }
 
     fn scope(&self) -> Result<Range<usize>, Error> {
-        // 强调匹配域从原真实正文开始；物理前缀不参与delimiter匹配，却仍在mask的Source坐标域内。
-        // 两个范围各有职责，不能为省坐标转换把quote/list标记送进可见标题或强调栈。
+        // Emphasis matching starts at actual inline text. Physical prefixes do
+        // not match delimiters but still occupy the mask's source coordinate space.
+        // Keep these distinct responsibilities: skipping coordinate conversion
+        // must not feed quote/list markers into visible text or the emphasis stack.
         match self {
             Self::Atx(leaf) => match leaf.details() {
                 LeafBlockDetails::AtxHeading {
@@ -59,6 +66,8 @@ impl HeadingSource {
         }
     }
 
+    /// Uses the fact's complete original source extent to bound admitted work,
+    /// rather than a viewport edge or the current decoded-title length.
     fn source_end(&self) -> usize {
         match self {
             Self::Atx(leaf) => leaf.source_end(),
@@ -72,8 +81,10 @@ struct Fill {
     flags: u8,
 }
 
-/// 每四个源字节共用一个mask字节：bit0隐藏、bit1代码字面；隐藏始终优先于代码字面。
-/// 匿名文件按实际首个标记才创建；全plain标题没有第二个文件、正文拷贝或全范围清零。
+/// One mask byte represents four source bytes: bit 0 hides, bit 1 marks code
+/// literals. Hidden text always takes precedence over literal interpretation.
+/// Creates anonymous storage only for the first actual marking fact. A plain
+/// heading needs no second file, copied text, or whole-range zero initialization.
 struct Mask {
     file: Option<File>,
     source: Range<usize>,
@@ -83,8 +94,10 @@ struct Mask {
 
 impl Mask {
     fn new(source: Range<usize>) -> Self {
-        // 源域只留原Fact的两个偏移；文件创建和稀疏长度设置推迟到第一条真实隐藏/字面事实。
-        // 因而巨大的纯文本标题也不会分配与长度成正比的mask内存或创建空白输出目录。
+        // Keep only the original fact's two offsets. File creation and sparse
+        // extent setup wait for the first actual hidden/literal fact.
+        // Thus even a giant plain heading allocates no length-proportional mask
+        // memory and creates no empty output namespace.
         Self {
             file: None,
             source,
@@ -93,13 +106,18 @@ impl Mask {
         }
     }
 
-    /// 本次只保一个真实语义事实的至多六段；未写完之前不能接收后继事实覆盖它。
+    /// Retains at most six ranges from one actual semantic fact. Its storage write
+    /// must finish before accepting another fact that would replace these slots.
     fn begin(&mut self, fills: impl IntoIterator<Item = (Range<usize>, u8)>) -> Result<(), Error> {
         if self.busy() {
+            // An unfinished storage write still owns these slots. Reject replacement
+            // without losing its remaining original-source ranges.
             return Err(Error::UnsupportedInline);
         }
-        // 一条proof可能含opener、body、closer及两端trim；固定六槽覆盖这一个事实而非全部标题。
-        // 上一事实未写完就不能覆盖槽位，后继语义读取必须等待真实文件写入完成。
+        // One proof may contain opener, body, closer, and both trim ranges. Six
+        // fixed slots cover this fact only, never an inventory of the entire heading.
+        // Do not overwrite unfinished ranges; later semantic reads wait for the
+        // actual current file writes to complete.
         self.pending = std::array::from_fn(|_| None);
         self.index = 0;
         for (index, (range, flags)) in fills.into_iter().enumerate() {
@@ -120,7 +138,8 @@ impl Mask {
         self.index < self.pending.len() && self.pending[self.index].is_some()
     }
 
-    /// 一步只读改写一个1KiB页；稀疏零页是已证明普通源，无需按标题长度预分配RAM或写零。
+    /// Updates at most one 1-KiB page per step. Sparse zero pages mean certified
+    /// ordinary text, requiring no heading-sized RAM allocation or zero writes.
     fn advance(&mut self) -> Result<MarkdownHeadingAnchorWork, Error> {
         let mut work = MarkdownHeadingAnchorWork {
             structural_transitions: 1,
@@ -129,20 +148,25 @@ impl Mask {
         let fill = self.pending[self.index]
             .as_mut()
             .ok_or(Error::UnsupportedInline)?;
-        // 空区间也是原事实的合法边界；只消耗该槽，不构造一次空pwrite或假装新内容已提交。
+        // Empty ranges are valid fact boundaries. Consume the slot without an
+        // empty positioned write or an invented publication of new content.
         if fill.range.is_empty() {
             self.index += 1;
             return Ok(work);
         }
         if self.file.is_none() {
+            // Acquire an unlinked file only after a nonempty certified mark exists.
+            // A failed create/extent operation drops its local file before returning.
             let file = tempfile::tempfile().map_err(storage)?;
             file.set_len(self.source.len().div_ceil(4) as u64)
                 .map_err(storage)?;
             self.file = Some(file);
             return Ok(work);
         }
-        // 页内按mask字节合并四个Source字节的2-bit标记；OR只增加已证权限，隐藏永远覆盖字面位。
-        // 当前范围跨页时仅移动其已写起点，下一量子继续同一份原事实，不能提前接下一个token。
+        // Merge two-bit facts for four source bytes per mask byte. OR adds only
+        // certified markings, and the hidden bit always overrides literal display.
+        // For a cross-page range, advance only its written prefix. The next
+        // quantum resumes this same fact before accepting another token.
         let first = fill.range.start - self.source.start;
         let last = (first / 4 + PAGE) * 4;
         let through = (fill.range.end - self.source.start).min(last);
@@ -171,10 +195,13 @@ impl Mask {
         Ok(work)
     }
 
-    /// 只读当前源小页的2-bit事实；没有文件就是真plain，不查询或创建默认文件。
+    /// Reads two-bit facts for the current bounded source page. No file means
+    /// plain text; never query or create a default backing file.
     fn flags(&self, start: usize, count: usize, output: &mut [u8]) -> Result<usize, Error> {
-        // 未写过的稀疏位置保普通文本语义；读取只物化这次至多256个Source字节对应的65字节。
-        // 文件页与原正文页不共用所有权，取消时关闭mask不会触碰用户Source或原文件。
+        // Unwritten sparse positions preserve ordinary-text meaning. Materialize
+        // at most 65 mask bytes for this request's 256 source bytes.
+        // Mask storage has separate ownership from document pages; cancellation
+        // closes only this mask, never the user source or original file.
         output[..count].fill(0);
         let Some(file) = self.file.as_ref() else {
             return Ok(0);
@@ -195,11 +222,14 @@ impl Mask {
         Ok(length)
     }
 
+    /// Discards pending metadata and explicitly closes only this anonymous mask.
+    /// The source document remains owned and readable through its existing leases.
     fn close(&mut self) -> Result<(), Error> {
         self.pending = std::array::from_fn(|_| None);
         if let Some(file) = self.file.take() {
             let descriptor = file.into_raw_fd();
-            // SAFETY: 本匿名文件只有本owner；转移后恰好close一次，不重试可能已复用的descriptor。
+            // SAFETY: This owner exclusively owns the anonymous file. Transfer its
+            // descriptor and close once; never retry a descriptor the OS may reuse.
             if unsafe { libc::close(descriptor) } != 0 {
                 return Err(storage(io::Error::last_os_error()));
             }
@@ -225,15 +255,19 @@ pub(super) struct HeadingProjection {
     next: usize,
     decoder: InlineTextDecoder,
     flushing: bool,
-    // 代码正文不解实体/反斜杠；这里只跨源页保最多三个不完整UTF8字节。
+    // Code bodies do not decode entities/backslashes. Carry at most three
+    // incomplete UTF-8 bytes between actual source pages.
     literal: [u8; 4],
     literal_len: usize,
-    // CRLF跨物理页仍只产生一个可见空格；两个字节都来自已认证正文，不能把片尾当换行终点。
+    // CRLF across pages still emits one visible space. Both bytes come from
+    // certified text; a page boundary cannot invent a line-ending boundary.
     literal_after_cr: bool,
     normal_after_cr: bool,
     closed: bool,
 }
 
+/// Preserve actual semantic read/copy/parser costs while exposing source-tree
+/// traversal as structural work at the original heading request's public boundary.
 fn semantic(work: SemanticWork) -> MarkdownHeadingAnchorWork {
     MarkdownHeadingAnchorWork {
         source_bytes: work.source_bytes,
@@ -247,8 +281,10 @@ fn semantic(work: SemanticWork) -> MarkdownHeadingAnchorWork {
 
 impl HeadingProjection {
     pub(super) fn new(source: HeadingSource) -> Result<Self, Error> {
-        // content是原物理Source域，scope是原inline匹配域；前缀只隐藏一次，不重建一份去前缀正文。
-        // quota沿现有语义外存归属，固定栈尾页与实际新结构页按真实获取量准入。
+        // Content is the physical source domain; scope is the original inline
+        // matching domain. Hide prefixes once without copying prefix-stripped text.
+        // The existing semantic-storage owner charges its fixed tail page and
+        // actual new structural pages against real acquired capacity.
         let range = source.content()?;
         let scope = source.scope()?;
         let options = source.options();
@@ -286,7 +322,8 @@ impl HeadingProjection {
         })
     }
 
-    /// 原 Source 上一个游标独占处理全部语法；mask写入和原匹配栈暂停时不会继续读取后继源。
+    /// One cursor exclusively handles source syntax. Pending mask writes or paused
+    /// matching-stack work prevent reads from advancing to later source events.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -298,10 +335,13 @@ impl HeadingProjection {
             ..Default::default()
         };
         if self.closed {
+            // Idempotent completion performs no source read or resource reacquisition.
             return Ok((work, true));
         }
-        // 首个量子只把原Fact移交给原共享cursor；不能在构造函数同步扫描长标题或拿短Parser探路。
-        // Box的真实固定容量单列，后续所有lookahead、storage和reference仍归这一个cursor。
+        // The first quantum transfers the original fact to the shared cursor.
+        // Construction never scans a giant heading or probes it with a short parser.
+        // Account for the box's actual fixed size separately. All later lookahead,
+        // storage, and reference requests still belong to this same cursor.
         if let Some(source) = self.initial.take() {
             let fuel = document
                 .byte_len()
@@ -325,8 +365,10 @@ impl HeadingProjection {
             self.cursor = Some(Box::new(cursor));
             return Ok((work, false));
         }
-        // 文件事实先落完，再接新的源事件；匹配栈暂停同样先恢复，Source页不会跨这些I/O被持有。
-        // 这个优先级防止后继proof覆盖当前待写range，也把每个量子的真实资源工作留在单一边界。
+        // Finish file facts before taking another source event; resume paused
+        // matching-stack work first too. No source lease crosses these I/O steps.
+        // This order prevents later proofs overwriting pending ranges and keeps
+        // each quantum's actual resource work at one accounting boundary.
         if self.mask.busy() {
             return self.mask.advance().map(|work| (work, false));
         }
@@ -335,8 +377,10 @@ impl HeadingProjection {
                 .emphasis
                 .advance(&self.quota, budget, &mut self.stack)
                 .map_err(Error::Semantic)?;
-            // matched span由原EmphasisJob签发；这里只隐藏真实delimiter，正文仍等源序输出时再借页。
-            // 没配对的run从未获得隐藏权限，下划线等字面内容会按原Source保留。
+            // The original emphasis job certifies matched spans. Hide only actual
+            // delimiters; body pages are leased later during source-ordered output.
+            // Unmatched runs never gain hidden authority; literal underscores and
+            // similar text remain exactly as the original source requires.
             if let Some(span) = span {
                 self.mask.begin([
                     (span.whole.start..span.body.start, 1),
@@ -345,8 +389,10 @@ impl HeadingProjection {
             }
             return Ok((semantic(measured), false));
         }
-        // 原Begin先保存外层强调头再进入完整label域；入栈需要flush时保同一proof继续，不能重复Begin。
-        // URL与title范围不进入label强调栈，也不复制成另一份可见文本。
+        // Begin saves the outer emphasis head before entering a complete label.
+        // A required stack flush retains this same proof rather than repeating Begin.
+        // URL/title ranges do not enter label emphasis matching or become
+        // another copied representation of visible heading text.
         if let Some(proof) = self.link.take() {
             let (measured, entered) = self
                 .emphasis
@@ -357,8 +403,10 @@ impl HeadingProjection {
             }
             return Ok((semantic(measured), false));
         }
-        // 真实StackFile回复只恢复原暂停操作；Progress不是append/read已完成，不能提前发布链接。
-        // metadata来自实际尾页分配，转换/flush费用已由回复携带，accept只转交而不双计工作。
+        // Real stack-file replies resume only the paused operation. Progress is
+        // not a completed append/read and cannot publish a link prematurely.
+        // Metadata reflects actual tail-page allocation. Replies already carry
+        // conversion/flush costs; acceptance forwards them without double charging.
         if let Some(request) = self.storage.as_ref() {
             let (step, metadata) = self
                 .stack
@@ -387,14 +435,19 @@ impl HeadingProjection {
             return Ok((work, false));
         }
         if self.reference.is_some() {
+            // A paused identifier must receive its actual found/missing answer before
+            // the original inline cursor can consume another source event.
             return self.advance_reference(document, budget);
         }
         if self.decoded {
+            // Visible output is legal only after all source-wide inline decisions close.
             return self.render(document, slugs, budget);
         }
         let cursor = self.cursor.as_mut().ok_or(Error::UnsupportedInline)?;
-        // Code/HTML/link前探会改变真正所需源位置，始终借cursor.next_byte，不沿假定的顺序offset推进。
-        // 任何后继文件操作或错误展开之前都结束这个lease；Doc仍独占mmap健康和回收责任。
+        // Code/HTML/link lookahead changes the next required source location.
+        // Lease cursor.next_byte instead of advancing an assumed sequential offset.
+        // Finish this lease before later file work or error propagation. The
+        // document retains its original mmap health and reclamation responsibility.
         let frame = document.table_source_frame(cursor.next_byte(), 256)?;
         let actual_read = frame.bytes.len();
         let step = cursor
@@ -429,8 +482,10 @@ impl HeadingProjection {
         };
         work.source_bytes = actual_read;
         work.structural_transitions += measured.transitions;
-        // 三种额外事实每次至多一条：已解析脚注、原行末空白、已闭合HTML/autolink。
-        // 它们都由同一源序cursor交付，不从样式、首个'>'或文本搜索补造可见范围。
+        // Additional facts describe resolved footnotes, original trailing line
+        // whitespace, or completed HTML/autolinks, at most one pending fact per step.
+        // The same source-ordered cursor certifies each; styles, a first '>', or
+        // text searching cannot manufacture their visible ranges.
         if let Some(footnote) = cursor.take_heading_footnote() {
             self.mask.begin([(footnote.source_range(), 1)])?;
         }
@@ -440,8 +495,10 @@ impl HeadingProjection {
         if let Some(html) = cursor.take_heading_html() {
             let range = html.source_range();
             if html.is_autolink() {
-                // autolink的显示label是原URL字面，不能再把其中'&amp;'当正文实体解码。
-                // 两侧尖括号隐藏，内部仍由固定UTF8 carry跨真实源页读取。
+                // An autolink displays its original literal URL. Its '&amp;' spelling
+                // must not undergo ordinary-text entity decoding again.
+                // Hide both angle brackets; a fixed UTF-8 carry reads the interior
+                // across real source-page boundaries.
 
                 self.mask.begin([
                     (range.start + 1..range.end - 1, 2),
@@ -461,6 +518,8 @@ impl HeadingProjection {
                 self.emphasis.start(run).map_err(Error::Semantic)?
             }
             InlineCodeStep::Link { proof, .. } => {
+                // Keep the certified label visible while hiding only its surrounding
+                // syntax/destination; emphasis enters the original label separately.
                 let source = proof.source_range();
                 let label = proof.label_range();
                 self.mask
@@ -468,6 +527,8 @@ impl HeadingProjection {
                 self.link = Some(proof);
             }
             InlineCodeStep::LinkEnd { source, label, .. } => {
+                // Restore the matching outer emphasis scope only when this same
+                // source link actually closes; the URL/title never joined that stack.
                 let measured = self
                     .emphasis
                     .leave_link(&source, &label, budget, &mut self.stack)
@@ -479,13 +540,15 @@ impl HeadingProjection {
                 self.reference = Some(Box::new(ReferenceLabel::new(request)))
             }
             InlineCodeStep::Proven { .. } => {
-                // 真实inline域已闭合，后文不再能回改delimiter/link决定；此时才授权开始输出。
-                // 外存匹配历史立即显式close，渲染阶段只保mask、slug文件和固定小页。
+                // The actual inline domain has closed, so later text cannot change
+                // delimiter/link decisions. Only now may visible output begin.
+                // Explicitly close external matching history immediately. Rendering
+                // retains only the mask, slug file, and fixed bounded pages.
 
                 self.decoded = true;
                 self.cursor = None;
                 self.emphasis.finish();
-                self.stack.close().map_err(Error::Semantic)?; // 匹配完成即归还语法外存，不等最终导航才关闭。
+                self.stack.close().map_err(Error::Semantic)?; // Return syntax storage at match completion, not at eventual navigation.
             }
             InlineCodeStep::NeedsGeneralInline { .. } => return Err(Error::UnsupportedInline),
             _ => {}
@@ -493,7 +556,8 @@ impl HeadingProjection {
         Ok((work, false))
     }
 
-    /// 代码 literal 与原 trim 证明分别落mask；只窥原body首尾两个字节判断真实CRLF宽度。
+    /// Marks literal code and certified trimming separately. Inspect at most two
+    /// bytes at each original body edge to determine actual CRLF width.
     fn code(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -504,8 +568,10 @@ impl HeadingProjection {
         let mut start = body.start;
         let mut end = body.end;
         if proof.trims_boundary_spaces() {
-            // trim标志由原code匹配器给出；首尾最多各窥两byte，只区别真实CRLF与单个归一空格。
-            // 全空格代码不会进入这个分支，不能擅自把它的全部可见空白删掉。
+            // The original code matcher certifies trimming. Inspect at most two
+            // bytes per edge to distinguish actual CRLF from one normalized space.
+            // All-space code never enters this branch; its visible whitespace must
+            // not be removed by an independent trimming policy.
 
             start += self.eol_width(document, body.start, (body.start + 2).min(body.end))?;
             let tail = body.end.saturating_sub(2).max(body.start);
@@ -531,6 +597,8 @@ impl HeadingProjection {
         })
     }
 
+    /// Distinguishes a real two-byte CRLF edge from one byte normalized as space,
+    /// borrowing no more than the caller's already bounded two-byte source extent.
     fn eol_width(
         &self,
         document: &MarkdownDocumentBuffer,
@@ -546,7 +614,8 @@ impl HeadingProjection {
         })
     }
 
-    /// 每次只补当前一个已认证identifier；查询仍沿原 Global 及原有限定义解析器，缺失须真实EOF。
+    /// Resolves one current certified identifier through the original global
+    /// frontier and bounded definition parser. Missing requires real source EOF.
     fn advance_reference(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -554,14 +623,18 @@ impl HeadingProjection {
     ) -> Result<(MarkdownHeadingAnchorWork, bool), Error> {
         let reference = self.reference.as_mut().unwrap();
         if reference.label().is_none() {
+            // Finish normalized-label preparation first. Raw or partial identifiers
+            // cannot authorize either a definition lookup or a missing answer.
             return reference
                 .advance(document, &self.quota, budget)
                 .map(|work| (semantic(work), false))
                 .map_err(Error::Semantic);
         }
         if reference.request.kind() == InlineReferenceKind::Footnote {
-            // 脚注只查存在性；普通reference仍查真实URL/title，两个业务答案不借假URL混用。
-            // 查询运行时保原cursor暂停身份，Found/Missing准备完才恢复同一个request。
+            // Footnotes ask only about existence; ordinary references resolve actual
+            // URL/title values. A fake URL cannot substitute for either answer.
+            // While querying, retain the original cursor's paused identity. Resume
+            // this same request only after its found/missing answer is ready.
 
             if self.footnotes.is_none() {
                 let mut footnotes = HeadingFootnotes::new(self.quota.clone());
@@ -608,6 +681,8 @@ impl HeadingProjection {
             return Ok((work, false));
         }
         if self.references.is_none() {
+            // Admit only this actual normalized label. The existing global frontier
+            // searches definitions without building a document-wide reference map.
             let mut queries = MarkdownTableReferenceQueries::for_batch(Some(self.quota.clone()));
             queries
                 .collect_verified_label(reference.label().unwrap())
@@ -627,6 +702,8 @@ impl HeadingProjection {
             .unwrap()
             .advance(document, budget)?;
         if complete {
+            // Resume the exact paused request after all needed definitions or real
+            // EOF complete. A local absence cannot be converted into a missing link.
             let resolved = self
                 .references
                 .as_ref()
@@ -655,7 +732,8 @@ impl HeadingProjection {
         Ok((work, false))
     }
 
-    /// 所有语义已闭合后才按原源序输出；更长的最终base永不命中有限fragment，可直接停止输出。
+    /// Emits source-ordered visible text only after semantics close. A completed
+    /// slug base already longer than the bounded target can stop further output.
     fn render(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -666,14 +744,18 @@ impl HeadingProjection {
             structural_transitions: 1,
             ..Default::default()
         };
-        // 语义证明已经完成。此时base越过目标长度，后续唯一化只会加长，不再可能命中fragment。
-        // 可以结束剩余输出并关闭文件，不能把这个剪枝提前到尚未闭合的原字面扫描阶段。
+        // Semantics are complete. Once the slug base exceeds target length,
+        // later uniqueness suffixes only lengthen it and cannot produce a match.
+        // End remaining output and close storage, but never apply this pruning
+        // during an earlier literal scan whose semantic decisions remain open.
         if slugs.irrelevant {
             self.close()?;
             return Ok((work, true));
         }
-        // 归一化器的carry属于当前普通文本域；hidden/code边界先排出它，不能跨markup凑出新实体。
-        // 真Source末端还要等最后完整UTF8输出排完，complete不能由一次空输出或短片推断。
+        // Decoder carry belongs to this ordinary-text domain. Flush it before
+        // hidden/code boundaries so markup cannot splice fragments into a new entity.
+        // Actual source end still waits for the final complete UTF-8 output.
+        // Neither empty output nor a short chunk proves completion.
         if self.flushing || self.next == self.source.end {
             let mut output = [0; 256];
             let step = self
@@ -705,7 +787,8 @@ impl HeadingProjection {
             .position(|&other| other != flag)
             .unwrap_or(count);
         if flag & 1 != 0 {
-            // Hidden边界先结束前一个已证普通文本域，避免把跨markup的'&am'+'p;'误解成实体。
+            // A hidden boundary ends the preceding ordinary-text domain, preventing
+            // '&am' and 'p;' separated by markup from becoming a new entity.
             self.next += group;
             self.flushing = true;
             self.literal_after_cr = false;
@@ -720,7 +803,8 @@ impl HeadingProjection {
         work.source_bytes = group;
         work.copied_bytes = group;
         if flag & 2 != 0 {
-            // 原code span只把真实CR/LF归一成空格，不解码实体；UTF8尾部由固定carry衔接。
+            // Original code-span rules normalize real CR/LF to spaces but never
+            // decode entities. A fixed carry joins incomplete UTF-8 tails.
             bytes.copy_within(..group, self.literal_len);
             bytes[..self.literal_len].copy_from_slice(&self.literal[..self.literal_len]);
             let length = group + self.literal_len;
@@ -733,7 +817,8 @@ impl HeadingProjection {
             self.literal[..self.literal_len].copy_from_slice(&bytes[valid..length]);
             let text =
                 std::str::from_utf8(&bytes[..valid]).map_err(|_| Error::UnsupportedInline)?;
-            // 与原code span相同：CR、LF及CRLF均为一个空格；保状态而不复制整段code。
+            // CR, LF, and CRLF each yield one space under code-span rules. Keep
+            // only continuation state, never a copy of the complete code span.
             let mut text_bytes = String::with_capacity(valid);
             for scalar in text.chars() {
                 if scalar == '\n' && self.literal_after_cr {
@@ -753,14 +838,19 @@ impl HeadingProjection {
             work.copied_bytes += copied;
             return Ok((work, false));
         }
-        // 完整事实的域边界必须落在合法UTF8边界；代码carry不得泄到普通文本或另一条code span。
-        // 有问题就沿原失败链清理，不能用替换字符掩盖Source坐标或解码错误。
+        // Certified domain boundaries must align to UTF-8 scalars. Code carry
+        // cannot leak into ordinary text or a different code span.
+        // Fail through the original cleanup chain; replacement characters must
+        // not hide source-coordinate or decoding errors.
         if self.literal_len != 0 {
+            // Another semantic domain cannot borrow an incomplete code scalar.
+            // Refuse publication rather than substitute a replacement character.
             return Err(Error::UnsupportedInline);
         }
         self.literal_after_cr = false;
         if self.normal_after_cr && bytes[0] == b'\n' {
-            // 前一步的真实CR已送出空格；这次只消费属于同一CRLF的LF，不建立第二个空格。
+            // The preceding actual CR already emitted a space. Consume its paired
+            // LF without emitting a second space.
             self.next += 1;
             self.normal_after_cr = false;
             return Ok((work, false));
@@ -770,7 +860,8 @@ impl HeadingProjection {
             .iter()
             .position(|byte| matches!(byte, b'\r' | b'\n'))
         {
-            // 只在真实EOL截小当前页，输出/输入长度仍一致，decoder消费数仍是canonical字节数。
+            // Shorten this page only at an actual EOL. Input/output replacement length
+            // stays equal, and decoder consumption still counts canonical source bytes.
             group = end + 1;
             bytes[end] = b' ';
         }
@@ -786,7 +877,8 @@ impl HeadingProjection {
             .decoder
             .feed(&bytes[..group], real_end, &mut output, budget)
             .map_err(Error::Global)?;
-        // 消费可能因输出页满而早停；只有真消费到末尾CR时才持有下一LF的归一化责任。
+        // A full output page may stop consumption early. Only consuming the
+        // actual final CR grants responsibility for normalizing the next LF.
         if step.consumed == group {
             let mut last = [0];
             read_source(document, self.next + group - 1, &mut last)?;
@@ -807,7 +899,8 @@ impl HeadingProjection {
         Ok((work, false))
     }
 
-    /// 各真实资源都尝试归还；两个关闭错误同样保留，不能第一个Err提前跳过另一个FD。
+    /// Attempts every owned resource release. Preserve both close failures rather
+    /// than skipping another descriptor after the first error.
     pub(super) fn close(&mut self) -> Result<(), Error> {
         self.initial = None;
         self.cursor = None;
@@ -830,7 +923,8 @@ impl HeadingProjection {
     }
 }
 
-/// 只合并当前至多260字节的真实逻辑片；全部lease逐个finish，UTF8可以跨piece而不造EOF。
+/// Joins at most 260 bytes for the current logical chunk. Finish every real
+/// lease separately; UTF-8 may cross pieces without manufacturing source EOF.
 fn read_source(
     document: &MarkdownDocumentBuffer,
     start: usize,
@@ -844,6 +938,8 @@ fn read_source(
         copied += count;
         frame.finish()?;
         if count == 0 {
+            // A nonempty pending range needs real bytes. Neither an empty lease nor
+            // the end of a physical piece is a successful logical end-of-source.
             return Err(Error::UnsupportedInline);
         }
     }

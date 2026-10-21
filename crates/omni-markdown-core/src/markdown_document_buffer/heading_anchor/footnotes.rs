@@ -1,19 +1,25 @@
-//! 当前标题的有限脚注查询；每个真实key独立重扫原Global，不保存全源定义表或定义正文。
-//! 已证明的定义key直接流式casefold比较，极长无关key也不会被物化成String。
+//! Bounded footnote queries for the current heading. Each real key independently
+//! scans the original global frontier without retaining all definitions or their text.
+//! Certified definition keys compare through streaming case folding, so even
+//! extremely long unrelated keys are never materialized as complete strings.
 
 use super::*;
 use pulldown_cmark::global_frontier::{InlineReferenceDecoder, VerifiedGlobalFootnoteDefinition};
 use unicase::UniCase;
 
-// label只属于当前标题的原规范化identifier；found=None是Unknown，不能解释为Missing。
-// 原文定义不进入该库存，重复key沿原UniCase匹配后复用同一个真实答案。
+// Labels are normalized identifiers belonging to this heading only. `None`
+// means unknown, never a missing definition proved by the whole source.
+// Source definitions do not enter this inventory. Duplicate keys reuse the same
+// actual answer after comparison under the existing UniCase rules.
 struct Query {
     label: String,
     found: Option<bool>,
 }
 
-// 当前定义只保共享解码续体及比较水位；源语法已经由真实Global Fact闭合。
-// 失配前缀不可能被后文修正，因此可立即放下这个decoder并继续原Global，无须读取剩余key。
+// A current definition retains its shared decoder continuation and comparison
+// offset only; the real global fact already certified the complete source syntax.
+// Later text cannot repair a mismatching prefix. Drop that decoder immediately
+// and resume the same global frontier without reading the rest of this key.
 struct Definition {
     decoder: InlineReferenceDecoder,
     end: usize,
@@ -32,7 +38,8 @@ pub(super) struct HeadingFootnotes {
 }
 
 impl HeadingFootnotes {
-    /// 此库存只收当前标题经原Parser/cursor认证的key；没有Doc、正文或历史强引用。
+    /// Stores only this heading's parser/cursor-certified keys, with no strong
+    /// references to the document, source text, or history.
     pub(super) fn new(quota: MarkdownTableWindowQuota) -> Self {
         Self {
             queries: Vec::new(),
@@ -46,7 +53,8 @@ impl HeadingFootnotes {
         }
     }
 
-    /// Fn回调只能表达Unknown；真实准入失败仍留原类型，Parser迭代后由拥有者立即返回。
+    /// The lookup callback can report unknown only. Preserve actual admission failure
+    /// as its original typed cause for the owner to return immediately after parsing.
     pub(super) fn lookup(&mut self, label: &str) -> Option<bool> {
         if let Some(query) = self
             .queries
@@ -56,10 +64,14 @@ impl HeadingFootnotes {
             return query.found;
         }
         if self.failure.is_some() {
+            // A prior admission failure revokes further query growth until the owner
+            // takes that exact error; unknown remains distinct from a missing result.
             return None;
         }
         let bytes = self.query_bytes.checked_add(label.len());
         if bytes.is_none_or(|bytes| bytes > FRAGMENT_LIMIT) {
+            // Reject before copying this key or allocating another handle page.
+            // The parser's optional-answer channel cannot conceal this typed failure.
             self.failure = Some(Error::Semantic(
                 super::super::table_window_request::MarkdownTableRequestError::Window(
                     crate::markdown_viewport_presentation::table_window::MarkdownTableWindowError::ReferenceLimit,
@@ -67,7 +79,8 @@ impl HeadingFootnotes {
             ));
             return None;
         }
-        // 只在目录满时按倍增分配新句柄页；旧字符串只移动所有权，不重复复制key。
+        // Grow the handle directory only when full. Move existing owned strings
+        // into its new capacity rather than copying their identifier bytes.
         let capacity = if self.queries.len() == self.queries.capacity() {
             self.queries.capacity().saturating_mul(2).max(4)
         } else {
@@ -81,6 +94,8 @@ impl HeadingFootnotes {
             return None;
         }
         if capacity != 0 {
+            // Account for allocator rounding before transferring existing query owners;
+            // failure drops only the new directory, retaining original query state.
             let mut next = Vec::with_capacity(capacity);
             if let Err(error) = self
                 .quota
@@ -102,30 +117,39 @@ impl HeadingFootnotes {
         None
     }
 
-    /// 所有当前查询均已有Found或真实EOF的Missing；没有查询时不创建全局扫描或匿名资源。
+    /// Every current query has either a found result or a missing result proved by
+    /// real EOF. An empty query set creates no global scan or anonymous resources.
     pub(super) fn is_ready(&self) -> bool {
         self.current == self.queries.len()
     }
+    /// Transfers the first actual lookup/admission failure to the original request
+    /// owner instead of reclassifying the callback's unknown value as a missing key.
     pub(super) fn take_failure(&mut self) -> Option<Error> {
         self.failure.take()
     }
 
-    /// 一个key只有Found或真实Global EOF才能结束；前瞻Fact不抬高其它源的可解释水位。
+    /// A key completes only on a real match or global EOF. Lookahead facts cannot
+    /// raise the semantic frontier of another source.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
         budget: usize,
     ) -> Result<(MarkdownHeadingAnchorWork, bool), Error> {
         if self.is_ready() {
+            // An answered or empty query set needs no source read or new frontier.
             return Ok((MarkdownHeadingAnchorWork::default(), true));
         }
         if self.definition.is_some() {
+            // Resume its exact bounded label decoder before asking for another fact.
             return self.compare_definition(document, budget);
         }
-        // 一个当前key独占一次原Global；串行重扫是明确可计费的CPU/I/O，换取有界内存和真实EOF。
-        // 成功或失败都随原请求释放，不留跨文档缓存、后台任务或一份全源脚注目录。
+        // One current key owns one original global scan. Serial rescanning has
+        // explicit CPU/I/O cost in exchange for bounded memory and truthful EOF.
+        // Both success and failure release this request's resources; no cross-document
+        // cache, background work, or whole-source footnote directory remains.
         if self.global.is_none() {
-            // 原UniCase的full casefold无上下文；只物化有限当前查询，不物化任何全源定义。
+            // UniCase's full case fold is context-free. Materialize only the bounded
+            // current query, never every source definition.
             self.quota
                 .admit_metadata(self.queries[self.current].label.len().saturating_mul(4))
                 .map_err(|error| {
@@ -187,13 +211,15 @@ impl HeadingFootnotes {
             budget - 128,
         );
         frame.finish()?;
-        // 这里只接真实Footnote定义存在性事实；正文、代码、HTML及相似裸字符都不能生成Found。
-        // SourceFrame已finish，若此前读取/回收失败不会进入下面的成功路径。
+        // Only a real global footnote-definition fact can establish existence.
+        // Body text, code, HTML, or similar raw characters cannot fabricate a match.
+        // The source lease has finished; any actual read/reclamation failure
+        // prevents entry into the successful fact-consumption path below.
         let (measured, fact) = match step.map_err(Error::Global)? {
             GlobalStep::Progress { work, .. } | GlobalStep::NeedInput { work, .. } => (work, None),
             GlobalStep::Fact { fact, work } => (work, Some(fact)),
             GlobalStep::Complete { work } => {
-                self.complete_query(false); // 唯一全源EOF授权Missing；当前屏幕没有定义不算Missing。
+                self.complete_query(false); // Only whole-source EOF proves missing; absence from the viewport proves nothing.
                 return Ok((
                     MarkdownHeadingAnchorWork {
                         source_bytes,
@@ -217,6 +243,8 @@ impl HeadingFootnotes {
         ))
     }
 
+    /// Retains the decoder and endpoint certified by this actual footnote fact,
+    /// not the definition's text or a guessed range found by string searching.
     fn definition(fact: VerifiedGlobalFootnoteDefinition) -> Definition {
         Definition {
             decoder: fact.reference_decoder(),
@@ -225,8 +253,10 @@ impl HeadingFootnotes {
         }
     }
 
-    /// 共享LabelScanner先产完整UTF8小片，再按原UniCase规则比较；一旦失配即可丢弃已认证完整定义。
-    /// 后继字符不能修正已经不同的casefold前缀，因此不需要读取或保存定义剩余key。
+    /// The shared label scanner emits complete bounded UTF-8 chunks for UniCase
+    /// comparison. A mismatch can discard this already certified complete definition.
+    /// Later characters cannot repair a different folded prefix, so no remaining
+    /// definition-key bytes need to be read or retained.
     fn compare_definition(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -251,7 +281,7 @@ impl HeadingFootnotes {
             &mut output,
             budget - 128,
         );
-        frame.finish()?; // 当前借页归还后才展开decoder错误或进行后继文件/查询动作。
+        frame.finish()?; // Return the current lease before propagating decoder errors or advancing file/query work.
         let step = step.map_err(Error::Global)?;
         let text =
             std::str::from_utf8(&output[..step.written]).map_err(|_| Error::UnsupportedInline)?;
@@ -267,8 +297,10 @@ impl HeadingFootnotes {
             .compared
             .checked_add(folded.len())
             .ok_or(Error::ArithmeticOverflow)?;
-        // casefold不会跨scalar重排字符；当前固定输出片与有限查询相同区间比较即可。
-        // 只有decoder真正消费closing bracket、长度也相等时，才能结束为Found。
+        // Case folding does not reorder across scalars. Compare this fixed output
+        // chunk with the corresponding range of the bounded query.
+        // A found result additionally requires the decoder's actual closing bracket
+        // and exactly equal complete folded lengths.
         let same = self.folded.as_bytes().get(definition.compared..end) == Some(folded.as_bytes());
         definition.compared = end;
         let exact = same && step.complete && end == self.folded.len();
@@ -280,14 +312,19 @@ impl HeadingFootnotes {
             ..Default::default()
         };
         if exact {
+            // A complete equal normalized key proves this query's existence; the
+            // global scanner and current definition can release their structural pages.
             self.complete_query(true);
         } else if !same || step.complete {
+            // A mismatching or unequal-length completed key answers nothing about
+            // later definitions. Resume the same original global scan, keeping Unknown.
             self.definition = None;
         }
         Ok((work, false))
     }
 
-    /// 查询与全局源都只有一个当前拥有者；结论交付即归还当前定义decoder和结构页。
+    /// The query and global scan have one current owner. Delivering the conclusion
+    /// releases its definition decoder and structural pages immediately.
     fn complete_query(&mut self, found: bool) {
         self.queries[self.current].found = Some(found);
         self.current += 1;

@@ -1,4 +1,5 @@
-//! 一个当前标题的真实引用查询；有限 Queries 只收当前标签，不创建全篇定义 Map。
+//! Resolves actual references for one current heading. Bounded queries contain
+//! only its labels, never a whole-document definition map.
 
 use super::*;
 use crate::markdown_document_buffer::table_reference_request;
@@ -12,7 +13,8 @@ pub(super) struct HeadingReferences {
 }
 
 impl HeadingReferences {
-    /// 先收有限标题实际引用，再按同源 Global 的 first-wins 定义顺序补齐；后置定义同样可见。
+    /// Collects bounded actual heading references, then resolves them in the same
+    /// source's global first-definition-wins order, including later definitions.
     pub(super) fn new(
         document: &MarkdownDocumentBuffer,
         queries: MarkdownTableReferenceQueries,
@@ -23,8 +25,11 @@ impl HeadingReferences {
             .and_then(|n| n.checked_add(1024 * 1024))
             .ok_or(Error::ArithmeticOverflow)?;
         let global = if queries.is_ready() {
+            // No unresolved heading label needs a whole-source structural scan.
             None
         } else {
+            // Capture this document's actual generation/extent. Later definitions
+            // remain visible, but no changed source can inherit this cursor's authority.
             Some(
                 GlobalFrontier::new(
                     document.generation(),
@@ -53,14 +58,16 @@ impl HeadingReferences {
         })
     }
 
-    /// Parser 的 callback 生命周期只借本次有限结果；返回借用值，不复制另一个 URL/title 缓冲。
+    /// Parser callbacks borrow these bounded results only. Returning borrowed values
+    /// creates no second URL/title buffer.
     pub(super) fn resolve<'a>(&'a self, label: &str) -> Option<(CowStr<'a>, CowStr<'a>)> {
         self.queries
             .resolve(label)
             .map(|(destination, title)| (destination.into(), title.into()))
     }
 
-    /// 一个真实定义仍通过现有有限规范化/原 Parser；源页、复制与语义工作都交回原 heading 请求。
+    /// Processes real definitions through the existing bounded normalizer/parser.
+    /// Source reads, copies, and semantic work return to the original heading request.
     pub(super) fn advance(
         &mut self,
         document: &MarkdownDocumentBuffer,
@@ -71,6 +78,8 @@ impl HeadingReferences {
             ..Default::default()
         };
         if let Some(pending) = self.pending.as_mut() {
+            // Complete the existing certified definition before advancing the global
+            // frontier; its bounded decoder owns its own pending normalization.
             let step = pending
                 .advance(document, &mut self.queries, budget)
                 .map_err(|error| Error::Semantic(MarkdownTableRequestError::Window(error)))?;
@@ -84,7 +93,7 @@ impl HeadingReferences {
             return Ok((work, false));
         }
         if self.queries.is_ready() {
-            self.global = None; // 真实最早定义已回答所有当前标签，无需扫描无关文尾。
+            self.global = None; // First matching definitions answered every label; unrelated trailing text need not be scanned.
             return Ok((work, true));
         }
         let global = self.global.as_mut().ok_or(Error::ArithmeticOverflow)?;
@@ -105,12 +114,14 @@ impl HeadingReferences {
                 budget - 128,
             )
             .map_err(Error::Global);
+        // Return the actual source lease before inspecting the parser result. Real
+        // reclamation failure takes precedence over a plausible definition/EOF fact.
         frame.finish()?;
         let (measured, fact) = match step? {
             GlobalStep::Progress { work, .. } | GlobalStep::NeedInput { work, .. } => (work, None),
             GlobalStep::Fact { fact, work } => (work, Some(fact)),
             GlobalStep::Complete { work } => {
-                self.queries.finish_verified_eof(); // 只有这个原全局 EOF 才授权 Missing。
+                self.queries.finish_verified_eof(); // Only the original global frontier's real EOF authorizes a missing result.
                 self.global = None;
                 return Ok((
                     MarkdownHeadingAnchorWork {
@@ -125,6 +136,8 @@ impl HeadingReferences {
         work.source_bytes = borrowed;
         work.structural_transitions += measured.transitions;
         if let Some(GlobalFact::Reference(fact)) = fact {
+            // Only a verified global definition can start bounded value parsing.
+            // Similar text in code, HTML, or ordinary paragraphs grants no lookup result.
             let source = document
                 .table_source_identity()
                 .ok_or(Error::ArithmeticOverflow)?;

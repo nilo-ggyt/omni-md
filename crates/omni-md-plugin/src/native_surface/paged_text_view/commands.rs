@@ -17,10 +17,13 @@ use crate::payload_use::PayloadUseGuard;
 #[derive(Clone, Copy)]
 /// The existing gesture slot keeps either a caret or the first word/Shift seed; it never stores source text.
 pub(super) enum DragAnchor {
+    // A caret drag keeps its original logical anchor; reflow cannot replace it with a new hit.
     Caret {
         anchor_utf16: usize,
         generation: u64,
     },
+    // Word selection retains the certified initial group/Shift role instead of expanding
+    // each endpoint independently.
     Word {
         anchor: WordAnchor,
         generation: u64,
@@ -47,6 +50,7 @@ impl DragAnchor {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         match word_anchor {
+            // The producer already mapped this word seed into the published Input coordinate domain.
             Some(anchor) => {
                 let position = match anchor {
                     WordAnchor::Selection(position) => position,
@@ -76,6 +80,7 @@ impl DragAnchor {
                     generation: state.generation,
                 })
             }
+            // No word proof means a normal caret seed, derived only from the actual published selection.
             None => Ok(Self::Caret {
                 anchor_utf16: state.selection.anchor_utf16,
                 generation: state.generation,
@@ -226,6 +231,7 @@ fn navigation(selector: Sel) -> Option<(Nav, bool)> {
             return Some((action, true));
         }
     }
+    // Whole-word/line/paragraph selection uses its own Scene operation, not an extending motion alias.
     for (selector_value, action) in [
         (sel!(selectWord:), Nav::SelectWord),
         (sel!(selectLine:), Nav::SelectLine),
@@ -370,6 +376,8 @@ impl NativeMarkdownPagedTextView {
             return Ok(()); // Copy alone creates no Core edit; the actual clipboard producer already completed.
         }
         if selector == sel!(paste:) || selector == sel!(pasteAsPlainText:) {
+            // Capture the original selection before any pasteboard getter can synchronously
+            // change focus or Input.
             let permit = origin.input.capture(origin.epoch, &current)?;
             let pasteboard = origin.step(self, NSPasteboard::generalPasteboard)?;
             if selector == sel!(paste:) && !origin.input.is_cell() {
@@ -382,6 +390,8 @@ impl NativeMarkdownPagedTextView {
                     return self.queue_attachment_paths(paths, None, origin.state);
                 }
             }
+            // Read one actual pasteboard value at arrival. The Native conversion below still owns
+            // its original permit; it cannot replace a later selection after getter reentry.
             let text = origin
                 .step(self, || {
                     // SAFETY: the public framework type constant lives for the process; reading it accesses no document.
@@ -395,6 +405,8 @@ impl NativeMarkdownPagedTextView {
             return self.finish_edit_commit(&origin, commit); // Pasted text uses the existing bounded input conversion and transaction limit.
         }
         if selector == sel!(cancelOperation:) && origin.state.marked.is_some() {
+            // Clone only the Rust Rc while borrowing the slot; this sends no Objective-C message.
+            // End that borrow before composition completion may reenter the original context.
             let context = self
                 .ivars()
                 .context
@@ -443,6 +455,8 @@ impl NativeMarkdownPagedTextView {
         } // Marked input stays in the synchronous NSTextInputClient protocol, outside the ordinary character queue.
 
         if selector == sel!(delete:) {
+            // Cocoa delete: applies only to explicit selected ranges; an empty caret is
+            // not implicit backspace.
             let permit = origin.input.capture(origin.epoch, &current)?;
             let outcome = origin.input.delete_selected_ranges(&permit, &current)?;
             return self.finish_edit_outcome(&origin, outcome);
@@ -701,6 +715,8 @@ impl NativeMarkdownPagedTextView {
                 if !scene.current(self) || !after_geometry.same(&geometry) {
                     return Err(NativeMarkdownPagedTextViewError::Revoked);
                 } // Layout changed during calculation; new geometry cannot certify an already computed old target.
+                // A vertical goal belongs to this exact layout and needs an explicit head side.
+                // Reject contradictory Scene output before any selection transaction is prepared.
                 if target.vertical_goal.is_some_and(|goal| {
                     !geometry.permits_goal(goal)
                         || target.head_affinity.is_none()
@@ -758,6 +774,8 @@ impl NativeMarkdownPagedTextView {
             }
             let permit = origin.input.capture(origin.epoch, &current)?;
             let action = edit(selector).ok_or(NativeMarkdownPagedTextViewError::Pending)?;
+            // The Scene owns the full grapheme/line replacement plan. Revalidate after calculation
+            // before the canonical transaction can use that range or its inserted text.
             let plan = scene.scene.edit_plan(action)?;
             if !scene.current(self) {
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
@@ -823,6 +841,8 @@ impl NativeMarkdownPagedTextView {
             return Ok(false);
         }
         let (_, context) = self.foreground_context()?;
+        // Deliver this physical event once to the composing client. Its synchronous callbacks may
+        // publish a new marked state, so only session identity is stable across the Native call.
         context.0.handleEvent(event);
         if !origin.session_current(self, origin.epoch) {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
@@ -869,6 +889,8 @@ impl NativeMarkdownPagedTextView {
                     .is_ok_and(|actual| actual.same(&request))
         };
         if pointer.clicks == 2 {
+            // A double click asks the existing source-word producer directly; no first rendered
+            // child frame is required to certify the raw hit already supplied by the parent.
             let permit = origin.input.capture(origin.epoch, &current)?;
             // Word dragging keeps the first word seed; Shift keeps the directed anchor. Original UBA treats them distinctly.
             // Convert all endpoints through this raw range; the parent must already own any cross-cell endpoint.
@@ -1135,6 +1157,8 @@ impl NativeMarkdownPagedTextView {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
         let extending = dragging || flags.contains(NSEventModifierFlags::Shift);
+        // A fresh Shift-down uses the current directed anchor. A continuing drag instead keeps
+        // the generation-bound seed captured at its own down, even after selection changes.
         let anchor = if !dragging && extending {
             let anchor = origin
                 .state
@@ -1151,6 +1175,7 @@ impl NativeMarkdownPagedTextView {
         } else {
             anchor
         };
+        // Drag/up may only borrow a live down. Only an actual new down may allocate gesture identity.
         let intent = if dragging || mouse_up {
             self.ivars()
                 .cell_pointer_intent
@@ -1213,6 +1238,8 @@ impl NativeMarkdownPagedTextView {
             Some(Anchor::Word(_)) => unreachable!("真实Word已交上方原选词消费者"),
         };
         if let Some(hit) = scene.scene.cell_hit(local, false)? {
+            // Offer the certified raw Cell hit to its real parent before a body selection can
+            // consume this endpoint; accepted ownership ends processing on the old Scene.
             let next_anchor = DragAnchor::Caret {
                 anchor_utf16: anchor.unwrap_or(hit.head_utf16),
                 generation: scene.origin.state.generation,
@@ -1249,6 +1276,8 @@ impl NativeMarkdownPagedTextView {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
         let permit = scene.origin.input.capture(scene.origin.epoch, &current)?;
+        // An active child/cross-Cell gesture gets first refusal with its original permit.
+        // A decline leaves this same Scene eligible for the ordinary body selection below.
         if scene.origin.delegate.extend_cell_pointer(
             &scene.key.request,
             super::NativeMarkdownPagedCellExtension::Selection {
@@ -1293,6 +1322,8 @@ impl NativeMarkdownPagedTextView {
         };
         let current = |epoch| epoch == scene.origin.epoch && scene.current(self);
         if let Some(hit) = scene.scene.cell_hit(local, true)? {
+            // Cell word hits preserve their original source-side bias and first-word seed;
+            // successful handoff must not fall through to a second body word query.
             let next = anchor.unwrap_or(WordAnchor::Word {
                 head_utf16: hit.head_utf16,
                 backward_bias: hit.backward_bias,
@@ -1410,6 +1441,8 @@ impl NativeMarkdownPagedTextView {
             return Err(NativeMarkdownPagedTextViewError::InvalidGeometry);
         }
         let viewport = request.viewport;
+        // Inside the child viewport, keep local editing ownership. Only an actual outside
+        // endpoint may ask the existing parent to commit/extend into canonical coordinates.
         if local.x >= viewport.origin.x
             && local.y >= viewport.origin.y
             && local.x < viewport.origin.x + viewport.size.width
@@ -1522,6 +1555,7 @@ impl NativeMarkdownPagedTextView {
                 .ok_or(NativeMarkdownPagedTextViewError::Pending)?;
             let focused = scene.step(self, || window.makeFirstResponder(Some(self)))?;
             if !focused {
+                // A refused focus transfer cannot authorize selection or link activation in this View.
                 return Err(NativeMarkdownPagedTextViewError::Revoked);
             }
             let point = scene.step(self, || event.locationInWindow())?;
@@ -1729,6 +1763,8 @@ impl NativeMarkdownPagedTextView {
         {
             return Err(NativeMarkdownPagedTextViewError::Revoked);
         }
+        // Move the original Rc rather than cloning gesture lifetime into both views. The
+        // parent becomes the sole slot owner before any Native timer/deallocation callback.
         let token = {
             let mut slot = self.ivars().cell_pointer_intent.borrow_mut();
             if slot.as_ref().is_none_or(|active| {
@@ -2006,6 +2042,8 @@ impl NativeMarkdownPagedTextView {
         if result.is_err() {
             self.retire_link_intent(&intent);
         }
+        // Cleanup can deliver a reentrant down. Report this up only if its original link
+        // slot still owns feedback, without clearing or overwriting a successor operation.
         let current_link = self
             .ivars()
             .link_intent
@@ -2263,6 +2301,7 @@ impl NativeMarkdownPagedTextView {
 mod tests {
     use super::*;
 
+    /// Real Cocoa selectors retain their existing visual/logical distinction, including Shift extension.
     #[test]
     fn legacy_visual_word_and_line_selectors_do_not_collapse_into_logical_motion() {
         assert_eq!(
@@ -2295,6 +2334,8 @@ mod tests {
         );
     }
 
+    /// Paragraph aliases preserve direction while Host Find, return, and quit stay outside
+    /// text-edit decoding.
     #[test]
     fn legacy_paragraph_aliases_share_original_direction_without_capturing_host_actions() {
         assert_eq!(

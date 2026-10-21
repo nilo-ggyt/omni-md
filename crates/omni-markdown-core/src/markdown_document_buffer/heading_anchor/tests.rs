@@ -1,16 +1,20 @@
-//! 合成真实文件经公开生产请求完成；不伪造 Fact、Source 身份、存储错误或私有阶段。
+//! Synthetic real files exercise public production requests without fabricated
+//! facts, source identities, storage errors, or private phase mutation.
 
 use super::{Error, MarkdownHeadingAnchorRequest, MarkdownHeadingAnchorStep};
 use crate::{MarkdownDocumentBuffer, MarkdownTextSelection};
 use std::{fs::File, io::Write, path::Path};
 
+/// Opens a real, caller-owned synthetic file through the production immutable
+/// snapshot path; no user vault or fabricated source authority participates.
 fn open(directory: &Path, name: &str, source: &str) -> MarkdownDocumentBuffer {
     let path = directory.join(name);
     std::fs::write(&path, source).unwrap();
     MarkdownDocumentBuffer::open(&path, 32 * 1024 * 1024).unwrap()
 }
 
-/// 等原生产 continuation 的真实终点；工作量来自公开收据，不检查内部 phase 或调用次数。
+/// Advances the original production continuation to its real endpoint. Work
+/// comes from public receipts, never private phases or expected call counts.
 fn complete(
     request: &mut MarkdownHeadingAnchorRequest,
     document: &MarkdownDocumentBuffer,
@@ -22,10 +26,12 @@ fn complete(
             | MarkdownHeadingAnchorStep::Found { work, .. }
             | MarkdownHeadingAnchorStep::NotFound { work } => work,
         };
-        // 这是真实输入物化边界，不能靠超长标题或一次 fallback 绕开已有视口预算。
+        // These are actual input-materialization boundaries. A giant heading or
+        // fallback must not bypass the existing viewport read/copy budgets.
         assert!(work.source_bytes <= 4096);
         assert!(work.copied_bytes <= 4096);
-        // 标题自身仍≤2KiB；真实引用值复用原生产定义解析器的16KiB有限值上限。
+        // Local heading parser inputs remain bounded; actual reference values
+        // retain the production definition parser's separate 16-KiB value limit.
         assert!(work.parser_input_bytes <= 16 * 1024);
         assert!(work.storage_bytes <= 4096);
         match step {
@@ -39,6 +45,8 @@ fn complete(
     panic!("标题链接没有在有限合成源上完成");
 }
 
+/// Visible inline content, repeated slug collisions, quotes, lists, and Setext
+/// headings must navigate to their actual original physical lines without editing disk.
 #[test]
 fn real_markdown_heading_text_and_duplicate_collisions_navigate_to_original_lines() {
     let directory = tempfile::tempdir().unwrap();
@@ -73,6 +81,7 @@ fn real_markdown_heading_text_and_duplicate_collisions_navigate_to_original_line
             "{fragment}"
         );
     }
+    // A heading-looking line inside a real code fence never acquires anchor semantics.
     let mut missing = document.heading_anchor_request("假标题").unwrap();
     assert_eq!(complete(&mut missing, &document).unwrap(), None);
     assert_eq!(
@@ -81,6 +90,8 @@ fn real_markdown_heading_text_and_duplicate_collisions_navigate_to_original_line
     );
 }
 
+/// A giant irrelevant heading must not block a later actual heading or retain
+/// a document-sized read window after navigation completes.
 #[test]
 fn giant_plain_heading_and_following_heading_are_streamed_without_full_materialization() {
     let directory = tempfile::tempdir().unwrap();
@@ -88,7 +99,8 @@ fn giant_plain_heading_and_following_heading_are_streamed_without_full_materiali
     let mut file = File::create(&path).unwrap();
     file.write_all(b"# ").unwrap();
     for _ in 0..2048 {
-        // 固定源块跨真实 mmap 页/UTF8边界；测试初始化同样不构造整条标题 String。
+        // Fixed source chunks cross real mmap and UTF-8 boundaries. Even fixture
+        // setup avoids constructing the entire heading as one string.
         file.write_all("中文".repeat(32).as_bytes()).unwrap();
     }
     file.write_all("\n\n# 后继标题\n".as_bytes()).unwrap();
@@ -104,12 +116,15 @@ fn giant_plain_heading_and_following_heading_are_streamed_without_full_materiali
     );
     assert!(mapping.peak_managed_resident_bytes() <= 64 * 1024);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), original.len());
-    // 已完成请求及目标只保 Weak；文档退出后真实 munmap 不得被导航缓存延长。
+    // Completed requests and targets retain weak identity only. After document
+    // destruction, navigation metadata must not delay the actual unmap.
     drop(document);
     assert!(mapping.unmap_succeeded());
     assert!(!mapping.failed());
 }
 
+/// Equal content and undo-restored bytes do not recreate the original request's
+/// document/generation authority; stale navigation must reject rather than retarget.
 #[test]
 fn requests_and_results_cannot_survive_edit_undo_or_an_equal_length_different_document() {
     let directory = tempfile::tempdir().unwrap();
@@ -135,6 +150,8 @@ fn requests_and_results_cannot_survive_edit_undo_or_an_equal_length_different_do
         target.position_for(&document).unwrap_err(),
         Error::SourceSuperseded
     );
+    // Undo can restore identical source bytes but not the consumed generation.
+    // Both the finished target and original continuation must remain revoked.
     document.undo().unwrap();
     assert_eq!(
         target.position_for(&document).unwrap_err(),
@@ -146,6 +163,8 @@ fn requests_and_results_cannot_survive_edit_undo_or_an_equal_length_different_do
     );
 }
 
+/// Cancellation is an explicit failure, never a successful NotFound. Abandoned
+/// navigation keeps no strong source owner that could delay actual document unmap.
 #[test]
 fn cancellation_and_abandonment_release_original_mapping_without_claiming_a_missing_anchor() {
     let directory = tempfile::tempdir().unwrap();
@@ -169,6 +188,8 @@ fn cancellation_and_abandonment_release_original_mapping_without_claiming_a_miss
     drop(abandoned);
 }
 
+/// Empty documents still have distinct owners even though both roots and source
+/// contents are empty. A zero-position target cannot cross that ownership boundary.
 #[test]
 fn an_empty_document_anchor_keeps_the_original_empty_owner_identity() {
     let directory = tempfile::tempdir().unwrap();
@@ -186,6 +207,8 @@ fn an_empty_document_anchor_keeps_the_original_empty_owner_identity() {
     );
 }
 
+/// Giant hidden HTML and real surrounding inline markup must project the exact
+/// visible slug while preserving reachability and bounded residency for a later heading.
 #[test]
 fn giant_complex_heading_projects_real_markup_and_keeps_the_following_heading_reachable() {
     let directory = tempfile::tempdir().unwrap();
@@ -193,7 +216,8 @@ fn giant_complex_heading_projects_real_markup_and_keeps_the_following_heading_re
     let mut file = File::create(&path).unwrap();
     file.write_all("# 开头<!--".as_bytes()).unwrap();
     for _ in 0..1024 {
-        // 超长注释是原HTML语法的一部分；两种请求都不能复制它形成标题String。
+        // The giant comment belongs to actual HTML syntax. Neither request may
+        // copy its contents into a complete heading string.
         file.write_all(&[b'x'; 1024]).unwrap();
     }
     file.write_all(
@@ -222,6 +246,8 @@ fn giant_complex_heading_projects_real_markup_and_keeps_the_following_heading_re
     assert!(!mapping.failed());
 }
 
+/// Cross-page quoted HTML, nested labels, multiline Setext scope, CR/CRLF, and
+/// later reference definitions must keep their original complete syntax decisions.
 #[test]
 fn long_setext_and_nested_link_labels_use_original_scope_and_real_later_references() {
     let directory = tempfile::tempdir().unwrap();
@@ -251,7 +277,8 @@ fn long_setext_and_nested_link_labels_use_original_scope_and_real_later_referenc
         let path = directory.path().join(format!("long-scope-{index}.md"));
         let mut file = File::create(&path).unwrap();
         file.write_all(opening.as_bytes()).unwrap();
-        // quoted属性里的'>'和']'不能提前关闭HTML或外层label；真实词法跨页继续。
+        // A quoted attribute's '>' or ']' cannot close HTML or the outer label
+        // early; actual lexical state must continue across source pages.
         for _ in 0..8 {
             file.write_all(&[b'x'; 1024]).unwrap();
         }
@@ -268,6 +295,8 @@ fn long_setext_and_nested_link_labels_use_original_scope_and_real_later_referenc
     }
 }
 
+/// Resolved links contribute their visible label; only real whole-source EOF
+/// permits an unresolved reference's literal spelling to remain in the anchor.
 #[test]
 fn heading_reference_labels_use_real_later_definitions_and_keep_missing_references_literal() {
     let directory = tempfile::tempdir().unwrap();
@@ -275,7 +304,8 @@ fn heading_reference_labels_use_real_later_definitions_and_keep_missing_referenc
     let document = open(directory.path(), "reference.md", source);
     let mut resolved = document.heading_anchor_request("标签").unwrap();
     assert_eq!(complete(&mut resolved, &document).unwrap(), Some(0));
-    // Missing 只有整个原 Global 已到EOF才能生效；不能把晚到定义当成不存在。
+    // Only the original whole-source frontier at real EOF proves missing.
+    // A definition appearing later in the source must remain visible.
     let mut missing = document.heading_anchor_request("不存在缺失").unwrap();
     let expected = source[..source.find("# [不存在]").unwrap()]
         .encode_utf16()
@@ -283,6 +313,8 @@ fn heading_reference_labels_use_real_later_definitions_and_keep_missing_referenc
     assert_eq!(complete(&mut missing, &document).unwrap(), Some(expected));
 }
 
+/// Greek final sigma depends on actual visible surrounding letters across
+/// markup and page boundaries; hidden HTML cannot create an artificial word edge.
 #[test]
 fn unicode_final_sigma_keeps_visible_context_across_markup_and_real_source_pages() {
     let directory = tempfile::tempdir().unwrap();
@@ -298,6 +330,8 @@ fn unicode_final_sigma_keeps_visible_context_across_markup_and_real_source_pages
         let expected = source[..source.find(line).unwrap()].encode_utf16().count();
         assert_eq!(complete(&mut request, &document).unwrap(), Some(expected));
     }
+    // Place the deciding visible suffix beyond a real multi-page hidden span.
+    // This contrasts a final sigma with one followed by another cased letter.
     for (index, (ending, fragment)) in [("-->**Σ**\n", "ος"), ("-->**Σ**Α\n", "οσα")]
         .into_iter()
         .enumerate()
@@ -317,6 +351,8 @@ fn unicode_final_sigma_keeps_visible_context_across_markup_and_real_source_pages
     }
 }
 
+/// A later empty footnote definition still proves existence. Nested labels and
+/// absent keys must preserve the same visible result in both short and giant headings.
 #[test]
 fn real_global_footnotes_include_later_empty_definitions_and_keep_missing_keys_literal() {
     let directory = tempfile::tempdir().unwrap();
