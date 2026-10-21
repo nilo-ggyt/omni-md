@@ -1,10 +1,10 @@
-//! 行号折叠热区与标记只消费同一个已发布 Scene；不在绘制或命中时解析隐藏正文。
+//! Fold markers and gutter hit regions consume the same published Scene without parsing hidden text during paint or hit-testing.
 
 use super::*;
 use crate::native_surface::paged_text_view::NativeMarkdownPagedTextScene;
 
 impl NativeMarkdownPagedGutter {
-    /// 原行号区任一可见软行都定位它的真实逻辑行；已出屏行和 Find 顶栏没有隐藏热区。
+    /// Any visible soft line resolves its actual logical line; offscreen rows and the Find header acquire no hidden hit region.
     pub(super) fn toggle_fold_at_event(&self, event: &NSEvent) -> Result<()> {
         let scene = self
             .ivars()
@@ -38,12 +38,12 @@ impl NativeMarkdownPagedGutter {
         self.require(&scene)?;
         if let Some(line) = selected {
             body.toggle_source_fold_line(scene.key().clone(), line)?;
-        } // 同一 Scene 的代次随点击传入原 Input 链；后继文本不能继承这个旧行号。
+        } // Carries the same Scene epoch into the original Input chain; successor text cannot inherit this old line number.
         Ok(())
     }
 }
 
-/// 与原右三角/下三角含义一致，直接进入既有窄 CPU 图，不增字体、字符串或窗口显示列表。
+/// Draws the established right/down fold triangle into the existing narrow CPU bitmap, without fonts, strings, or window display lists.
 pub(super) fn draw_fold_marker(context: &CGContext, frame: NSRect, right: f64, folded: bool) {
     let x = right - 4.0;
     let y = frame.origin.y + frame.size.height * 0.5;
@@ -56,10 +56,12 @@ pub(super) fn draw_fold_marker(context: &CGContext, frame: NSRect, right: f64, f
     );
     CGContext::begin_path(Some(context));
     if folded {
+        // A collapsed block points right, preserving the existing expansion affordance.
         CGContext::move_to_point(Some(context), x - 2.0, y - 3.0);
         CGContext::add_line_to_point(Some(context), x + 2.0, y);
         CGContext::add_line_to_point(Some(context), x - 2.0, y + 3.0);
     } else {
+        // An expanded foldable block points down; this changes marker ink only, not fold authority.
         CGContext::move_to_point(Some(context), x - 3.0, y + 2.0);
         CGContext::add_line_to_point(Some(context), x + 3.0, y + 2.0);
         CGContext::add_line_to_point(Some(context), x, y - 2.0);

@@ -1,4 +1,5 @@
-//! 原字符提交通知的有限选择权限；拒绝状态在同一 owner 生命周期内不可恢复。
+//! Finite selection authority during the original character-commit notification.
+//! Rejection remains irreversible for that same owner's entire lifetime.
 
 use super::*;
 
@@ -11,7 +12,8 @@ pub(in crate::native_surface) enum NativeMarkdownPendingSelectionPhase {
     SuperclassTail,
 }
 
-/// 这些坐标只来自原请求或纯 Core 编辑结果；观测到的 Native 值永不加入候选来源。
+/// Coordinates come only from original input or a pure Core edit result.
+/// Observed Native values can never extend this candidate-source set.
 #[derive(Clone, Copy)]
 pub(in crate::native_surface) struct NativeMarkdownPendingSelectionSources {
     pub(in crate::native_surface) source: &'static str,
@@ -19,11 +21,14 @@ pub(in crate::native_surface) struct NativeMarkdownPendingSelectionSources {
     pub(in crate::native_surface) caret: Option<NSRange>,
     pub(in crate::native_surface) marked_before: Option<NSRange>,
     pub(in crate::native_surface) marked_after: Option<NSRange>,
-    // 只有与原 prepared input 完全匹配的字符 primitive 才声明 superclass 的删除阶段尾点。
+    // Only the character primitive matching original prepared input may declare
+    // the superclass deletion phase's transient EOF.
     pub(in crate::native_surface) is_input_replacement: bool,
 }
 
 impl NativeMarkdownPendingSelectionSources {
+    /// Derive finite replacement/caret facts from the original canonical change,
+    /// without granting the distinct Native input-replacement phase permission.
     pub(in crate::native_surface) fn canonical(
         source: &'static str,
         edit: &MarkdownHistoryTextEdit,
@@ -49,7 +54,8 @@ impl NativeMarkdownPendingSelectionSources {
     }
 }
 
-/// 两个附加尾点只从原长度和原替换参数推出；实际 getter 不能给这些来源补值。
+/// Derive both additional endpoints only from original lengths/replacement.
+/// A getter's observed value cannot fill in missing source facts.
 fn native_markdown_pending_selection_eof_sources(
     before_len: usize,
     after_len: usize,
@@ -58,16 +64,16 @@ fn native_markdown_pending_selection_eof_sources(
     let replacement = sources.replacement?;
     let replacement_end = replacement.location.checked_add(replacement.length)?;
     if replacement_end > before_len {
-        return None; // 原替换必须完整属于首 Native 前的 root，越界参数不取得任何 EOF 权限。
+        return None; // The replacement must belong wholly to the pre-Native root; out-of-range input grants no EOF authority.
     }
     let caret = sources.caret?;
     if caret.length != 0 {
-        return None; // 插入末端是原请求派生的单 caret，不能把任意范围当作输入长度。
+        return None; // The insertion endpoint is a single original caret, not an arbitrary range standing in for input length.
     }
     let inserted_len = caret.location.checked_sub(replacement.location)?;
     let deleted_len = before_len.checked_sub(replacement.length)?;
     if deleted_len.checked_add(inserted_len)? != after_len {
-        return None; // 原替换与实际候选新长度必须精确一致，不能以 raw 值或夹取修正差异。
+        return None; // Original replacement and candidate length must agree exactly, without raw-value substitution or clamping.
     }
     Some((
         NSRange::new(before_len, 0),
@@ -77,7 +83,8 @@ fn native_markdown_pending_selection_eof_sources(
     ))
 }
 
-/// 同一个实际返回收据 Rc 穿过通知、池释放和 superclass 尾声；不持正文或 Native 图。
+/// The same actual receipt Rc crosses notifications, pool drains, and the
+/// superclass tail, without retaining document text or a Native graph.
 pub(in crate::native_surface) struct NativeMarkdownPendingSelectionOwner {
     pub(in crate::native_surface) id: u64,
     pub(in crate::native_surface) committed: Rc<NativeMarkdownCommittedSelection>,
@@ -97,7 +104,8 @@ pub(in crate::native_surface) struct NativeMarkdownPendingSelectionOwner {
 pub(in crate::native_surface) type NativeMarkdownPendingSelectionSlot =
     RefCell<Option<Rc<NativeMarkdownPendingSelectionOwner>>>;
 
-/// 只释放原 id 与同 Rc 的槽；局部旧 guard 不得 take 掉 Native 重入发布的后继 owner。
+/// Take only the slot with original id and exact Rc identity. An old local guard
+/// cannot remove a successor owner published through Native reentry.
 fn take_pending_selection_owner(
     slot: &NativeMarkdownPendingSelectionSlot,
     owner: &Rc<NativeMarkdownPendingSelectionOwner>,
@@ -114,7 +122,8 @@ fn take_pending_selection_owner(
 }
 
 impl NativeMarkdownPendingSelectionOwner {
-    /// 安装尾声仍须拥有原槽的同一 Rc；同值 serial 或同一收据的另一个局部都不能替代它。
+    /// The installation tail still requires this exact slot Rc; equal serials
+    /// or another local owner of the same receipt cannot substitute for it.
     pub(in crate::native_surface) fn owns_slot(
         self: &Rc<Self>,
         slot: &NativeMarkdownPendingSelectionSlot,
@@ -124,16 +133,20 @@ impl NativeMarkdownPendingSelectionOwner {
             .is_some_and(|actual| actual.id == self.id && Rc::ptr_eq(actual, self))
     }
 
-    /// 每次拒绝都留下 tombstone；旧收据若已失效，不得重置真实后继输入的 Known。
+    /// Preserve an irreversible rejection. Revoking an old receipt must not
+    /// reset a real successor input's Known selection.
     pub(in crate::native_surface) fn reject(&self) {
         self.revoked.set(true);
         self.committed.revoke_pending_selection();
     }
 
+    /// Both local rejection and original committed-input authority remain live.
     pub(in crate::native_surface) fn current(&self) -> bool {
         !self.revoked.get() && self.committed.current()
     }
 
+    /// Check the same owner around a reentrant Native operation. A changed owner
+    /// leaves rejection permanent rather than blessing a returned stale value.
     pub(in crate::native_surface) fn native_step<T>(
         &self,
         work: impl FnOnce() -> T,
@@ -150,7 +163,8 @@ impl NativeMarkdownPendingSelectionOwner {
         Ok(result)
     }
 
-    /// raw 值只与首通知前的固定坐标比较；旧 before 可超过新 EOF，不能拿它读取新正文。
+    /// Compare raw values only with coordinates fixed before the first
+    /// notification. Old before may exceed new EOF, but grants no new text read.
     pub(in crate::native_surface) fn observe(
         &self,
         present: bool,
@@ -165,17 +179,20 @@ impl NativeMarkdownPendingSelectionOwner {
     }
 
     #[cfg(feature = "native-markdown-runtime-probe")]
+    /// Record bounded diagnostic progress without changing input authority.
     pub(in crate::native_surface) fn record_read(&self) {
         if let Some(next) = self.reads.get().checked_add(1) {
             self.reads.set(next);
         }
     }
 
+    /// Admit one synchronous sample. Recursive observation permanently rejects
+    /// the original owner even if a getter later returns the earlier value.
     pub(in crate::native_surface) fn begin_sample(
         self: &Rc<Self>,
     ) -> Option<NativeMarkdownPendingSelectionSampleGuard> {
         if !self.current() || self.sampling.replace(true) {
-            self.reject(); // 不能递归读 getter，也不能让重入后返回 A 复活原收据。
+            self.reject(); // Neither recursive getters nor an A-after-B return can revive this receipt.
             return None;
         }
         Some(NativeMarkdownPendingSelectionSampleGuard {
@@ -183,6 +200,8 @@ impl NativeMarkdownPendingSelectionOwner {
         })
     }
 
+    /// Match only the predeclared finite sources allowed in this actual phase.
+    /// Diagnostic hit bits never add a new selection or source-read permission.
     pub(in crate::native_surface) fn source_hits(&self, raw: NSRange) -> u16 {
         let mut hits = 0_u16;
         for (index, range) in self.ranges.iter().enumerate() {
@@ -193,7 +212,7 @@ impl NativeMarkdownPendingSelectionOwner {
                         | NativeMarkdownPendingSelectionPhase::SuperclassTail
                 )
             {
-                continue; // 原 EOF 只在结束通知及其连续安装尾声有效，不能授权更早的选择变化。
+                continue; // Original EOF is valid only for EndEditing and its continuous installation tail.
             }
             if index == 8
                 && !matches!(
@@ -201,10 +220,11 @@ impl NativeMarkdownPendingSelectionOwner {
                     NativeMarkdownPendingSelectionPhase::SuperclassTail
                 )
             {
-                continue; // delete-only EOF 只属于真实输入 super 的尾声，普通通知阶段不接受它。
+                continue; // Delete-only EOF belongs exclusively to the actual input superclass tail.
             }
             if *range == Some(raw) {
-                // 0..6 保持原来源；7=首 Native 前 EOF；8=原替换删除后、尚未插入新候选的 EOF。
+                // Slots 0..6 retain original sources; 7 is pre-Native EOF; 8 is
+                // EOF after original deletion and before candidate insertion.
                 hits |= 1 << index;
             }
         }
@@ -212,7 +232,8 @@ impl NativeMarkdownPendingSelectionOwner {
     }
 }
 
-/// getter 或 pool drain 再入即 sticky 撤原权；局部 guard 只恢复 reading，不得清除 revoked。
+/// Getter/pool-drain reentry leaves rejection sticky. This local guard restores
+/// sampling availability only, never the revoked authority.
 pub(in crate::native_surface) struct NativeMarkdownPendingSelectionSampleGuard {
     owner: Rc<NativeMarkdownPendingSelectionOwner>,
 }
@@ -229,11 +250,12 @@ pub(in crate::native_surface) fn native_markdown_pending_selection_trace_enabled
 
 #[cfg(not(feature = "native-markdown-runtime-probe"))]
 pub(in crate::native_surface) fn native_markdown_pending_selection_trace_enabled() -> bool {
-    false // 普通发布不读取 probe 环境变量，也不进入逐通知诊断日志。
+    false // Ordinary releases read no probe environment variable and emit no per-notification trace.
 }
 
 impl PieceBackedMarkdownTextStorage {
-    /// 纯提交后必定安装 owner；构造失权也保留 revoked tombstone，不静默退回普通 capture。
+    /// Install an owner after pure commit. Construction revocation still keeps
+    /// its rejection marker rather than reverting to ordinary recapture.
     pub(in crate::native_surface) fn begin_pending_selection(
         &self,
         committed: &Rc<NativeMarkdownCommittedSelection>,
@@ -242,7 +264,8 @@ impl PieceBackedMarkdownTextStorage {
         if let Some(existing) = self.pending_selection_for(committed) {
             return existing;
         }
-        // 精确新长度只依赖原提交票和 Weak 文档身份；兼容范围收据的未知 head 不能阻止测量。
+        // Exact new length uses the original commit and Weak document identity.
+        // An unknown head in a range receipt does not replace those length facts.
         let new_len = self
             .document()
             .and_then(|document| committed.current_utf16_len_for(&document));
@@ -254,9 +277,10 @@ impl PieceBackedMarkdownTextStorage {
                 sources,
             )
         });
-        // 字符提交和纯 fold 发布均已完成，首 Native 通知/池 drain 尚未发生。
-        // 方法内核同 generation/full selection/serial 后结束 Doc 借用，不从 raw 推导或夹取 EOF。
-        let id = committed.selection_serial(); // 原票已有的有限 serial，不引入提交后可能失败的另一计数器。
+        // Character/fold publication is complete before the first Native
+        // notification or pool drain. Length capture verifies original
+        // generation/full selection/serial, without deriving EOF from raw values.
+        let id = committed.selection_serial(); // Reuse the original finite serial without a new fallible post-commit counter.
         let selection = committed.selection;
         let after = NSRange::new(
             selection.anchor_utf16.min(selection.head_utf16),
@@ -294,7 +318,7 @@ impl PieceBackedMarkdownTextStorage {
             .ivars()
             .pending_selection
             .replace(Some(Rc::clone(&owner)));
-        drop(previous); // slot 借用已结束；旧局部 guard 无权清理这个新 id。
+        drop(previous); // The slot borrow has ended; an old guard cannot clear this successor id.
         if owner.revoked.get() {
             owner.reject();
         }
@@ -309,6 +333,8 @@ impl PieceBackedMarkdownTextStorage {
         owner
     }
 
+    /// Borrow only the pending owner of this exact committed receipt; an equal
+    /// selection in a successor notification is insufficient.
     pub(in crate::native_surface) fn pending_selection_for(
         &self,
         committed: &Rc<NativeMarkdownCommittedSelection>,
@@ -321,6 +347,7 @@ impl PieceBackedMarkdownTextStorage {
             .map(Rc::clone)
     }
 
+    /// Label the current synchronous phase only while original id and Rc match.
     pub(in crate::native_surface) fn pending_selection_phase(
         &self,
         owner: &Rc<NativeMarkdownPendingSelectionOwner>,
@@ -333,10 +360,12 @@ impl PieceBackedMarkdownTextStorage {
             .as_ref()
             .is_some_and(|current| current.id == owner.id && Rc::ptr_eq(current, owner))
         {
-            owner.phase.set(phase); // 仅标注原同步阶段，不调用 Native，也不改变任何选择权限。
+            owner.phase.set(phase); // No Native call or additional selection authority is introduced by this label.
         }
     }
 
+    /// Advance phase for the same original committed receipt, without capturing
+    /// another owner if its pending slot has already ended.
     pub(in crate::native_surface) fn pending_selection_phase_for(
         &self,
         committed: &Rc<NativeMarkdownCommittedSelection>,
@@ -347,6 +376,8 @@ impl PieceBackedMarkdownTextStorage {
         }
     }
 
+    /// Return only this exact original slot before dropping its receipt outside
+    /// the RefCell borrow. A reentrant successor remains independently owned.
     pub(in crate::native_surface) fn finish_pending_selection(
         &self,
         owner: &Rc<NativeMarkdownPendingSelectionOwner>,
@@ -365,7 +396,8 @@ impl PieceBackedMarkdownTextStorage {
     }
 }
 
-/// canonical 共用通知路径持局部 guard；旧 guard 的 Drop 不能 take 后继 owner。
+/// Local guard on the canonical notification path. Its destructor cannot take
+/// a successor owner occupying the same shared slot.
 pub(in crate::native_surface) struct NativeMarkdownPendingSelectionGuard {
     pub(in crate::native_surface) slot: Rc<NativeMarkdownPendingSelectionSlot>,
     pub(in crate::native_surface) owner: Rc<NativeMarkdownPendingSelectionOwner>,
@@ -382,7 +414,7 @@ impl Drop for NativeMarkdownPendingSelectionGuard {
                 self.owner.current()
             );
         }
-        drop(removed); // 结束槽借用后再释放原收据；不持有 storage/Native/Doc 强 owner。
+        drop(removed); // Release outside the slot borrow, without strong storage/Native/document ownership.
     }
 }
 

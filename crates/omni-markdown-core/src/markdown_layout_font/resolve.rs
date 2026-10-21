@@ -1,4 +1,4 @@
-//! 只读有限表目录、名称和fvar；不读取glyf正文或构造第二份字体字节。
+//! Resolve through bounded table directories, names, and fvar metadata without copying font bytes or interpreting glyph outlines.
 use std::sync::Arc;
 
 use harfrust::Font;
@@ -33,7 +33,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_be_bytes(raw.try_into().expect("已核固定4B")))
 }
 
-/// 每个face只留几个目录事实；名称迭代前先限制真实record数，不靠take隐藏未知尾部。
+/// Retain a few directory facts per face; bound actual record counts before iteration rather than hiding unknown tails with take.
 struct Directory {
     name_records: usize,
     has_fvar: bool,
@@ -44,7 +44,7 @@ fn directory(bytes: &[u8], base: usize) -> Result<Directory> {
         bytes.get(base..version_end),
         Some(b"\0\x01\0\0" | b"OTTO" | b"true")
     ) {
-        return Err(Error::InvalidContainer); // 非SFNT格式没有可证明的同一集合face，不能交给宽容回退。
+        return Err(Error::InvalidContainer); // A non-SFNT input cannot prove the same collection face and must not enter a permissive fallback.
     }
     let count = usize::from(u16_at(bytes, base + 4)?);
     if count == 0 || count > MAX_TABLES {
@@ -61,7 +61,7 @@ fn directory(bytes: &[u8], base: usize) -> Result<Directory> {
     for record in records.as_chunks::<16>().0 {
         let tag: [u8; 4] = record[..4].try_into().expect("固定tag");
         if previous.is_some_and(|old| old >= tag) {
-            return Err(Error::InvalidDirectory); // 重复或无序tag不能由不同parser选择不同的同名表。
+            return Err(Error::InvalidDirectory); // Duplicate/unordered tags must not let different parsers select different tables for the same name.
         }
         previous = Some(tag);
         let offset = usize::try_from(u32_at(record, 8)?).map_err(|_| Error::MetadataOverflow)?;
@@ -69,6 +69,7 @@ fn directory(bytes: &[u8], base: usize) -> Result<Directory> {
         let end = offset.checked_add(size).ok_or(Error::MetadataOverflow)?;
         let table = bytes.get(offset..end).ok_or(Error::InvalidDirectory)?;
         if tag == *b"name" {
+            // Validate the complete directory and string-region boundary before any decoded-name iteration.
             if size > MAX_NAME_BYTES || table.len() < 6 {
                 return Err(Error::NameBudgetExceeded);
             }
@@ -85,6 +86,7 @@ fn directory(bytes: &[u8], base: usize) -> Result<Directory> {
                 return Err(Error::InvalidNameTable);
             }
             if version == 1 {
+                // Format-one language-tag records belong before the string region too; bound their actual count and extent.
                 let languages = usize::from(u16_at(table, record_end)?);
                 let language_end = record_end
                     .checked_add(2)
@@ -122,6 +124,7 @@ impl NameBudget {
         id: NameId,
         target: &str,
     ) -> Result<bool> {
+        // Repeated instance-name lookups share one finite record/scalar budget across every collection face.
         self.records = self
             .records
             .checked_sub(directory.name_records)
@@ -135,11 +138,11 @@ impl NameBudget {
                     .checked_sub(1)
                     .ok_or(Error::NameBudgetExceeded)?;
                 if index >= MAX_POSTSCRIPT_BYTES {
-                    return Err(Error::NameBudgetExceeded); // 超长同前缀不能被截成看似精确命中。
+                    return Err(Error::NameBudgetExceeded); // Truncating an overlong equal prefix could manufacture an apparent exact match.
                 }
                 if wanted.next() != Some(scalar) {
                     matches = false;
-                    break; // 这一名称已知不同；不读取无关长后缀或保存它的String。
+                    break; // The name already differs; avoid decoding an unrelated long suffix or retaining its String.
                 }
             }
             if matches && wanted.next().is_none() {
@@ -157,7 +160,7 @@ struct Candidate {
     has_fvar: bool,
 }
 
-/// 只解码已选 face 原名称表里的有界基础 PSName；不借 Native 合成名或命名实例标签。
+/// Decode one bounded base PSName from the selected face's original names, not a synthesized Native name or named-instance label.
 fn face_postscript(font: &Font) -> Result<String> {
     for record in font.names().get(NameId::POSTSCRIPT_NAME).iter() {
         let mut candidate = String::new();
@@ -169,7 +172,7 @@ fn face_postscript(font: &Font) -> Result<String> {
                 return Err(Error::InvalidPostScriptName);
             }
             candidate.push(scalar);
-        } // 原完整表已通过目录预算；这里只读一个有限名称，不碰字形轮廓或正文。
+        } // The complete table passed directory limits; decode only this bounded name, without glyph outlines or document text.
         if !candidate.is_empty() {
             return Ok(candidate);
         }
@@ -177,8 +180,8 @@ fn face_postscript(font: &Font) -> Result<String> {
     Err(Error::PostScriptNotFound)
 }
 
-/// 从已经认证的不可变 face 派生另一实例；完整原表相等才保留它的唯一 face 事实。
-/// 不接受另一份 Blob，因此路径相同、同名或另一 TTC face 都不能替换原冻结来源。
+/// Derive from the already authenticated immutable face, retaining its unique identity only when the complete original name table matches.
+/// No replacement Blob is accepted, so equal paths/names or another TTC face cannot substitute for the original immutable source.
 pub(super) fn derive_name_table(
     original: &Font,
     metadata: &Metadata,
@@ -191,8 +194,8 @@ pub(super) fn derive_name_table(
     if axes.len() > MAX_AXES {
         return Err(Error::VariationBudgetExceeded);
     }
-    // 原 resolver 已在完整容器中排除同表歧义。这里只核同一个 face 的完整表，
-    // 不能重新 Font::new 生成第二套布局缓存，也不能拿表前缀或 PSName 猜面索引。
+    // Original resolution already excluded ambiguity across the complete container. Check this same face's full table,
+    // without creating another Font/cache or inferring the face index from a table prefix or PSName.
     if !original
         .tables()
         .name_data()
@@ -200,8 +203,8 @@ pub(super) fn derive_name_table(
     {
         return Err(Error::PostScriptNotFound);
     }
-    // 通用 resolve 可从命名实例 PSName 建立原 owner；派生已回到基础 face 加显式轴，
-    // 不能让旧实例标签跟随新轴位。原 name-table owner 则已持同一真实基础名称。
+    // General resolution may start from a named-instance PSName. Derivation returns to base face plus explicit axes,
+    // so an old instance label must not follow new coordinates; name-table resolution already holds the actual base name.
     let base_postscript = metadata
         .named_instance
         .map(|_| face_postscript(original))
@@ -220,10 +223,10 @@ pub(super) fn derive_name_table(
         metadata.source_bytes,
         postscript,
         axes,
-    ) // 原 finish 仍完整核真实 fvar、未知/重复/越界轴，并从同 SharedFont 建新实例。
+    ) // Original finish validates actual fvar and unknown/duplicate/out-of-range axes before deriving from the same SharedFont.
 }
 
-/// 完整Native名称表必须逐字节属于唯一真实face；相同名称/字形数量不能代替这个来源核验。
+/// Match the complete Native name table byte-for-byte to one real face; equal names or glyph counts cannot replace source verification.
 pub(super) fn resolve_name_table(
     bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
     native_name_table: &[u8],
@@ -244,7 +247,7 @@ pub(super) fn resolve_name_table(
         usize::try_from(u32_at(raw, 8)?).map_err(|_| Error::MetadataOverflow)?
     } else {
         1
-    }; // 单文件候选仍须走同样严格的SFNT目录验证，不能直接假定face0匹配。
+    }; // A standalone candidate still requires strict SFNT directory validation, rather than assuming face zero matches.
     if count == 0 || count > MAX_FACES {
         return Err(Error::FaceBudgetExceeded);
     }
@@ -263,10 +266,10 @@ pub(super) fn resolve_name_table(
             .is_some_and(|table| table.as_bytes() == native_name_table)
         {
             continue;
-        } // 只比较完整原表，不把前缀、hash碰巧相同或Native显示名当face匹配。
+        } // Only complete original-table equality matches, not a prefix, coincident hash, or Native display name.
         if matched.is_some() {
             return Err(Error::AmbiguousFace);
-        } // 多face共享完全相同name表时没有足够身份信息，不能用遍历顺序挑一个。
+        } // Multiple faces with identical name tables lack unique identity; iteration order cannot select one.
         let postscript = face_postscript(&font)?;
         matched = Some((
             Candidate {
@@ -279,8 +282,8 @@ pub(super) fn resolve_name_table(
         ));
     }
     let (matched, postscript) = matched.ok_or(Error::PostScriptNotFound)?;
-    // face已经由完整原表唯一确定，轴位来自真实Native实例；不再按名字搜索所有命名实例。
-    // 系统UIFont的369个实例无需创建/枚举，也不以提高无关预算来绕过实际来源证明。
+    // Full-table equality already uniquely identified the face, with axes supplied by the actual Native instance.
+    // Do not enumerate unrelated named instances or raise their budget merely to bypass this original-source proof.
     finish(matched, count, raw.len(), &postscript, axes)
 }
 
@@ -289,6 +292,7 @@ pub(super) fn resolve(
     postscript: &str,
     axes: &[Axis],
 ) -> Result<(Font, Metadata)> {
+    // Bound public identity/axis input before inspecting the immutable blob; no invalid request falls back to a generic face.
     if postscript.is_empty()
         || postscript.len() > MAX_POSTSCRIPT_BYTES
         || postscript.chars().any(char::is_control)
@@ -305,7 +309,7 @@ pub(super) fn resolve(
         }
         usize::try_from(u32_at(raw, 8)?).map_err(|_| Error::MetadataOverflow)?
     } else {
-        1 // 只表示单SFNT候选；其真实签名与目录仍在下方严格验证。
+        1 // One standalone SFNT candidate only; validate its actual signature and directory below.
     };
     if count == 0 || count > MAX_FACES {
         return Err(Error::FaceBudgetExceeded);
@@ -326,6 +330,7 @@ pub(super) fn resolve(
         let direct = budget.matches(&font, &directory, NameId::POSTSCRIPT_NAME, postscript)?;
         let mut named: Option<(u16, Vec<Axis>)> = None;
         if directory.has_fvar {
+            // PSName resolution must also inspect actual named instances; share original name work limits and reject an oversized instance table.
             let fvar = font
                 .tables()
                 .fvar()
@@ -342,7 +347,7 @@ pub(super) fn resolve(
             {
                 let instance = instance.map_err(|_| Error::InvalidVariationTable)?;
                 let Some(id) = instance.post_script_name_id else {
-                    continue; // 没有PSNameID的实例不能用subfamily显示名替代精确PSName。
+                    continue; // An instance lacking PSNameID cannot substitute a subfamily display name for an exact PSName.
                 };
                 if !budget.matches(&font, &directory, id, postscript)? {
                     continue;
@@ -375,13 +380,13 @@ pub(super) fn resolve(
                     record.axis_tag().to_be_bytes() != axis.tag
                         || record.default_value().to_f32() != axis.value
                 }) {
-                    // nameID6也指该face的default位置；同名实例只有全部轴相同才是同一值。
-                    // 不同位置共用PSName时不能根据遍历顺序任取其中一个。
+                    // nameID6 also identifies this face's default position. A same-name instance agrees only when every axis equals default;
+                    // equal PSNames at different positions cannot be resolved by iteration order.
                     return Err(Error::AmbiguousNamedInstance);
                 }
             }
             if matched.is_some() {
-                return Err(Error::AmbiguousFace); // 不依赖目录顺序或上次命中缓存挑第一个face。
+                return Err(Error::AmbiguousFace); // Never choose the first face by directory order or a previous-match cache.
             }
             matched = Some(Candidate {
                 face: face as u32,
@@ -400,7 +405,7 @@ pub(super) fn resolve(
     )
 }
 
-/// 两个来源只共用已经确定face后的轴校验和实际instance构造，不混淆各自的匹配授权。
+/// Share axis validation and actual instance construction only after face selection, preserving each entry's distinct matching authority.
 fn finish(
     matched: Candidate,
     count: usize,
@@ -411,6 +416,7 @@ fn finish(
     let named_instance = matched.named.as_ref().map(|(index, _)| *index);
     let mut actual = matched.named.map_or_else(Vec::new, |(_, axes)| axes);
     let mut explicit = axes.to_vec();
+    // Sort finite explicit tags once so duplicates fail before a builder could silently replace one value with another.
     explicit.sort_unstable_by_key(|axis| axis.tag);
     if explicit.windows(2).any(|pair| pair[0].tag == pair[1].tag) {
         return Err(Error::DuplicateAxis);
@@ -424,7 +430,7 @@ fn finish(
         let records = fvar.axes().map_err(|_| Error::InvalidVariationTable)?;
         if records.len() > MAX_AXES {
             return Err(Error::VariationBudgetExceeded);
-        } // Native表匹配路径同样保留真实轴数量上限，但不读取无关命名实例。
+        } // Native table matching retains the actual axis-count limit without reading unrelated named instances.
         for (index, record) in records.iter().enumerate() {
             let tag = record.axis_tag().to_be_bytes();
             let min = record.min_value().to_f32();
@@ -448,7 +454,7 @@ fn finish(
                         tag: axis.axis_tag().to_be_bytes(),
                         value: axis.default_value().to_f32(),
                     })
-                    .collect(); // 非命名实例采用本face真实default，不把请求轴默认补0。
+                    .collect(); // A non-named instance starts at this face's actual defaults, not zero-filled requested axes.
             }
             let value = actual
                 .iter_mut()
@@ -458,7 +464,7 @@ fn finish(
                 value.value = requested.value;
             }
             if !value.value.is_finite() || value.value < min || value.value > max {
-                return Err(Error::InvalidAxisValue); // 实例表本身的越界坐标同样不能由builder静默夹取。
+                return Err(Error::InvalidAxisValue); // Builder clamping must not hide invalid coordinates from the instance table itself.
             }
         }
         if explicit
@@ -468,9 +474,10 @@ fn finish(
             return Err(Error::UnknownAxis);
         }
     } else if !explicit.is_empty() {
-        return Err(Error::UnknownAxis); // 静态face没有合法显式变体轴，不忽略请求。
+        return Err(Error::UnknownAxis); // Static faces have no valid explicit variation axes; do not ignore the request.
     }
     actual.sort_unstable_by_key(|axis| axis.tag);
+    // Build a new instance only from the complete validated axis set; retain actual face metrics in metadata rather than caller estimates.
     let font = matched
         .font
         .instance_builder()

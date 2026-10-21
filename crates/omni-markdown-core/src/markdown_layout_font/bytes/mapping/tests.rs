@@ -1,4 +1,5 @@
-//! 真实VM/FD成功与失败收据；故障注入只改本测试的syscall参数，不伪造成功或泄漏测试资源。
+//! Actual VM/descriptor success and failure receipts. Existing injection changes only this test's
+//! syscall arguments; it neither fabricates success nor leaves test-owned resources behind.
 use super::*;
 use crate::immutable_snapshot::snapshot_font_file;
 use std::{cell::Cell, fs::File};
@@ -35,16 +36,18 @@ fn real_failing_close_syscall_prevents_publication_and_preserves_negative_fact_a
     let original_fd = Cell::new(None);
     let result = ReadonlyFontMapping::map_with_close(file, Arc::clone(&facts), |fd| {
         original_fd.set(Some(fd));
-        // 只对必然无效的-1做真实失败调用；不重复close真实FD，避免并发复用误关他人资源。
+        // Make a real failing close on invalid -1, never double-close the actual descriptor and
+        // risk closing another concurrent test's reused resource.
         close_descriptor(-1)
     });
     assert!(result.is_err());
     assert_eq!(facts.first_errno(), Some(libc::EBADF));
     assert!(!facts.backing_closed.load(Ordering::Acquire));
     assert!(facts.completed.load(Ordering::Acquire));
-    assert!(facts.unmapped.load(Ordering::Acquire)); // 已取得的VM实际补偿归还，但不抹掉原close失败。
+    assert!(facts.unmapped.load(Ordering::Acquire)); // Actual compensating unmap does not erase the original close failure.
     assert_eq!(facts.mapped_bytes.load(Ordering::Acquire), 0);
-    // 注入没有实际关闭原fd；测试单独归还它，不把这一恢复写成生产owner的成功收据。
+    // Injection did not close the real descriptor. Return it separately without rewriting this
+    // external compensation as a successful production-owner receipt.
     close_descriptor(original_fd.get().unwrap()).unwrap();
     assert!(!facts.backing_closed.load(Ordering::Acquire));
     assert_eq!(facts.first_errno(), Some(libc::EBADF));
@@ -58,7 +61,8 @@ fn actual_misaligned_unmap_failure_never_fakes_zero_and_drop_does_not_retry() {
     let address = mapping.address;
     let length = mapping.length;
     let result = mapping.release_with(|address, length| {
-        // SAFETY: 故意传非页对齐地址，公开munmap合同返回EINVAL；不解除有效映射，也不借出该指针。
+        // SAFETY: an intentionally unaligned address makes munmap return EINVAL; it neither
+        // unmaps the valid extent nor exposes a reference through that pointer.
         unsafe { libc::munmap(address.add(1).cast(), length) }
     });
     assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
@@ -66,10 +70,11 @@ fn actual_misaligned_unmap_failure_never_fakes_zero_and_drop_does_not_retry() {
     assert!(facts.completed.load(Ordering::Acquire));
     assert!(!facts.unmapped.load(Ordering::Acquire));
     assert_eq!(facts.mapped_bytes.load(Ordering::Acquire), length);
-    drop(mapping); // 已尝试的owner不能重试地址；原负面事实永久保留。
+    drop(mapping); // The attempted owner cannot retry this address; its negative facts remain intact.
     assert!(!facts.unmapped.load(Ordering::Acquire));
-    // SAFETY: 本隔离测试仍独占知道的真实映射且没有借用；显式补偿测试注入，避免污染后续进程。
+    // SAFETY: this isolated test still exclusively owns the known actual mapping with no borrows;
+    // compensate its injected failure explicitly rather than leaving VM in the test process.
     assert_eq!(unsafe { libc::munmap(address.as_ptr().cast(), length) }, 0);
-    assert_eq!(facts.mapped_bytes.load(Ordering::Acquire), length); // 不把外部恢复篡改成owner成功。
+    assert_eq!(facts.mapped_bytes.load(Ordering::Acquire), length); // External recovery cannot rewrite the owner's failure as success.
     assert_eq!(facts.first_errno(), Some(libc::EINVAL));
 }

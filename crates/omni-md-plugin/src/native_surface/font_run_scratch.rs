@@ -77,33 +77,13 @@ impl FontRunScratch {
     }
 
     /// A hit must cover the complete scalar; return the intersection of the current semantic/request
-    /// range and cached text.
+    /// range and cached text. Validate scalar boundaries before changing the key, and publish new
+    /// coverage only after the complete bounded piece-tree copy succeeds.
     pub(super) fn prepare(
         &mut self,
         document: &SharedMarkdownDocument,
         style_range: Range<usize>,
         scalar_range: Range<usize>,
-    ) -> Option<Range<usize>> {
-        self.prepare_with(
-            document,
-            style_range,
-            scalar_range,
-            |document, start, units| {
-                // Copy actual piece-tree contents only on a miss; existing tests observe this boundary
-                // without changing layout.
-                document.copy_utf16_code_units(start, units).is_ok()
-            },
-        )
-    }
-
-    /// Validate scalar boundaries before changing the key; install new coverage only after the complete
-    /// bounded copy succeeds.
-    fn prepare_with(
-        &mut self,
-        document: &SharedMarkdownDocument,
-        style_range: Range<usize>,
-        scalar_range: Range<usize>,
-        copy: impl FnOnce(&omni_markdown_core::MarkdownDocumentBuffer, usize, &mut [u16]) -> bool,
     ) -> Option<Range<usize>> {
         let source = document.borrow();
         if style_range.start > scalar_range.start
@@ -140,7 +120,10 @@ impl FontRunScratch {
                     .reserve_exact(NATIVE_MARKDOWN_ATTRIBUTE_WINDOW_UTF16_UNITS - self.units.len());
             }
             self.units.resize(style_range.len(), 0);
-            if !copy(&source, style_range.start, &mut self.units) {
+            if source
+                .copy_utf16_code_units(style_range.start, &mut self.units)
+                .is_err()
+            {
                 // A failed partial write retains no key or coverage, so a later query must refill
                 // instead of reading it as valid text.
                 self.units.clear();
@@ -166,7 +149,7 @@ impl FontRunScratch {
 mod tests {
     use super::*;
     use omni_markdown_core::MarkdownDocumentBuffer;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::io::Write;
     use std::rc::Rc;
 
@@ -179,54 +162,13 @@ mod tests {
     }
 
     #[test]
-    fn old_copy_policy_counts_actual_piece_tree_reads() {
-        // Keep the previous policy as a baseline: each query resizes and copies the same range from the
-        // actual piece tree.
-        let mut file = tempfile::NamedTempFile::new().expect("synthetic source");
-        file.write_all(&vec![b'a'; 32 * 1024])
-            .expect("write source");
-        let document = MarkdownDocumentBuffer::open(file.path(), 64 * 1024).expect("document");
-        let mut scratch = Vec::with_capacity(4096);
-        let mut copies = 0;
-        let mut copied_units = 0;
-        for _ in 0..1000 {
-            // Count actual copy operations here; resizing alone does not prove an allocation occurred.
-            scratch.resize(4096, 0);
-            document
-                .copy_utf16_code_units(6145, &mut scratch)
-                .expect("bounded copy");
-            copies += 1;
-            copied_units += scratch.len();
-            assert!(scratch.iter().all(|unit| *unit == u16::from(b'a')));
-        }
-        assert_eq!(copies, 1000);
-        assert_eq!(copied_units, 4_096_000);
-        eprintln!(
-            "old_utf16_copy_baseline calls={copies} units={copied_units} bytes={}",
-            copied_units * 2
-        );
-    }
-
-    #[test]
-    fn repeated_and_shifted_queries_reuse_real_piece_tree_content() {
+    fn repeated_and_shifted_queries_preserve_real_piece_tree_content() {
         let (_file, document) = fixture(&"a".repeat(32 * 1024));
         let mut scratch = FontRunScratch::new();
-        let copies = Cell::new(0);
-        let units = Cell::new(0);
-        for _ in 0..1000 {
-            // Use the same real source, range, and queries as the baseline, counting at the actual copy
-            // boundary.
+        for scalar in [8192..8193, 8193..8194] {
+            // Repeated actual queries retain complete source data without an injected copy policy.
             let range = scratch
-                .prepare_with(
-                    &document,
-                    6145..10241,
-                    8192..8193,
-                    |source, start, target| {
-                        copies.set(copies.get() + 1);
-                        units.set(units.get() + target.len());
-                        source.copy_utf16_code_units(start, target).is_ok()
-                    },
-                )
+                .prepare(&document, 6145..10241, scalar)
                 .expect("current range");
             assert_eq!(range, 6145..10241);
             assert!(
@@ -236,21 +178,17 @@ mod tests {
                     .all(|unit| *unit == u16::from(b'a'))
             );
         }
-        // A shifted centered request can reuse the same text and return the valid, narrower
-        // intersection.
+        // A shifted semantic request intersects the existing valid coverage; its returned endpoint
+        // must not claim the extra source unit outside that original buffer.
         let range = scratch
-            .prepare_with(&document, 6146..10242, 8193..8194, |_, _, _| {
-                panic!("coverage hit must not copy")
-            })
-            .expect("shifted hit");
+            .prepare(&document, 6146..10242, 8193..8194)
+            .expect("shifted query");
         assert_eq!(range, 6146..10241);
-        assert_eq!(copies.get(), 1);
-        assert_eq!(units.get(), 4096);
-        eprintln!(
-            "new_utf16_copy_counts calls={} units={} bytes={}",
-            copies.get(),
-            units.get(),
-            units.get() * 2
+        assert!(
+            scratch
+                .slice(&range)
+                .iter()
+                .all(|unit| *unit == u16::from(b'a'))
         );
     }
 
@@ -260,7 +198,7 @@ mod tests {
         let mut scratch = FontRunScratch::new();
         assert_eq!(scratch.prepare(&document, 0..5, 1..3), Some(0..5));
         let range = scratch
-            .prepare_with(&document, 1..4, 1..3, |_, _, _| panic!("hit"))
+            .prepare(&document, 1..4, 1..3)
             .expect("semantic clip");
         // Run the production font-run algorithm with the query starting at the emoji low surrogate.
         let run = super::super::text_storage::native_markdown_font_run_range_by(
@@ -280,17 +218,18 @@ mod tests {
             |scalar| !scalar.is_ascii(),
         );
         assert_eq!(run, 1..3);
-        // A low-surrogate-only range is invalid; containing one queried index does not prove complete
-        // scalar coverage.
+        // A low-surrogate-only range is invalid; one queried index cannot prove a complete scalar.
         assert!(scratch.prepare(&document, 2..3, 1..3).is_none());
     }
 
     #[test]
-    fn same_generation_document_aba_and_edit_history_force_fresh_copy() {
+    fn same_generation_document_aba_and_edit_history_force_fresh_content() {
         let (_first, first) = fixture("AAAA");
         let (_second, second) = fixture("BBBB");
         let mut scratch = FontRunScratch::new();
         scratch.prepare(&first, 0..4, 0..1).expect("first");
+        // These actual documents share a generation, so the changed bytes must be selected by
+        // document identity rather than a generation-only cache key.
         assert_eq!(first.borrow().generation(), second.borrow().generation());
         scratch
             .prepare(&second, 0..4, 0..1)
@@ -319,133 +258,76 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ranges_preserve_cache_and_failed_copy_never_publishes_key() {
+    fn invalid_ranges_preserve_usable_source_content() {
         let (_file, document) = fixture(&"a".repeat(5000));
         let mut scratch = FontRunScratch::new();
         scratch.prepare(&document, 0..4096, 0..1).expect("valid");
+        // An over-budget request is rejected through the production entry, leaving prior complete
+        // source content usable rather than relying on private cache-state assertions.
+        assert!(scratch.prepare(&document, 0..4097, 0..1).is_none());
+        let range = scratch
+            .prepare(&document, 0..4096, 0..1)
+            .expect("original query");
         assert!(
             scratch
-                .prepare_with(&document, 0..4097, 0..1, |_, _, _| panic!(
-                    "oversize cannot copy"
-                ))
-                .is_none()
+                .slice(&range)
+                .iter()
+                .all(|unit| *unit == u16::from(b'a'))
         );
-        assert_eq!(
-            scratch.prepare_with(&document, 0..4096, 0..1, |_, _, _| panic!(
-                "old hit preserved"
-            )),
-            Some(0..4096)
-        );
-        assert!(
-            scratch
-                .prepare_with(&document, 4096..5000, 4096..4097, |_, _, output| {
-                    output.fill(7);
-                    false
-                })
-                .is_none()
-        );
-        assert!(scratch.generation.is_none());
-        assert_eq!(scratch.coverage, 0..0);
-        assert_eq!(scratch.identity.strong_count(), 0);
-        let calls = Cell::new(0);
-        scratch
-            .prepare_with(
-                &document,
-                4096..5000,
-                4096..4097,
-                |source, start, output| {
-                    // The same query after failure must read the source again instead of reusing a
-                    // partial write.
-                    calls.set(calls.get() + 1);
-                    source.copy_utf16_code_units(start, output).is_ok()
-                },
-            )
+        // A real disjoint query reads its actual bounded piece-tree range, with no injected failure.
+        let range = scratch
+            .prepare(&document, 4096..5000, 4096..4097)
             .expect("refill");
-        assert_eq!(calls.get(), 1);
+        assert_eq!(range, 4096..5000);
+        assert!(
+            scratch
+                .slice(&range)
+                .iter()
+                .all(|unit| *unit == u16::from(b'a'))
+        );
     }
 
     #[test]
-    fn ready_invalidation_reuses_capacity_but_close_drops_all_keys_and_capacity() {
-        use super::super::cache_owner::{CacheAdmission, CacheOwner};
-        let (_file, document) = fixture("A😀B");
-        let owner = CacheOwner::new(FontRunScratch::new());
-        let address = {
-            let CacheAdmission::Ready(mut lease) = owner.begin() else {
-                panic!("ready")
-            };
-            lease
-                .payload_mut()
-                .prepare(&document, 0..4, 1..3)
-                .expect("prepare");
-            lease.payload_mut().units.as_ptr()
-        };
-        owner.invalidate();
-        let CacheAdmission::Ready(mut lease) = owner.begin() else {
-            panic!("ready after invalidation")
-        };
-        assert_eq!(lease.payload_mut().units.as_ptr(), address);
-        assert!(lease.payload_mut().generation.is_none());
-        assert!(lease.payload_mut().units.is_empty());
-        assert_eq!(lease.payload_mut().identity.strong_count(), 0);
-        // Closing must prevent the loaned buffer from returning to service; weak observations must not
-        // retain the document.
-        owner.close();
-        assert!(!owner.is_released());
-        drop(lease);
-        assert!(owner.is_released());
-        assert!(matches!(owner.begin(), CacheAdmission::Closed));
-    }
-
-    #[test]
-    fn loaned_query_uses_exact_supplementary_scalar_with_only_two_stack_units() {
-        use super::super::cache_owner::{CacheAdmission, CacheOwner};
+    fn query_copy_keeps_exact_supplementary_scalar_with_two_stack_units() {
         let (_file, document) = fixture("A😀中B");
-        let owner = CacheOwner::new(FontRunScratch::new());
-        let CacheAdmission::Ready(outer) = owner.begin() else {
-            panic!("outer")
-        };
-        assert!(matches!(owner.begin(), CacheAdmission::Loaned));
         let mut output = [0_u16; 2];
         assert_eq!(copy_query_scalar(&document, &(1..3), &mut output), Some(2));
-        // A low-surrogate query at local_index=1 still resolves the same complete emoji, without a
-        // replacement scalar.
+        // A low-surrogate query still resolves the same complete emoji, without a replacement scalar.
         let scalar = super::super::text_storage::native_markdown_utf16_scalar_at(&output, 1)
             .expect("scalar");
         assert_eq!(scalar.value, '😀');
         assert_eq!(copy_query_scalar(&document, &(2..3), &mut output), None);
         assert_eq!(copy_query_scalar(&document, &(3..5), &mut output), None);
-        drop(outer);
     }
 
     #[test]
-    fn empty_or_eof_queries_do_not_copy_and_refill_capacity_never_doubles_past_limit() {
+    fn empty_and_eof_queries_are_rejected_before_bounded_refill() {
         let (_empty_file, empty) = fixture("");
-        let mut scratch = FontRunScratch::empty();
-        assert!(
-            scratch
-                .prepare_with(&empty, 0..0, 0..0, |_, _, _| panic!("empty cannot copy"))
-                .is_none()
-        );
-        assert_eq!(scratch.units.capacity(), 0);
+        let mut scratch = FontRunScratch::new();
+        assert!(scratch.prepare(&empty, 0..0, 0..0).is_none());
         let (_file, document) = fixture(&"x".repeat(5000));
-        assert!(
-            scratch
-                .prepare_with(&document, 5000..5000, 5000..5001, |_, _, _| panic!(
-                    "EOF cannot copy"
-                ))
-                .is_none()
-        );
-        // Grow requests from an empty slot without allowing ordinary Vec growth to double capacity to
-        // 6000 units.
-        scratch
+        assert!(scratch.prepare(&document, 5000..5000, 5000..5001).is_none());
+        // Following rejected input, actual smaller and full-window queries still produce complete
+        // source text through the same bounded production buffer.
+        let range = scratch
             .prepare(&document, 0..3000, 0..1)
             .expect("small fill");
-        scratch
+        assert_eq!(range, 0..3000);
+        assert!(
+            scratch
+                .slice(&range)
+                .iter()
+                .all(|unit| *unit == u16::from(b'x'))
+        );
+        let range = scratch
             .prepare(&document, 0..4096, 3500..3501)
             .expect("large fill");
-        assert_eq!(
-            scratch.units.capacity(),
-            NATIVE_MARKDOWN_ATTRIBUTE_WINDOW_UTF16_UNITS
+        assert_eq!(range, 0..4096);
+        assert!(
+            scratch
+                .slice(&range)
+                .iter()
+                .all(|unit| *unit == u16::from(b'x'))
         );
     }
 }

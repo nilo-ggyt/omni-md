@@ -1,27 +1,31 @@
-//! 同一实际平台Font的完整水平推进快照；只覆盖水平metrics，不修改cmap、GSUB或定位算法。
+//! Complete horizontal advance snapshot for the actual platform Font. Override only horizontal
+//! metrics, leaving cmap, GSUB, and the original positioning algorithm unchanged.
 
 use harfrust::{Direction, Font, FontFuncs, GlyphId, ShaperFont};
 
 use super::{MarkdownLayoutFontError as Error, Result, positioning};
 
-/// 固定glyph域纯值归原Font payload独占；没有Source、Native强引用、闭包或全局缓存。
+/// The original Font payload uniquely owns values for its complete fixed glyph domain, without
+/// Source/Native strong references, closures, or a global cache.
 pub(super) struct HorizontalAdvances {
     scale: i32,
     values: Box<[i32]>,
 }
 
 impl HorizontalAdvances {
-    /// 平台数据已按原glyph顺序读取；解析出的maxp域仍是数量权威，调用方不能自行缩短。
-    /// 原双精度point推进只在此转为与GPOS/trak相同的细尺度，公开26.6继续由原出口统一量化。
+    /// Platform data arrives in original glyph order; parsed maxp remains the count authority, so
+    /// callers cannot shorten the table. Convert double-precision point advances to the same fine
+    /// scale as GPOS/trak here; the existing final output still quantizes public 26.6 values once.
     pub(super) fn new(font: &Font, points: f64, glyphs: u32, values: Box<[f64]>) -> Result<Self> {
         if glyphs == 0 || glyphs > 65_536 || values.len() != glyphs as usize {
             return Err(Error::InvalidHorizontalAdvances);
         }
         let (scale, divisor) = positioning::bound_scale(points)?;
-        // Native 的完整名义推进已反映该实际字号/轴实例自己的默认 tracking 策略。
-        // 按 HarfBuzz CoreText font bridge 的合同，在名义入口扣原 Font 真正会加的值；
-        // 后续原定位仍按 GCB 加回它，既不关闭 kern/trak，也不按 glyph 或字体名称补差。
-        // point_size 使用 shape 同一 f32 编码，尺度仍绑定原双精度字号，避免两次舍入相减。
+        // Native nominal advances already include this point-size/axis instance's default tracking.
+        // Match the HarfBuzz CoreText bridge: subtract what this original Font would add at nominal
+        // lookup, then let original positioning add it per GCB. Keep kern/trak enabled rather than
+        // compensating by glyph/font name. Encode point_size as the same f32 used for shaping while
+        // binding scale to the original f64 size, avoiding subtraction of independently rounded terms.
         let tracking = ShaperFont::new(font)
             .with_scale(scale)
             .default_tracking_advance(Direction::LeftToRight, Some(points as f32));
@@ -33,9 +37,10 @@ impl HorizontalAdvances {
             let raw = (value * 64.0 * f64::from(divisor)).round();
             if !value.is_finite() || raw < f64::from(i32::MIN) || raw > f64::from(i32::MAX) {
                 return Err(Error::InvalidHorizontalAdvances);
-            } // 错误立即丢弃整个候选；不保留半张表，也不以hmtx或零值补缺项。
-            // 真实负值不夹成零；原前沿会用同一回调和实际 tracking 证明能否提前发布。
-            // 超出坐标范围拒绝整张候选表，不能让饱和运算改变 Native 名义度量。
+            } // Reject the entire candidate; never keep a partial table or fill missing values from hmtx/zero.
+            // Preserve actual negative values. The original frontier uses this same callback and
+            // tracking to prove early publication; overflow must reject the table rather than
+            // saturating and changing Native nominal metrics.
             converted.push(
                 (raw as i32)
                     .checked_sub(tracking)
@@ -48,7 +53,8 @@ impl HorizontalAdvances {
         })
     }
 
-    /// 同一Font的snapshot只属于原绑定字号的实际尺度；相同face另一字号须重新捕获。
+    /// The snapshot belongs to its actual bound point-size scale; the same face at another size
+    /// requires a separately captured advance table.
     pub(super) fn require_scale(&self, scale: i32) -> Result<()> {
         if scale != self.scale {
             return Err(Error::InvalidPointSize);
@@ -58,8 +64,9 @@ impl HorizontalAdvances {
 }
 
 impl FontFuncs for HorizontalAdvances {
-    /// HarfRust在原已解析Font的glyph域内查询；非法glyph不具备平台快照索引权限。
-    /// 只覆盖这一真实业务度量，批查询沿上游默认方法逐项调用，不额外持可变状态。
+    /// HarfRust queries within the original parsed Font's glyph domain; invalid glyphs have no
+    /// snapshot index authority. Override only this metric and retain upstream default batch calls,
+    /// without additional mutable state.
     fn glyph_h_advance(&self, _font: &ShaperFont<'_, '_>, glyph: GlyphId) -> i32 {
         self.values[glyph.to_u32() as usize]
     }

@@ -1,4 +1,4 @@
-//! 使用仓库已有真实字体和有限合成SFNT元数据，验证精确face、命名实例与owner边界。
+//! Verify exact faces, named instances, and ownership with the repository's real font and finite synthetic SFNT metadata.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ const ROBOTO: &[u8] = include_bytes!(concat!(
 const NAME: &str = "Roboto-Regular";
 
 fn bytes(value: &[u8]) -> Arc<dyn AsRef<[u8]> + Send + Sync> {
-    Arc::new(value.to_vec()) // 只有有限测试字体复制；产品resolver只借用调用方原Arc。
+    Arc::new(value.to_vec()) // Only finite test fixtures copy font bytes; the product resolver shares the caller's original Arc.
 }
 fn read_u16(value: &[u8], offset: usize) -> usize {
     usize::from(u16::from_be_bytes(
@@ -20,6 +20,7 @@ fn read_u32(value: &[u8], offset: usize) -> usize {
     u32::from_be_bytes(value[offset..offset + 4].try_into().unwrap()) as usize
 }
 fn tables(value: &[u8]) -> BTreeMap<[u8; 4], Vec<u8>> {
+    // Decode this known finite fixture's actual directory so modified inputs retain real table payloads rather than a replacement Font implementation.
     (0..read_u16(value, 4))
         .map(|index| {
             let record = 12 + index * 16;
@@ -31,6 +32,7 @@ fn tables(value: &[u8]) -> BTreeMap<[u8; 4], Vec<u8>> {
         .collect()
 }
 fn rebuild(tables: BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
+    // Rebuild only finite fixture metadata, preserving sorted tags and real absolute SFNT offsets for the production resolver.
     let count = tables.len();
     let mut result = vec![0; 12 + count * 16];
     result[..4].copy_from_slice(b"\0\x01\0\0");
@@ -54,6 +56,7 @@ fn rebuild(tables: BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
     result
 }
 fn collection(fonts: &[Vec<u8>]) -> Vec<u8> {
+    // Assemble a real finite TTC container, moving each embedded face's table offsets into the complete container coordinate space.
     let mut result = vec![0; 12 + fonts.len() * 4];
     result[..4].copy_from_slice(b"ttcf");
     result[4..8].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
@@ -67,11 +70,12 @@ fn collection(fonts: &[Vec<u8>]) -> Vec<u8> {
             let shifted = read_u32(&font, offset) + base;
             font[offset..offset + 4].copy_from_slice(&(shifted as u32).to_be_bytes());
         }
-        result.extend(font); // TTC表偏移按真实全容器字节重定位，不把局部offset误当face0。
+        result.extend(font); // TTC table offsets refer to actual full-container bytes, not local offsets interpreted as face zero.
     }
     result
 }
 fn renamed() -> Vec<u8> {
+    // Change existing PSName records in the real font, producing a genuinely distinct second face for identity/ambiguity cases.
     let mut all = tables(ROBOTO);
     let name = all.get_mut(b"name").unwrap();
     let start = read_u16(name, 4);
@@ -93,6 +97,7 @@ fn named_variable() -> Vec<u8> {
     named_variable_with("Roboto-Medium", 500)
 }
 fn named_variable_with(postscript: &str, coordinate: i32) -> Vec<u8> {
+    // Add one finite real name/fvar instance record to the original face, so public resolution must read its actual encoded coordinates.
     let mut all = tables(ROBOTO);
     let name = all.get_mut(b"name").unwrap();
     assert_eq!(read_u16(name, 0), 0);
@@ -137,6 +142,7 @@ fn named_variable_with(postscript: &str, coordinate: i32) -> Vec<u8> {
 }
 
 #[test]
+// A clone retains original authority until its last owner drops; resolving equal bytes again must create independent authority.
 fn real_face_owns_exact_font_and_only_its_clones_share_authority() {
     let original = bytes(ROBOTO);
     let font = MarkdownLayoutFont::resolve(Arc::clone(&original), NAME, &[]).unwrap();
@@ -157,11 +163,12 @@ fn real_face_owns_exact_font_and_only_its_clones_share_authority() {
     drop(font);
     assert!(!observer.payload_released());
     drop(shared);
-    assert!(observer.payload_released()); // 其他同字体字节owner仍在，收据只证明原payload/Font字段。
+    assert!(observer.payload_released()); // Other font-byte owners still live; this receipt proves only the original payload/Font field dropped.
     assert_eq!(other.metadata().postscript_name, NAME);
 }
 
 #[test]
+// Explicit point-size precision cannot alter the general font contract or allow another size to borrow this bound instance's authority.
 fn bound_point_size_keeps_old_scale_contract_and_rejects_a_different_size() {
     let name = tables(ROBOTO).remove(b"name").unwrap();
     let generic = MarkdownLayoutFont::resolve_name_table(bytes(ROBOTO), &name, &[]).unwrap();
@@ -177,9 +184,9 @@ fn bound_point_size_keeps_old_scale_contract_and_rejects_a_different_size() {
         positioning::scale(&bound, 16.0, 1024),
         Err(MarkdownLayoutFontError::InvalidPointSize)
     ));
-    assert!(!bound.permits(&generic.authority())); // 新构造有新权限，不能重签旧Font任务。
+    assert!(!bound.permits(&generic.authority())); // New construction creates new authority rather than reauthorizing an old Font job.
 
-    // 0.1是合法Native字号，其双精度原值不能先舍入成6/64点；更大字号仍保原有效范围。
+    // A valid 0.1-point Native size retains its original double precision instead of rounding to 6/64 point first; large sizes keep the valid range.
     for points in [0.1, 32.0, 1024.0, 1_000_000.0, 33_554_430.0] {
         let font =
             MarkdownLayoutFont::resolve_name_table_at_size(bytes(ROBOTO), &name, &[], points)
@@ -201,6 +208,7 @@ fn bound_point_size_keeps_old_scale_contract_and_rejects_a_different_size() {
 }
 
 #[test]
+// Derived faces must shape identically to fresh same-source instances and release their independent payloads before the shared bytes' final munmap.
 fn derived_face_keeps_real_shaping_and_independent_payload_release() {
     use crate::{
         MarkdownDocumentBuffer, MarkdownLayoutTextSource, MarkdownShapingBudget,
@@ -208,7 +216,7 @@ fn derived_face_keeps_real_shaping_and_independent_payload_release() {
         MarkdownShapingStatus,
     };
 
-    // 冻结真实上游字体并打开独立正文；本测试只写隔离目录，不借平台字体或用户笔记。
+    // Freeze the real upstream font and open independent text, writing only an isolated fixture directory without platform fonts or user notes.
     let directory = tempfile::tempdir().unwrap();
     let font_path = directory.path().join("font.ttf");
     let document_path = directory.path().join("source.md");
@@ -224,8 +232,8 @@ fn derived_face_keeps_real_shaping_and_independent_payload_release() {
     let source = MarkdownLayoutTextSource::capture(&document);
     let source_authority = source.authority();
 
-    // 走公开 Job 完整输入和整形；比较字号绑定后的实际 glyph/cluster/advance，
-    // 不读取底层缓存地址、不伪造推进表，也不以派生次数当性能通过的证据。
+    // Drive the public Job through complete input and shaping, comparing actual size-bound glyphs/clusters/advances.
+    // Do not inspect cache addresses, manufacture a platform advance oracle, or treat derivation counts as performance evidence.
     let shape = |font: &MarkdownLayoutFont, points: f32| {
         let authority = font.authority();
         let mut job = MarkdownShapingJob::new(
@@ -265,7 +273,7 @@ fn derived_face_keeps_real_shaping_and_independent_payload_release() {
             .collect();
         assert!(!result.is_empty());
         drop(job);
-        // Source 和 Font 仍归本用例合法持有；这里只结算已经结束 Job 的实际存储。
+        // The case still legitimately owns Source and Font; these facts settle only the completed Job's actual storage resources.
         let closed = resources.snapshot();
         assert_eq!(
             (
@@ -281,7 +289,7 @@ fn derived_face_keeps_real_shaping_and_independent_payload_release() {
         assert!(!closed.cleanup_failed && closed.first_error.is_none());
         result
     };
-    let _ = shape(&original, 14.0); // 真实使用原 face 后再派生，不只覆盖未初始化的字体。
+    let _ = shape(&original, 14.0); // Shape with the original face before deriving, rather than testing only an unused Font.
     for points in [0.1, 14.0, 32.0] {
         let derived = original
             .derive_name_table_at_size(&name, &[], points)
@@ -293,10 +301,10 @@ fn derived_face_keeps_real_shaping_and_independent_payload_release() {
         assert_eq!(shape(&derived, points as f32), shape(&full, points as f32));
         let released = derived.resource_observer();
         drop(derived);
-        assert!(released.payload_released()); // 派生缓存共享不会反向保活它的独立权限 owner。
+        assert!(released.payload_released()); // Shared derived caches must not keep the independent authority payload alive.
     }
 
-    // 原 payload 可先结束；派生 face 继续独立完成真实整形，最后一条字节强边结束才 munmap。
+    // Drop the original payload first; the surviving derived face still shapes, and only the last strong byte owner triggers actual munmap.
     let surviving = original
         .derive_name_table_at_size(&name, &[], 32.0)
         .unwrap();
@@ -314,12 +322,13 @@ fn derived_face_keeps_real_shaping_and_independent_payload_release() {
 }
 
 #[test]
+// Public capture rejects invalid complete-domain metric inputs as a whole, without claiming that synthetic values are successful Native measurements.
 fn incomplete_or_unrepresentable_horizontal_metrics_reject_the_entire_font_capture() {
     let name = tables(ROBOTO).remove(b"name").unwrap();
     let original = MarkdownLayoutFont::resolve(bytes(ROBOTO), NAME, &[]).unwrap();
     let count = original.metadata().glyph_count as usize;
-    // 这些都是公开捕获边界的真实非法输入，不伪造一份“平台成功”推进表作Native oracle。
-    // 数量不足不能被默认hmtx补齐；非有限或超坐标推进不能饱和成另一个有效字宽。
+    // These are actual invalid inputs at the public capture boundary, not a fabricated successful platform-advance oracle.
+    // Missing glyphs cannot fall back to hmtx; nonfinite/overflowing advances cannot saturate into another valid width.
     for (case, advances) in [
         ("missing_glyph_domain", Box::<[f64]>::default()),
         ("not_finite", vec![f64::NAN; count].into_boxed_slice()),
@@ -346,6 +355,7 @@ fn incomplete_or_unrepresentable_horizontal_metrics_reject_the_entire_font_captu
 }
 
 #[test]
+// Original f64 design coordinates must normalize to the actual Font position; nearby unequal positions and invalid tags cannot pass approximately.
 fn original_double_design_axes_require_exact_normalized_equivalence() {
     let variable = named_variable();
     let name = tables(&variable).remove(b"name").unwrap();
@@ -372,17 +382,18 @@ fn original_double_design_axes_require_exact_normalized_equivalence() {
         vec![(*b"nope", 1.0)],
         vec![(*b"wght", native), (*b"wght", native)],
     ] {
-        assert!(font.verify_design_coordinates(&axes).is_err()); // 越界/未知/重复不借fvar夹取或枚举顺序通过。
+        assert!(font.verify_design_coordinates(&axes).is_err()); // Out-of-range/unknown/duplicate axes cannot pass through fvar clamping or iteration order.
     }
 }
 
 #[test]
+// Complete original name-table bytes identify one actual face; neither a display alias, a prefix, nor equal font metadata confers allocation authority.
 fn native_name_table_matches_complete_unique_face_without_resolving_ui_aliases() {
     let name = tables(ROBOTO).remove(b"name").unwrap();
     let font = MarkdownLayoutFont::resolve_name_table(bytes(ROBOTO), &name, &[]).unwrap();
     let named = MarkdownLayoutFont::resolve(bytes(ROBOTO), NAME, &[]).unwrap();
     assert_eq!(font.metadata(), named.metadata());
-    assert!(!font.permits(&named.authority())); // 相同表只证明face，不能把新Font冒充原Font allocation。
+    assert!(!font.permits(&named.authority())); // Equal tables identify the face but cannot impersonate the original Font allocation.
 
     let renamed = renamed();
     let container = collection(&[ROBOTO.to_vec(), renamed.clone()]);
@@ -394,7 +405,7 @@ fn native_name_table_matches_complete_unique_face_without_resolving_ui_aliases()
         (1, 2)
     );
     assert!(second.metadata().postscript_name.starts_with('X'));
-    // 同一 TTC 的不同完整表不能借原 face 的派生入口；正确 face 仍可独立派生新字号。
+    // Another complete name table within the same TTC cannot use this face's derivation entry; the correct face can still derive an independent size.
     assert!(matches!(
         second.derive_name_table_at_size(&name, &[], 18.0),
         Err(MarkdownLayoutFontError::PostScriptNotFound)
@@ -416,7 +427,7 @@ fn native_name_table_matches_complete_unique_face_without_resolving_ui_aliases()
             font.derive_name_table_at_size(candidate, &[], 18.0),
             Err(MarkdownLayoutFontError::PostScriptNotFound)
         ));
-    } // 全表任意字节不同和截短表都不能借PSName前缀补签原face。
+    } // Any differing byte or truncated table cannot reauthorize the original face through an equal PSName prefix.
     let duplicate = collection(&[ROBOTO.to_vec(), ROBOTO.to_vec()]);
     assert!(matches!(
         MarkdownLayoutFont::resolve_name_table(bytes(&duplicate), &name, &[]),
@@ -425,6 +436,7 @@ fn native_name_table_matches_complete_unique_face_without_resolving_ui_aliases()
 }
 
 #[test]
+// Native table matching retains actual axis validation even though it does not enumerate named instances by synthesized PSName.
 fn native_name_table_keeps_axis_validation_and_uses_explicit_actual_coordinates() {
     let variable = named_variable();
     let name = tables(&variable).remove(b"name").unwrap();
@@ -434,7 +446,7 @@ fn native_name_table_keeps_axis_validation_and_uses_explicit_actual_coordinates(
     };
     let font = MarkdownLayoutFont::resolve_name_table(bytes(&variable), &name, &[axis]).unwrap();
     assert_eq!(font.metadata().axes, vec![axis]);
-    assert_eq!(font.metadata().named_instance, None); // 来源是base face加真实Native轴位，不假造命名实例索引。
+    assert_eq!(font.metadata().named_instance, None); // Base face plus actual Native axes does not manufacture a named-instance index.
     let derived = font
         .derive_name_table_at_size(
             &name,
@@ -485,10 +497,11 @@ fn native_name_table_keeps_axis_validation_and_uses_explicit_actual_coordinates(
                 | ("range", MarkdownLayoutFontError::InvalidAxisValue)
                 | ("unknown", MarkdownLayoutFontError::UnknownAxis)
         ));
-    } // 不按合成名称搜索实例，不等于放松真实轴数量、重复项、未知项或取值范围约束。
+    } // Avoiding synthesized-name instance search does not relax actual axis-count, duplicate, unknown-tag, or range constraints.
 }
 
 #[test]
+// Resolve the actual second face and reject ambiguous or missing PSNames without selecting face zero as a fallback.
 fn ttc_exact_second_face_and_ambiguous_names_never_fall_back_to_zero() {
     let value = collection(&[renamed(), ROBOTO.to_vec()]);
     let font = MarkdownLayoutFont::resolve(bytes(&value), NAME, &[]).unwrap();
@@ -506,6 +519,7 @@ fn ttc_exact_second_face_and_ambiguous_names_never_fall_back_to_zero() {
 }
 
 #[test]
+// Actual instance coordinates seed public resolution; explicit overrides stay within range and derivation returns to base-face identity.
 fn named_instance_coordinates_are_real_and_explicit_axes_are_not_clamped() {
     let value = bytes(&named_variable());
     let named = MarkdownLayoutFont::resolve(Arc::clone(&value), "Roboto-Medium", &[]).unwrap();
@@ -524,8 +538,8 @@ fn named_instance_coordinates_are_real_and_explicit_axes_are_not_clamped() {
     let explicit =
         MarkdownLayoutFont::resolve(Arc::clone(&value), "Roboto-Medium", &[axis]).unwrap();
     assert_eq!(explicit.metadata().axes, [axis]);
-    // 命名实例派生新轴时只保原 face，名称恢复为同完整 name 表解析得到的基础 PSName。
-    // 不能把旧 Roboto-Medium 标签留给新轴，也不能沿原 named_instance 隐式补回500。
+    // Deriving new axes from a named instance retains its original face and restores the base PSName from the same complete name table.
+    // Do not keep the old Roboto-Medium label for new axes or implicitly restore its old 500 coordinate from named_instance metadata.
     let name = tables(&named_variable()).remove(b"name").unwrap();
     let derived = named
         .derive_name_table_at_size(&name, &[axis], 18.0)
@@ -574,6 +588,7 @@ fn named_instance_coordinates_are_real_and_explicit_axes_are_not_clamped() {
 }
 
 #[test]
+// Malformed/oversized public inputs fail before unbounded directory/name iteration, with static-face axis requests rejected explicitly.
 fn actual_container_and_name_budgets_fail_before_unbounded_metadata_iteration() {
     let mut header = b"ttcf\0\x01\0\0".to_vec();
     header.extend(257_u32.to_be_bytes());
@@ -601,6 +616,7 @@ fn actual_container_and_name_budgets_fail_before_unbounded_metadata_iteration() 
 }
 
 #[test]
+// A direct base PSName and named-instance PSName can agree only at the actual default coordinate, never by choosing one match first.
 fn direct_and_named_postscript_only_agree_at_the_actual_default_position() {
     let conflicting = named_variable_with(NAME, 500);
     assert!(matches!(

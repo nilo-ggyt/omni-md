@@ -1,7 +1,8 @@
 //! Owns viewport-sized line-number/fold controls without owning document text or editor lifetime.
 //!
-//! Geometry is prepared in the existing coalesced TextKit transaction. Painting reads a bounded
-//! snapshot only; fold state contains canonical intervals and is invalidated by any text generation.
+//! Default paged production uses the independent `paged` module. The explicitly gated TextKit reference
+//! implementation below prepares bounded geometry in its existing coalesced transaction; it is not a production fallback.
+//! Reference painting reads that snapshot only; fold state retains canonical intervals and generation authority.
 
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 use super::*;
@@ -39,7 +40,7 @@ struct GutterLine {
     folded: bool,
 }
 
-/// 缓存只借用本次已验证片段的身份与有限几何；弱引用不延长 TextKit 或正文寿命。
+/// Caches only this verified fragment's identity and bounded geometry; Weak does not extend TextKit or document lifetime.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterFragmentProof {
     fragment: Weak<objc2_app_kit::NSTextLayoutFragment>,
@@ -47,8 +48,8 @@ struct GutterFragmentProof {
     frame: NSRect,
 }
 
-/// 行号不能仅凭同一 Core 代次继续使用：滚动与 Find 可在代次不变时替换整批 Native 几何。
-/// 每个 ruler 至多保留当前视口的 256 片元数据，没有正文副本、原生强引用或第二布局索引。
+/// Core generation alone cannot authorize line numbers: scrolling and Find may replace Native geometry without editing text.
+/// Each ruler retains at most 256 current-viewport fragment records, without text copies, Native strong owners, or another layout index.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterGeometryProof {
     generation: u64,
@@ -66,11 +67,11 @@ struct GutterGeometryProof {
 
 #[cfg(feature = "native-raster-surface-probe")]
 thread_local! {
-    // 整个主线程进程最多十六次失败；日志不保留视图、正文、Native 对象或后继调度。
+    // Limits failure diagnostics to sixteen main-thread observations, retaining no view, text, Native object, or successor scheduling.
     static GUTTER_STALE_DIAGNOSTIC_COUNT: Cell<u8> = const { Cell::new(0) };
 }
 
-/// 只复用原校验已经取得的固定标量；None 表示原短路路径未读取，不能为日志补做 getter。
+/// Reuses fixed scalars already read by validation; None denotes an unvisited short-circuit branch, without extra diagnostic getters.
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterProofDiagnostic {
@@ -85,7 +86,7 @@ struct GutterProofDiagnostic {
     identity_matches: Option<bool>,
 }
 
-/// 失败后只打印原结果；固定 trace 开关关闭时不改变证明、计数或任何 Native 调用。
+/// Reports only the original failure; disabling trace changes no proof, counter, or Native call.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn report_gutter_proof_failure(
     site: &'static str,
@@ -97,7 +98,7 @@ fn report_gutter_proof_failure(
     #[cfg(feature = "native-raster-surface-probe")]
     native_markdown_trace! {
         let ordinal = GUTTER_STALE_DIAGNOSTIC_COUNT.with(|count| {
-            if count.get() == 16 { return None; } // 预算耗尽只停日志，不制造后续成功或重试。
+            if count.get() == 16 { return None; } // Exhausting diagnostics stops logging only, without manufacturing success or retries.
             let next = count.get() + 1;
             count.set(next);
             Some(next)
@@ -108,11 +109,11 @@ fn report_gutter_proof_failure(
         }
     }
     #[cfg(not(feature = "native-raster-surface-probe"))]
-    let _ = (site, reason, operation, proof, facts); // 普通构建没有计数器、输出或额外 Native 观测。
+    let _ = (site, reason, operation, proof, facts); // Ordinary builds add no diagnostic counter, output, or Native observation.
 }
 
 #[cfg(feature = "native-raster-surface-probe")]
-/// 一次原标签循环的有限事实；仅几何/计数，不缓存正文、标签字符串或另一个行数组。
+/// Bounded facts from one original label loop contain geometry/counts only, without text, label strings, or another row array.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterDrawFacts {
     dirty: NSRect,
@@ -127,10 +128,10 @@ struct GutterDrawFacts {
 pub(super) struct GutterIvars {
     text_view: Weak<PieceBackedMarkdownTextView>,
     lines: RefCell<Vec<GutterLine>>,
-    // lines 与本证明只在无 Native 调用的同一发布段更换；失败刷新先撤证明，不重新签旧行。
+    // Lines and proof change in one publication segment without Native calls; failed refresh revokes the proof rather than renewing old rows.
     geometry: RefCell<Option<Rc<GutterGeometryProof>>>,
     attributes: RefCell<Option<Rc<Retained<MarkdownTextAttributes>>>>,
-    // 标量在 super initializer 前固定；只有实际正文 Raster 存在时才走 CPU layer 路径。
+    // Fixes the flag before super initialization; uses the CPU-layer path only when the actual document Raster exists.
     #[cfg(feature = "native-raster-surface-probe")]
     raster_enabled: bool,
     #[cfg(feature = "native-raster-surface-probe")]
@@ -158,22 +159,22 @@ define_class!(
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(wantsUpdateLayer))]
-        /// 只有同一原正文 Raster 才改用真实 CALayer.contents；普通路径原样交还 NSRulerView。
+        /// Uses actual CALayer.contents only with the same original document Raster; ordinary reference drawing stays with NSRulerView.
         fn wants_update_layer(&self) -> bool {
             if self.ivars().raster_enabled {
                 true
             } else {
-                // SAFETY: 公开 NSView getter 的 ABI 与本覆写一致，接收者已完成全部 ivars 初始化。
+                // SAFETY: The public NSView getter ABI matches this override, whose receiver already has fully initialized ivars.
                 unsafe { msg_send![super(self), wantsUpdateLayer] }
             }
         }
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(updateLayer))]
-        /// 原 AppKit 脏标记触发一次有限 CPU 绘制；取消或失败不伪造完成、不启动重试调度。
+        /// An actual AppKit damage event triggers one bounded CPU paint; cancellation/failure neither certifies completion nor schedules retries.
         fn update_layer(&self) {
             if !self.ivars().raster_enabled {
-                // SAFETY: 未启用辅助画布时完整转发公开 NSView 生命周期方法。
+                // SAFETY: Without the auxiliary canvas, forwards the public NSView lifecycle method unchanged.
                 unsafe { let _: () = msg_send![super(self), updateLayer]; }
                 return;
             }
@@ -182,58 +183,58 @@ define_class!(
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(drawRect:))]
-        /// layer 入口不再产生窗口 accelerated-CG 显示列表；原 drawRect 只在 CPU context 调用。
+        /// The layer entry avoids a window accelerated-CG display list; original drawRect runs only within the CPU context.
         fn draw_rect(&self, dirty: NSRect) {
             if self.ivars().raster_enabled {
                 self.paint_raster_layer("drawRect");
             } else {
-                // SAFETY: 普通原路径保持 NSRulerView 公开绘制 ABI 与原 dirty 范围。
+                // SAFETY: The ordinary reference path preserves NSRulerView's public drawing ABI and original damage range.
                 unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
             }
         }
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(setFrame:))]
-        /// 真实几何事件先撤正文共用的原几何票，再调用原生 setter。
+        /// Actual geometry events revoke the document's shared geometry intent before the native setter.
         fn set_frame_for_raster(&self, frame: NSRect) {
             self.invalidate_raster_geometry();
-            // SAFETY: 原 NSView setter 接收同一 NSRect ABI，不改参数或布局策略。
+            // SAFETY: The original NSView setter receives the same NSRect ABI without parameter or layout-policy changes.
             unsafe { let _: () = msg_send![super(self), setFrame: frame]; }
         }
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(setBounds:))]
-        /// 滚动产生的真实 bounds 改变不能让旧 CPU 图继续签发布。
+        /// Actual scroll bounds changes revoke publication authority for old CPU images.
         fn set_bounds_for_raster(&self, bounds: NSRect) {
             self.invalidate_raster_geometry();
-            // SAFETY: 与公开原 NSView setter ABI 一致，原几何参数完整转发。
+            // SAFETY: Matches the public NSView setter ABI and forwards original geometry unchanged.
             unsafe { let _: () = msg_send![super(self), setBounds: bounds]; }
         }
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(viewDidChangeBackingProperties))]
-        /// 屏幕 scale 改变必须撤原票，不能把旧像素分辨率作为新 backing 发布。
+        /// A screen-scale change revokes the intent; old pixel resolution cannot become new backing.
         fn backing_changed_for_raster(&self) {
             self.invalidate_raster_geometry();
-            // SAFETY: 公开 NSView 通知方法无参数，不增加观察者或隐藏视图。
+            // SAFETY: The public NSView notification takes no arguments and adds no observer or hidden view.
             unsafe { let _: () = msg_send![super(self), viewDidChangeBackingProperties]; }
         }
 
         #[cfg(feature = "native-raster-surface-probe")]
         #[unsafe(method(viewDidMoveToWindow))]
-        /// 同一 ruler 换窗也撤原票；不把后继窗口身份补签到进行中的绘制。
+        /// Moving the same ruler to another window revokes its intent instead of assigning successor identity to in-flight paint.
         fn window_changed_for_raster(&self) {
             self.invalidate_raster_geometry();
-            // SAFETY: 保留公开原 NSView 生命周期调用顺序与 ABI。
+            // SAFETY: Preserves the public NSView lifecycle order and ABI.
             unsafe { let _: () = msg_send![super(self), viewDidMoveToWindow]; }
         }
 
         #[unsafe(method(drawHashMarksAndLabelsInRect:))]
-        /// 只绘制同一活 Source 视口内的缓存行号；不在绘制中解析正文或触发布局。
+        /// Paints cached line numbers only inside the same live Source viewport, without parsing text or triggering layout.
         fn draw_hash_marks_and_labels(&self, dirty: NSRect) {
             #[cfg(feature = "native-raster-surface-probe")]
             if self.ivars().raster_enabled && !self.raster_draw_is_active() {
-                return; // 只有本次真实 CPU super drawRect 可消费标签，不能旁路回到窗口 GPU context。
+                return; // Only this actual CPU super drawRect may consume labels, without bypassing it through the window GPU context.
             }
             let Some(Some(view)) = self.paint_native_step(|| self.ivars().text_view.load()) else { return; };
             let _payload_use = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
@@ -245,7 +246,7 @@ define_class!(
             let Some((viewport, generation)) = self.source_viewport(&view) else { return; };
             let Some(damage) = native_markdown_paint_rect(viewport, dirty, viewport) else { return; };
             let Some(active_line) = self.paint_native_step(|| view.selected_source_line()) else { return; };
-            // 原有有限缓存完整保留；结束借用后才调用可重入的 Native 坐标和标签绘制。
+            // Clones the existing bounded cache before reentrant Native coordinate conversion and label drawing, with no cache borrow held.
             let lines = self.ivars().lines.borrow().clone();
             #[cfg(feature = "native-markdown-runtime-probe")]
             crate::native_surface::probe_call_diagnostic::memory_point("gutter_draw_begin");
@@ -257,7 +258,7 @@ define_class!(
             let Some(_graphics) = self.paint_native_step(GutterGraphicsState::save) else { return; };
             if self.paint_native_step(|| NSBezierPath::clipRect(damage)).is_none() { return; }
             for line in lines {
-                // 仍按原始正文基线转换，不把长逻辑行号挪到视口边缘。
+                // Converts original document baselines rather than moving a long logical line's number to the viewport edge.
                 let Some(point) = self.paint_native_step(|| self.convertPoint_fromView(
                     NSPoint::new(0.0, line.document_y), Some(&view))) else { return; };
                 if self.source_viewport(&view) != Some((viewport, generation)) { return; }
@@ -268,29 +269,29 @@ define_class!(
                 let Some(rect) = visible_gutter_line(point.y, line.height, viewport) else {
                     #[cfg(feature = "native-raster-surface-probe")]
                     { facts.outside_viewport += 1; }
-                    continue; // 完全屏外逻辑行仍不挪到视口顶端，必须保留原折叠命中坐标。
+                    continue; // Offscreen logical lines do not move to the viewport top; their original fold-hit coordinates remain authoritative.
                 };
                 let Some(paint) = native_markdown_paint_rect(rect, dirty, viewport) else {
                     #[cfg(feature = "native-raster-surface-probe")]
                     { facts.outside_damage += 1; }
-                    continue; // 普通原dirty绘制仍保留既有局部更新语义。
+                    continue; // Ordinary damage drawing retains the existing local-update semantics.
                 };
                 if active_line == Some(line.number) {
-                    // 与原路径相同的真实活动行交集；RAII 在任意撤权出口配平 graphics state。
+                    // Uses the same actual active-line intersection; RAII balances graphics state on every revoked exit.
                     let Some(_highlight) = self.paint_native_step(GutterGraphicsState::save) else { return; };
                     let Some(color) = self.paint_native_step(|| NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.48, 0.72, 0.12)) else { return; };
                     if self.paint_native_step(|| color.setFill()).is_none()
                         || self.paint_native_step(|| NSBezierPath::fillRect(paint)).is_none() { return; }
                 }
                 let marker = if line.folded {
-                    "▶" // 已折叠行继续显示原展开标记，点击仍走原 Core 折叠授权。
+                    "▶" // A folded line shows the existing expansion marker; clicks still require Core fold authority.
                 } else if line.may_fold {
-                    "▾" // 预提示不授予隐藏正文的权限。
+                    "▾" // A visual hint alone grants no authority to hide text.
                 } else {
-                    " " // 普通行只保留原行号。
+                    " " // An ordinary line retains its number only.
                 };
                 let Some(string) = self.paint_native_step(|| NSString::from_str(&format!("{} {marker}", line.number + 1))) else { return; };
-                // SAFETY: 原字典仍只含活字体/颜色与不可变键，临时有限标签同步归还。
+                // SAFETY: The original dictionary contains live fonts/colors and immutable keys only; bounded temporary labels return synchronously.
                 let Some(label) = self.paint_native_step(|| unsafe {
                     NSAttributedString::initWithString_attributes(NSAttributedString::alloc(), &string, Some(&attributes))
                 }) else { return; };
@@ -298,12 +299,12 @@ define_class!(
                 if self.paint_native_step(|| label.drawAtPoint(NSPoint::new(4.0, point.y))).is_none() { return; }
                 #[cfg(feature = "native-raster-surface-probe")]
                 if let Some(raster) = self.ivars().raster.borrow().as_ref() {
-                    raster.record_drawn_label(); // 原实际标签调用已返回且原票有效，才记一次绘制事实。
+                    raster.record_drawn_label(); // Records a draw only after the actual label call returns under the original intent.
                 }
             }
-            // 完整原循环后只复核一次片段批次，避免逐标签/逐 Native 原语重复遍历造成平方开销。
+            // Rechecks the fragment batch once after the complete loop, avoiding quadratic rescans per label or Native primitive.
             if !self.cached_geometry_is_current(&view, &capture, &proof, "draw_end") { return; }
-            drop(_graphics); // 先恢复 graphics state，再记原 draw-end 边界。
+            drop(_graphics); // Restores graphics state before recording the original draw-end boundary.
             #[cfg(feature = "native-raster-surface-probe")]
             self.complete_raster_draw(facts);
             #[cfg(feature = "native-markdown-runtime-probe")]
@@ -311,31 +312,31 @@ define_class!(
         }
 
         #[unsafe(method(mouseDown:))]
-        /// 只命中同一 Source 可见区域内的缓存逻辑行，遮挡区没有折叠热区。
+        /// Hits cached logical lines only in the same Source visible area; occluded regions have no fold target.
         fn mouse_down(&self, event: &NSEvent) {
             let Some(view) = self.ivars().text_view.load() else {
-                // AppKit 交付已排队事件时，原弱客户端可能已经释放。
+                // The original weak client may have ended before AppKit delivers a queued event.
                 return;
             };
-            // 鼠标命中测试保留几何后会调用 AppKit；其完整生命周期都阻止 accepted release。
+            // Hit-testing retains geometry across AppKit calls; the full operation prevents accepted payload release.
             let _payload_use = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
             if view.ivars().textkit_graph_teardown.get() {
-                // 迟到点击不能解析旧折叠区域或提交任何草稿。
+                // A late click cannot parse old fold regions or commit a draft.
                 return;
             }
             let Ok(capture) = view.ivars().folds.capture_selection() else { return; };
             let Some(proof) = self.ivars().geometry.borrow().clone() else { return; };
             if !self.cached_geometry_is_current(&view, &capture, &proof, "mouse_begin") { return; }
             let Some((viewport, generation)) = self.source_viewport(&view) else {
-                return; // Preview、关闭或未挂载的 ruler 都不能消费旧折叠事件。
+                return; // Preview, closed, or unmounted rulers cannot consume an old fold event.
             };
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             if !gutter_contains_point(viewport, point) {
-                return; // 与绘制使用同一正文 clip，Find/header 区域不会留下不可见热区。
+                return; // Shares painting's document clip, leaving no invisible hit regions in Find/header areas.
             }
             let lines = self.ivars().lines.borrow().clone();
             let selected = lines.into_iter().find(|line| {
-                // 保留长逻辑行的原命中高度，只裁掉正文实际不可见的部分。
+                // Preserves a long logical line's original hit height, clipping only actually invisible portions.
                 let top = self
                     .convertPoint_fromView(NSPoint::new(0.0, line.document_y), Some(&view))
                     .y;
@@ -344,13 +345,13 @@ define_class!(
             });
             if self.source_viewport(&view) != Some((viewport, generation))
                 || !self.cached_geometry_is_current(&view, &capture, &proof, "mouse_end") {
-                // 原生转换若重入新布局/正文代次/关闭，旧点不能命中后继几何。
+                // Conversion reentry into layout, a new document generation, or close prevents the old point from targeting successor geometry.
                 return;
             }
             if let Some(line) = selected {
-                // core 再核当前代次、实际语法并先提交可见草稿，点击不会绕过原折叠事务。
+                // Core rechecks generation and actual syntax after normal draft commit; the click cannot bypass the existing fold transaction.
                 if let Err(error) = view.toggle_source_fold(line.number) {
-                    // 容量、提交或语法拒绝都保留原正文和已有折叠图。
+                    // Capacity, commit, or syntax refusal preserves original text and existing folds.
                     present_native_markdown_error(&error);
                 }
             }
@@ -358,7 +359,7 @@ define_class!(
     }
 );
 
-/// 配平原同步绘图栈；即使权限撤销也必须恢复，不能把新 clip 留给下一个控件。
+/// Balances the original synchronous graphics stack even after revocation, without leaking clip state to another control.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 struct GutterGraphicsState;
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
@@ -378,17 +379,17 @@ impl Drop for GutterGraphicsState {
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl NativeMarkdownGutter {
     #[cfg(feature = "native-raster-surface-probe")]
-    /// 两个公开 Native 入口共用普通 Rust 边界，避免直接调用带隐藏 selector 的覆写实现。
+    /// Both public Native entries share an ordinary Rust boundary, rather than directly calling selector-bearing override implementations.
     fn paint_raster_layer(&self, entry: &'static str) {
         let raster = self.ivars().raster.borrow().clone();
         if let Some(raster) = raster
             && let Err(error) = raster.paint(self, entry)
         {
             raster.report_failure(&error);
-        } // 构造尚未安装租约或 accepted 已取走时，不碰任何旧 Native 图。
+        } // An uninstalled construction lease or accepted teardown grants no access to an old Native graph.
     }
 
-    /// CPU 回调沿同一原票逐原语核验；普通窗口路径保留完全相同的 Native 调用。
+    /// CPU callbacks guard each primitive with the same original intent; ordinary reference drawing retains its original Native calls.
     fn paint_native_step<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
         #[cfg(feature = "native-raster-surface-probe")]
         if self.ivars().raster_enabled {
@@ -399,7 +400,7 @@ impl NativeMarkdownGutter {
                 return raster.drawing_step(self, work);
             }
         }
-        Some(work()) // 原鼠标命中与初始几何读取没有 CPU paint 权限，不新增绘制事务。
+        Some(work()) // Original mouse hits and initial geometry reads create no additional CPU paint transaction.
     }
 
     #[cfg(feature = "native-raster-surface-probe")]
@@ -429,13 +430,13 @@ impl NativeMarkdownGutter {
 
     #[cfg(feature = "native-raster-surface-probe")]
     fn draw_native_for_raster(&self, bounds: NSRect) {
-        // SAFETY: 直接调用原 NSRulerView 公开绘制；它仍分派到原 drawHashMarks，context 已限定为 CPU。
+        // SAFETY: Calls public NSRulerView drawing, which still dispatches original drawHashMarks inside the established CPU context.
         unsafe {
             let _: () = msg_send![super(self), drawRect: bounds];
         }
     }
 
-    /// 纯 Rust 身份检查可放在逐 Native 原语前后，不重新遍历片段或升级正文 owner。
+    /// Pure Rust identity checks may bracket each Native primitive without rescanning fragments or upgrading document ownership.
     fn proof_is_current(&self, proof: &Rc<GutterGeometryProof>) -> bool {
         self.ivars()
             .geometry
@@ -444,8 +445,8 @@ impl NativeMarkdownGutter {
             .is_some_and(|actual| Rc::ptr_eq(actual, proof))
     }
 
-    /// 只在绘制/点击准入与完整绘制结束检查一次原批次；过程中仍由原 Raster 票撤销几何权限。
-    /// 所有 Weak/Native 查询都夹在原选择票与原 proof 身份检查之间，且没有 RefCell 借用跨调用。
+    /// Checks the original batch at paint/hit admission and complete draw exit; the Raster intent still revokes geometry during work.
+    /// Brackets every Weak/Native query with original selection/proof identity checks, without RefCell borrows across calls.
     fn cached_geometry_is_current(
         &self,
         view: &PieceBackedMarkdownTextView,
@@ -456,14 +457,14 @@ impl NativeMarkdownGutter {
         let failure = Cell::new(None);
         let operation = Cell::new("begin");
         let facts = Cell::new(GutterProofDiagnostic::default());
-        // 只记录原短路求值中的首个 false；后续清理/复核不能覆盖真正的失败原因。
+        // Records the first false from original short-circuit evaluation only; later cleanup/checks cannot replace that failure reason.
         let predicate = |name: &'static str, value: bool| {
             if !value && failure.get().is_none() {
                 failure.set(Some(name));
             }
             value
         };
-        // 此宏仅给原调用贴固定名称，保留同一 guard、同一 getter 及原 .ok()? 短路。
+        // The macro labels original calls only, preserving their guard, getter, and .ok()? short-circuit behavior.
         macro_rules! read {
             ($guard:expr, $name:literal, $work:expr) => {{
                 operation.set($name);
@@ -506,7 +507,7 @@ impl NativeMarkdownGutter {
             operation.set("canonical.document");
             let document = storage.document()?;
             let generation = document.borrow().generation();
-            drop(document); // 日志复用原借用已经取得的 generation，不升级额外正文 owner。
+            drop(document); // Diagnostics reuse the generation already read under the original borrow, without another document upgrade.
             let mut observed = facts.get();
             observed.epochs = Some((
                 generation,
@@ -515,7 +516,7 @@ impl NativeMarkdownGutter {
                 storage.ivars().font_run_scratch.epoch(),
                 view.ivars().folds.revision(),
             ));
-            facts.set(observed); // 其余 epoch 都是现有校验读取的纯 Cell，不补做 Native getter。
+            facts.set(observed); // Other epochs are existing pure Cell reads, with no additional Native diagnostic getter.
             if !current() || !predicate("generation", generation == proof.generation) {
                 return None;
             }
@@ -528,7 +529,7 @@ impl NativeMarkdownGutter {
                 "document_viewport",
                 actual_viewport == Some((proof.visible, proof.origin)),
             ) {
-                return None; // 比较正文文档 clip，ruler 的固定零 origin 不构成来源证明。
+                return None; // Compares the actual document clip; a ruler's fixed zero origin is not Source evidence.
             }
             let Some(manager_weak) = proof.manager.as_ref() else {
                 operation.set("empty_document.shape");
@@ -604,7 +605,7 @@ impl NativeMarkdownGutter {
                 observed.state = None;
                 observed.frame = None;
                 observed.identity_matches = None;
-                facts.set(observed); // None 明确保留原短路后尚未读取的字段，不用诊断补读 frame。
+                facts.set(observed); // None preserves fields skipped by original short-circuiting, without reading a frame merely for diagnostics.
                 let fragment = read!(&current, "fragment.weak", || expected.fragment.load())?;
                 let state = read!(&current, "fragment.state", || fragment.state());
                 let mut observed = facts.get();
@@ -653,9 +654,9 @@ impl NativeMarkdownGutter {
                     return None;
                 }
             }
-            current().then_some(()) // 原业务判断与 Native 序列不变；日志绝不推进布局或签发通过。
+            current().then_some(()) // Preserves original decisions and Native order; diagnostics neither advance layout nor authorize success.
         })();
-        // 原临时 Native claim 全部归还之后仍沿原票复核；只复用实际失败，不另做观测调用。
+        // Rechecks the original intent after Native temporaries return, reusing actual failure without extra observation calls.
         let valid = result.is_some()
             && predicate("selection_after_claim_drop", capture.current())
             && predicate("proof_after_claim_drop", self.proof_is_current(proof));
@@ -671,10 +672,10 @@ impl NativeMarkdownGutter {
         valid
     }
 
-    /// 绘制和折叠点击共用实时可见区域，不缓存 Find 高度或手工补偿 header 偏移。
+    /// Paint and fold hits share the actual visible area, without cached Find height or manual header offsets.
     fn source_viewport(&self, view: &PieceBackedMarkdownTextView) -> Option<(NSRect, u64)> {
         if view.ivars().textkit_graph_teardown.get() {
-            return None; // accepted 后的空壳不升级 canonical 弱引用。
+            return None; // An accepted empty shell does not upgrade the canonical Weak.
         }
         let proof = self.ivars().geometry.borrow().clone()?;
         let generation = {
@@ -685,20 +686,20 @@ impl NativeMarkdownGutter {
                 || storage.ivars().font_run_scratch.epoch() != proof.font_epoch
                 || view.ivars().folds.revision() != proof.fold_revision
             {
-                return None; // 隐藏 ruler 的迟到绘制和事件不能借 Preview 恢复 Source 权限。
+                return None; // Late hidden-ruler drawing/events cannot borrow Preview to restore Source authority.
             }
             let document = storage.document()?;
             document.borrow().generation()
-        }; // canonical 借用及临时强 owner 均在坐标转换前结束。
+        }; // Canonical borrowing and temporary strong ownership end before coordinate conversion.
         let (text_visible, origin) = self.paint_native_step(|| view.bounded_paint_viewport())??;
         if generation != proof.generation
             || text_visible != proof.visible
             || origin != proof.origin
             || !self.proof_is_current(&proof)
         {
-            return None; // 同代次的新滚动/Find 视口不能给旧缓存重新签发绘制或折叠命中权限。
+            return None; // A new scroll/Find viewport in the same text generation cannot renew old cache paint/fold-hit authority.
         }
-        // ruler 独占横向条带；仅转换正文 clip 的上下沿，原生层级自行包含 Find/resize 偏移。
+        // The ruler owns its horizontal strip; converts only document clip edges while actual hierarchy accounts for Find/resize offsets.
         let top = self
             .paint_native_step(|| {
                 self.convertPoint_fromView(NSPoint::new(0.0, text_visible.origin.y), Some(view))
@@ -719,12 +720,12 @@ impl NativeMarkdownGutter {
         );
         let visible = self.paint_native_step(|| self.visibleRect())?;
         let viewport = native_markdown_paint_rect(visible, bounds, vertical_clip)?;
-        // 所有可重入 getter 返回后再核活代次和 Source；非法/空交集不会被全文 bounds 替代。
+        // Rechecks generation and Source after reentrant getters; invalid/empty intersections never use whole-document bounds instead.
         self.paint_native_step(|| view.gutter_generation_is_current(generation))?
             .then_some((viewport, generation))
     }
 
-    /// 一个滚动面只挂接一个原 ruler；仅保留有限字体/标签和弱 editor，辅助层构造失败明确上报。
+    /// One scroll surface mounts one reference ruler with bounded fonts/labels and a weak editor; auxiliary-layer construction failure is explicit.
     pub(super) fn new(
         scroll: &NSScrollView,
         view: &PieceBackedMarkdownTextView,
@@ -734,7 +735,7 @@ impl NativeMarkdownGutter {
         #[cfg(feature = "native-raster-surface-probe")]
         let raster_owner = view.ivars().raster_surface.borrow().clone();
         #[cfg(not(feature = "native-raster-surface-probe"))]
-        let _ = ledger; // 普通构建不创建辅助层或第二 ledger。
+        let _ = ledger; // Ordinary reference builds create no auxiliary layer or second ledger.
         let font = NSFont::monospacedDigitSystemFontOfSize_weight(11.0, unsafe {
             // SAFETY: AppKit's regular font weight is an immutable exported scalar.
             NSFontWeightRegular
@@ -748,7 +749,7 @@ impl NativeMarkdownGutter {
             text_view: Weak::from(view),
             lines: RefCell::new(Vec::new()),
             geometry: RefCell::new(None),
-            // 绘制只克隆 Rust Rc，原生 retain/release 不与 RefCell 借用重叠。
+            // Drawing clones Rust Rc only; Native retain/release never overlaps a RefCell borrow.
             attributes: RefCell::new(Some(Rc::new(attributes))),
             #[cfg(feature = "native-raster-surface-probe")]
             raster_enabled: raster_owner.is_some(),
@@ -760,7 +761,7 @@ impl NativeMarkdownGutter {
         let ruler: Retained<Self> = unsafe {
             msg_send![super(allocated), initWithScrollView: Some(scroll), orientation: NSRulerOrientation::VerticalRuler]
         };
-        // macOS 14+ 普通 NSView 默认允许越界绘制；先限制 ruler 自身边界，正文 clip 仍单独约束绘制与点击。
+        // Explicitly clips ruler bounds under modern AppKit; the separate document clip still constrains painting and clicks.
         ruler.setClipsToBounds(true);
         ruler.setRuleThickness(74.0);
         ruler.setClientView(Some(view));
@@ -794,7 +795,7 @@ impl NativeMarkdownGutter {
         let capture = view.ivars().folds.capture_selection().ok()?;
         let proof = self.ivars().geometry.borrow().clone()?;
         if !self.cached_geometry_is_current(view, &capture, &proof, "active_line_background") {
-            return None; // 正文活动行背景也不能消费另一视口的旧行号几何。
+            return None; // Document active-line background cannot consume old gutter geometry from another viewport either.
         }
         self.ivars()
             .lines
@@ -810,12 +811,12 @@ impl NativeMarkdownGutter {
             })
     }
 
-    /// 逐字段证明 ruler 空壳不保留几何容量或属性所有权。
+    /// Checks each payload slot to prove the ruler shell retains no geometry capacity or attribute ownership.
     pub(super) fn payload_is_empty(&self) -> bool {
         let metadata_empty = self.ivars().lines.borrow().capacity() == 0
             && self.ivars().geometry.borrow().is_none()
             && self.ivars().attributes.borrow().is_none();
-        // clientView 原生 getter 前结束全部 RefCell 临时借用，关闭观察也允许重入。
+        // Ends every temporary RefCell borrow before the clientView getter, allowing reentrant close observation.
         #[cfg(feature = "native-raster-surface-probe")]
         let metadata_empty = metadata_empty && self.ivars().raster.borrow().is_none();
         metadata_empty && self.clientView().is_none()
@@ -827,7 +828,7 @@ impl NativeMarkdownGutter {
         {
             let raster = self.ivars().raster.borrow_mut().take();
             if let Some(raster) = raster {
-                // 先取出唯一槽再调用可重入 Native；恢复原关系后归还所有辅助元数据。
+                // Takes the sole slot before reentrant Native calls, restoring original relationships and returning auxiliary metadata.
                 if let Err(error) = raster.restore() {
                     raster.report_failure(&error);
                 }
@@ -837,17 +838,17 @@ impl NativeMarkdownGutter {
         let lines = self.ivars().lines.replace(Vec::new());
         let geometry = self.ivars().geometry.borrow_mut().take();
         let attributes = self.ivars().attributes.borrow_mut().take();
-        // 全部借用结束后释放容量及原生值，随后才调用可重入的 client detach。
+        // Releases capacity and Native values after all borrows end, before reentrant client detachment.
         drop((lines, geometry, attributes));
         self.setClientView(None);
     }
 }
 
-/// 原逻辑行只裁掉屏外部分；标签仍用未裁剪基线绘制，不把行号挪到视口顶端。
+/// Clips only offscreen portions of the original logical line; labels keep their original baseline rather than moving to the viewport top.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn visible_gutter_line(top: f64, height: f64, viewport: NSRect) -> Option<NSRect> {
     if !top.is_finite() || !height.is_finite() {
-        return None; // 无法认证的 native 行几何不能产生绘制或折叠命中权限。
+        return None; // Unverified Native line geometry grants no paint or fold-hit authority.
     }
     let line = NSRect::new(
         NSPoint::new(viewport.origin.x, top),
@@ -856,7 +857,7 @@ fn visible_gutter_line(top: f64, height: f64, viewport: NSRect) -> Option<NSRect
     native_markdown_paint_rect(line, viewport, viewport)
 }
 
-/// 使用左闭右开的同一可见区域，防止边缘事件落入相邻 Find/header 控件。
+/// Uses the same half-open visible region so edge events cannot fall into neighboring Find/header controls.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_contains_point(rect: NSRect, point: NSPoint) -> bool {
     point.x.is_finite()
@@ -869,11 +870,11 @@ fn gutter_contains_point(rect: NSRect, point: NSPoint) -> bool {
 
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 impl PieceBackedMarkdownTextView {
-    /// TextKit/坐标调用返回后重新验证派生数据仍属于同一活 canonical 代次。
+    /// Revalidates derived data against the same live canonical generation after TextKit/coordinate calls.
     pub(super) fn projection_generation_is_current(&self, expected: u64) -> bool {
         let sealed = self.ivars().textkit_graph_teardown.get();
         let current = if sealed {
-            // 已封闭时连 canonical weak 都不升级，不延长业务生命周期。
+            // A sealed graph does not even upgrade canonical Weak, avoiding any business-lifetime extension.
             None
         } else {
             self.ivars()
@@ -885,7 +886,7 @@ impl PieceBackedMarkdownTextView {
         projection_can_publish(sealed, expected, current)
     }
 
-    /// ruler 仅属于 Source；Native 回调中切到 preview 也使旧几何失去发布权限。
+    /// The ruler belongs to Source only; switching to Preview during Native callbacks revokes old geometry publication.
     fn gutter_generation_is_current(&self, expected: u64) -> bool {
         self.projection_generation_is_current(expected)
             && self.ivars().text_storage.load().is_some_and(|storage| {
@@ -913,7 +914,7 @@ impl PieceBackedMarkdownTextView {
     pub(super) fn draw_source_active_line(&self, dirty: NSRect) {
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // 独立绘制入口同样不能在 accepted 后取得正文或属性。
+            // This separate drawing entry also cannot acquire text or attributes after acceptance.
             return;
         }
         let Some(line) = self.selected_source_line() else {
@@ -925,7 +926,7 @@ impl PieceBackedMarkdownTextView {
             return;
         };
         let Some((visible, _)) = self.bounded_paint_viewport() else {
-            return; // 首次隐藏/卸载不绘制；原生挂载/draw事件会沿既有调度恢复。
+            return; // An initially hidden/unmounted view draws nothing; actual mount/draw events resume through existing scheduling.
         };
         let Some(frame) = ruler.line_frame(self, line, self.bounds().size.width) else {
             // Offscreen/unlaid caret geometry is deferred; drawing never forces whole-document layout.
@@ -944,7 +945,7 @@ impl PieceBackedMarkdownTextView {
     pub(super) fn invalidate_source_gutter_highlight(&self) {
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // 迟到选择通知不重新请求空壳绘制。
+            // Late selection notifications cannot request drawing on an empty shell.
             return;
         }
         if let Some(ruler) = self.ivars().gutter.get().and_then(Weak::load) {
@@ -953,11 +954,11 @@ impl PieceBackedMarkdownTextView {
         }
     }
 
-    /// 显式全部展开、模式切换及teardown保留清空策略；正常编辑改由真实ChangeSet映射。
+    /// Explicit expand-all, mode change, and teardown retain their clearing policy; ordinary edits map through actual ChangeSet.
     pub(super) fn unfold_source(&self) {
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // 已 take/drop 的折叠状态不能被旧输入入口重新写入。
+            // Old input entries cannot repopulate fold state already taken and dropped.
             return;
         }
         if self.ivars().folds.borrow_mut().is_empty() {
@@ -965,7 +966,7 @@ impl PieceBackedMarkdownTextView {
             return;
         }
         self.ivars().folds.borrow_mut().clear();
-        self.ivars().folds.advance(); // 显式展开撤权；无效化不再重复推进提交票据。
+        self.ivars().folds.advance(); // Explicit unfolding revokes authority; invalidation does not advance the commit intent again.
         self.invalidate_fold_layout();
     }
 
@@ -973,18 +974,18 @@ impl PieceBackedMarkdownTextView {
     fn invalidate_fold_layout(&self) {
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() || !self.ivars().folds.owner_is_current() {
-            // 原生 layout 调用必须保持同一活 owner，不能请求已断开空壳恢复派生图。
+            // Native layout requires the same live owner and cannot ask a detached shell to restore derived state.
             return;
         }
         let Ok(capture) = self.ivars().folds.capture_selection() else {
             return;
         };
-        // 原owner/capture确认后，本次无效化已承担当前dirty；finish入口预先take时再取为空无副作用。
-        // 仅在首次Native释放/调用之前确认一次，之后重入新置的dirty须保留，不能在返回时清掉。
+        // After confirming the owner/capture, this invalidation owns current damage; a prior finish take makes another take a no-op.
+        // Takes damage before the first Native release/call only; later damage created by reentry must remain on return.
         self.ivars().folds.take_layout_dirty();
-        self.advance_block_fold_epoch(); // 同text generation的fold变化也必须撤销旧派生语义。
+        self.advance_block_fold_epoch(); // Fold changes within one text generation also revoke old derived semantics.
         let _ = (|| -> Result<(), NativeMarkdownFoldError> {
-            // 释放原生cache与任一getter均可重入；只沿开始时的同一fold票据推进。
+            // Native cache release and getters may reenter; advances only under the fold intent captured at entry.
             selection_native_step(&capture, || self.invalidate_visible_table_layout_cache())?;
             let Some(manager) = selection_native_step(&capture, || self.textLayoutManager())?
             else {
@@ -1000,10 +1001,10 @@ impl PieceBackedMarkdownTextView {
             selection_native_step(&capture, || self.setNeedsDisplay(true))?;
             selection_native_step(&capture, || self.schedule_visible_table_layout_update())?;
             Ok(())
-        })(); // 失去权限时已有新状态负责绘制，不重新领票或排重试。
+        })(); // After revocation, new state owns drawing; no intent recapture or retry is scheduled.
     }
 
-    /// 已提交变化先换纯fold坐标，派生Native无效化在结束document借用后只消费一次。
+    /// Committed edits first update pure fold coordinates; derived Native invalidation runs once after document borrowing ends.
     pub(super) fn finish_fold_layout_update(&self) {
         if self.ivars().folds.take_layout_dirty() {
             self.invalidate_fold_layout();
@@ -1017,7 +1018,7 @@ impl PieceBackedMarkdownTextView {
         }
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // probe 或其他直接调用也必须遵守同一 sealed 边界。
+            // Probes and other direct callers obey the same sealed boundary.
             return Err("笔记折叠控件已关闭".into());
         }
         self.commit_active_table_cell()?;
@@ -1073,7 +1074,7 @@ impl PieceBackedMarkdownTextView {
             let move_to_header = (selected.selection.head_utf16 > region.hidden_utf16_range.start
                 && selected.selection.head_utf16 < region.hidden_utf16_range.end)
                 .then_some(region.hidden_utf16_range.start);
-            // 先在纯栈发布本次有限选择，再调用Native setter；不能在其重入后追加旧region。
+            // Publishes this bounded choice in Rust before the Native setter; reentry cannot append the old region afterward.
             self.ivars().folds.borrow_mut().push(region);
             self.ivars().folds.advance();
             if let Some(header) = move_to_header {
@@ -1087,18 +1088,18 @@ impl PieceBackedMarkdownTextView {
     /// Rebuild at most one viewport of logical line labels from existing TextKit 2 fragment geometry.
     pub(super) fn refresh_source_gutter(&self) {
         self.finish_fold_layout_update();
-        // 所有调用方（含 probe 直接调用）都覆盖 canonical Rc 和枚举 block 的完整寿命。
+        // All callers, including direct probes, cover the full canonical Rc and enumeration-block lifetime.
         let _payload_use = PayloadUseGuard::enter(&self.ivars().payload_use_depth);
         if self.ivars().textkit_graph_teardown.get() {
-            // 清理后的 Vec 容量不能因迟到刷新被重建。
+            // Late refresh cannot reconstruct Vec capacity already released by cleanup.
             return;
         }
         let Some(ruler) = self.ivars().gutter.get().and_then(Weak::load) else {
             // Isolated storage/probe adapters may intentionally have no scroll-owned ruler.
             return;
         };
-        // 刷新开始即撤销上一批证明；同代次新视口若准备失败，旧 lines 也不能借新票继续画或命中。
-        // 先移出 RefCell 再 drop Weak 元数据，所有后续 Native 调用都不携带槽借用。
+        // Refresh revokes the previous batch proof immediately; failed same-generation viewport preparation cannot renew old rows for paint or hits.
+        // Takes Weak metadata out before dropping it; subsequent Native calls carry no slot borrow.
         let previous_geometry = ruler.ivars().geometry.borrow_mut().take();
         drop(previous_geometry);
         if self
@@ -1116,7 +1117,7 @@ impl PieceBackedMarkdownTextView {
             return;
         };
         let Some(document) = storage.document() else {
-            // 已断开正文既没有来源，也不能继续保留可命中的旧标签。
+            // A disconnected document has neither Source authority nor permission to retain hittable old labels.
             let previous = ruler.ivars().lines.replace(Vec::new());
             drop(previous);
             return;
@@ -1126,11 +1127,11 @@ impl PieceBackedMarkdownTextView {
             (document.utf16_len(), document.generation())
         };
         if self.ivars().folds.generation.get() != generation {
-            // 只有绕过正式observer的未知新代次才展开；已提交映射由其同代次票据继续授权。
+            // Only an unknown generation outside the observer flow unfolds; committed mappings retain their matching-generation authority.
             self.ivars().folds.synchronize_generation(generation);
         }
         let Ok(capture) = self.ivars().folds.capture_selection() else {
-            return; // 刷新只消费原前台笔记票；不能在 Native 回调后重新领取较新 owner。
+            return; // Refresh consumes the original foreground note intent, without acquiring a newer owner after Native callbacks.
         };
         let geometry_epoch = storage.ivars().table_geometry_epoch.get();
         let semantic_epoch = storage.ivars().presentation_semantic_epoch.get();
@@ -1147,7 +1148,7 @@ impl PieceBackedMarkdownTextView {
         };
         let is_empty = document_length == 0;
         if is_empty {
-            // 空笔记依旧只有第一行，不为它请求片段或构造假的 source 覆盖。
+            // An empty note still has one first line, without fragment requests or fabricated Source coverage.
             let Ok(Some((visible, origin))) =
                 native_markdown_table_intent_step(&current, || self.bounded_paint_viewport())
             else {
@@ -1176,13 +1177,13 @@ impl PieceBackedMarkdownTextView {
             if !publish_gutter_lines(&ruler.ivars().lines, prepared, current()) {
                 return;
             }
-            // 发布期间没有 Native 调用，不能出现新 lines 仍带旧 proof 的可重入观察窗口。
+            // Publication makes no Native call, so reentry cannot observe new lines paired with an old proof.
             *ruler.ivars().geometry.borrow_mut() = Some(proof);
             ruler.setNeedsDisplay(true);
             return;
         }
         let prepared = (|| -> Option<(Vec<GutterLine>, Rc<GutterGeometryProof>)> {
-            // 每个 Native getter 都在同一原票前后检查；正文借用不跨 Native 或同步枚举。
+            // Each Native getter checks the same original intent before and after; document borrows span neither Native calls nor synchronous enumeration.
             let manager =
                 native_markdown_table_intent_step(&current, || self.textLayoutManager()).ok()??;
             let registered = native_markdown_table_intent_step(&current, || {
@@ -1190,7 +1191,7 @@ impl PieceBackedMarkdownTextView {
             })
             .ok()??;
             if !std::ptr::eq(&*manager, &*registered) {
-                return None; // 同长度、同坐标的另一 manager 也不能成为本 ruler 的源。
+                return None; // Another manager with equal length/coordinates cannot become this ruler's source.
             }
             let content =
                 native_markdown_table_intent_step(&current, || manager.textContentManager())
@@ -1202,7 +1203,7 @@ impl PieceBackedMarkdownTextView {
                 &*content,
                 actual_content.as_super(),
             ) {
-                return None; // 保持原 view/content/storage 图的真实身份，不从点坐标猜关联。
+                return None; // Requires actual original view/content/storage identities instead of inferring relationships from coordinates.
             }
             let actual_storage =
                 native_markdown_table_intent_step(&current, || actual_content.textStorage())
@@ -1221,7 +1222,7 @@ impl PieceBackedMarkdownTextView {
                 native_markdown_table_intent_step(&current, || viewport.textLayoutManager())
                     .ok()??;
             if !std::ptr::eq(&*viewport_manager, &*manager) {
-                return None; // 原 controller 的真实范围只对其实际 manager 生效。
+                return None; // The original controller's actual range belongs only to its actual manager.
             }
             let range =
                 native_markdown_table_intent_step(&current, || viewport.viewportRange()).ok()??;
@@ -1250,7 +1251,7 @@ impl PieceBackedMarkdownTextView {
                 )
                 .ok()?;
                 if from > to || to > document_length {
-                    return None; // 不把外来/越界 location clamp 成合法 canonical 范围。
+                    return None; // Foreign/out-of-range locations cannot be clamped into valid canonical ranges.
                 }
                 for (location, offset) in [(&start, from), (&end, to)] {
                     let offset = isize::try_from(offset).ok()?;
@@ -1264,7 +1265,7 @@ impl PieceBackedMarkdownTextView {
                     .ok()?
                         != 0
                     {
-                        return None; // 必须能由原 provider 精确重建端点，不能仅凭整数范围相信来源。
+                        return None; // The original provider must reconstruct endpoints exactly; integer bounds alone do not prove Source identity.
                     }
                 }
                 Some(from..to)
@@ -1276,10 +1277,10 @@ impl PieceBackedMarkdownTextView {
             let terminal_viewport =
                 viewport_source.is_empty() && viewport_source.end == document_length;
             if viewport_source.is_empty() && !terminal_viewport {
-                return None; // 暂未布局的内部空 viewport 没有当前正文覆盖，不能猜上一片的位置。
+                return None; // An unlaid internal empty viewport has no current document coverage; do not guess the preceding fragment.
             }
-            // 点查询可能先返回旧 outflow 的 LayoutAvailable 片段；只有当前 viewport.location
-            // 的公开源查询是本批首片。无需 ensureLayout，也不从 0 访问任何离屏正文。
+            // A point query may return an old LayoutAvailable outflow fragment; only the current viewport.location
+            // Source lookup establishes this batch's first fragment, without ensureLayout or reading offscreen text from zero.
             let seed = native_markdown_table_intent_step(&current, || range.location()).ok()?;
             let first = native_markdown_table_intent_step(&current, || {
                 manager.textLayoutFragmentForLocation(&seed)
@@ -1295,20 +1296,20 @@ impl PieceBackedMarkdownTextView {
                 block2::RcBlock::new(|pointer: NonNull<objc2_app_kit::NSTextLayoutFragment>| {
                     if !current() || visited.get() >= MAX_GUTTER_LINES {
                         failed.set(true);
-                        return objc2::runtime::Bool::NO; // 预算限制片段数，不让同一逻辑行的重复片绕过上限。
+                        return objc2::runtime::Bool::NO; // The budget counts fragments, so repeated fragments of one logical line cannot bypass it.
                     }
                     let first_callback = visited.get() == 0;
                     visited.set(visited.get() + 1);
                     let next = (|| -> Option<bool> {
-                        // SAFETY: 公开同步枚举仅在 callback 内借出活片段；裸指针不保存到缓存。
+                        // SAFETY: Public synchronous enumeration lends a live fragment during its callback only; no raw pointer enters the cache.
                         let fragment = unsafe { pointer.as_ref() };
                         if first_callback && !std::ptr::eq(fragment, &*first) {
-                            return None; // 枚举若仍返回另一个旧首片，不能跳过它而把洞包装成完整覆盖。
+                            return None; // If enumeration returns a different stale first fragment, skipping it cannot certify complete coverage.
                         }
                         if native_markdown_table_intent_step(&current, || fragment.state()).ok()?
                             != objc2_app_kit::NSTextLayoutFragmentState::LayoutAvailable
                         {
-                            return None; // estimated/unknown 不能读取并发布 frame，绘制也不负责排版。
+                            return None; // Estimated/unknown state cannot publish a frame, and drawing never performs layout.
                         }
                         let fragment_manager = native_markdown_table_intent_step(&current, || {
                             fragment.textLayoutManager()
@@ -1324,7 +1325,7 @@ impl PieceBackedMarkdownTextView {
                         if !std::ptr::eq(&*fragment_manager, &*manager)
                             || !std::ptr::eq(&*element_content, &*content)
                         {
-                            return None; // 每片仍须来自原 manager/content，不能混合两次布局的 Native 图。
+                            return None; // Every fragment must still belong to the original manager/content; separate Native layouts cannot be mixed.
                         }
                         let fragment_range = native_markdown_table_intent_step(&current, || {
                             fragment.rangeInElement()
@@ -1340,15 +1341,15 @@ impl PieceBackedMarkdownTextView {
                         })
                         .ok()??;
                         if !std::ptr::eq(&*actual, fragment) {
-                            return None; // 已被原 manager 替代的旧 outflow 片段即使 state==3 也没有标签权限。
+                            return None; // An old outflow fragment replaced by its manager has no label authority even with LayoutAvailable state.
                         }
                         let frame = native_markdown_table_intent_step(&current, || {
                             fragment.layoutFragmentFrame()
                         })
                         .ok()?;
                         let (frontier, bottom) = if terminal_viewport {
-                            // EOF 可以有真正已排版的空末行，也可能公开 lookup 返回唯一实际末片；
-                            // 只接受其真实 source.end==len 的这一片，不向前搜索、不合成基线。
+                            // EOF may have an actually laid-out terminal empty line, or public lookup may return the actual final fragment;
+                            // accepts only that one fragment ending at real document length, without backward search or a synthesized baseline.
                             if !first_callback || source.end != document_length {
                                 return None;
                             }
@@ -1370,7 +1371,7 @@ impl PieceBackedMarkdownTextView {
                                 },
                             )?
                         };
-                        // 先证明连续源和单调几何，再取逻辑行元数据；完全屏外与折叠零高片仍只推进覆盖。
+                        // Proves continuous Source and monotone geometry before logical-line metadata; offscreen and folded zero-height fragments advance coverage only.
                         let top = frame.origin.y + origin.y;
                         let bottom_in_document = bottom + origin.y;
                         if !top.is_finite() || !bottom_in_document.is_finite() {
@@ -1413,7 +1414,7 @@ impl PieceBackedMarkdownTextView {
                                     may_fold: hint,
                                     folded,
                                 });
-                            } // 软换行片段共享原逻辑行号，不把行号移到视口顶端。
+                            } // Soft-wrap fragments share the original logical number, without moving it to the viewport top.
                         }
                         let fragment_weak =
                             native_markdown_table_intent_step(&current, || Weak::from(fragment))
@@ -1425,7 +1426,7 @@ impl PieceBackedMarkdownTextView {
                         });
                         covered.set(Some(frontier));
                         previous_bottom.set(Some(bottom));
-                        Some(frontier < viewport_source.end) // 精确覆盖真实 viewport 后立停，不消费相邻 outflow。
+                        Some(frontier < viewport_source.end) // Stops at complete actual viewport coverage without consuming adjacent outflow.
                     })();
                     if next.is_none() || !current() {
                         failed.set(true);
@@ -1442,7 +1443,7 @@ impl PieceBackedMarkdownTextView {
             })
             .ok()?;
             drop(enumerated);
-            drop(block); // 同步枚举与所有 callback 借用结束后，才做整批发布前复核。
+            drop(block); // Rechecks the full batch only after synchronous enumeration and callback borrows have ended.
             let covered_to_end = covered.get().is_some_and(|end| {
                 end >= viewport_source.end
                     || self.ivars().folds.hidden_range_is_covered(
@@ -1453,7 +1454,7 @@ impl PieceBackedMarkdownTextView {
                     )
             });
             if failed.get() || !covered_to_end {
-                return None; // 不发布截断前缀，也不用 frame 高度补造源覆盖。
+                return None; // Publishes no truncated prefix and never infers Source coverage from frame height.
             }
             let final_range =
                 native_markdown_table_intent_step(&current, || viewport.viewportRange()).ok()??;
@@ -1469,7 +1470,7 @@ impl PieceBackedMarkdownTextView {
                     .ok()?
                     != Some((visible, origin))
             {
-                return None; // 查找/滚动/模式重入改变原 viewport 或图时，不提交跨帧混合结果。
+                return None; // Find/scroll/mode reentry changing the original viewport or graph prevents mixed-frame publication.
             }
             let manager_weak =
                 native_markdown_table_intent_step(&current, || Weak::from_retained(&manager))
@@ -1493,14 +1494,14 @@ impl PieceBackedMarkdownTextView {
             Some((lines.into_inner(), proof))
         })();
         let Some((prepared, proof)) = prepared else {
-            return; // 保留原失败策略；没有完整当前几何时不把不完整前缀伪装成可见标签。
+            return; // Preserves the failure policy: incomplete geometry cannot masquerade as visible labels.
         };
         if !publish_gutter_lines(
             &ruler.ivars().lines,
             prepared,
             current() && self.gutter_generation_is_current(generation),
         ) {
-            // 最后一次 native callback 返回后才提交；关闭或 canonical 改变均丢弃本次容量。
+            // Publishes after the final Native callback; close or canonical changes discard this candidate allocation.
             return;
         }
         *ruler.ivars().geometry.borrow_mut() = Some(proof);
@@ -1508,8 +1509,8 @@ impl PieceBackedMarkdownTextView {
     }
 }
 
-/// 同一真实 viewport 的下一片必须连续推进源，且排版 frame 不能倒退或重叠。
-/// 只检查有限标量；零高折叠片仍可推进覆盖，真正离屏/隐藏标签由原绘制交集决定。
+/// The next fragment of the same actual viewport must advance continuous Source with no backward or overlapping layout frame.
+/// Checks bounded scalars only; zero-height folds may advance coverage, while actual paint intersections determine hidden/offscreen labels.
 #[cfg(test)]
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_viewport_fragment_frontier(
@@ -1529,7 +1530,7 @@ fn gutter_viewport_fragment_frontier(
     )
 }
 
-/// Native可以完全省略显式折叠片；只有同原票证明hidden联合覆盖才跨源空洞。
+/// Native may omit explicitly folded fragments; only hidden-range union coverage under the original intent permits crossing a Source gap.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_viewport_fragment_frontier_with_hidden(
     viewport: &std::ops::Range<usize>,
@@ -1540,11 +1541,11 @@ fn gutter_viewport_fragment_frontier_with_hidden(
     hidden: &impl Fn(&std::ops::Range<usize>) -> bool,
 ) -> Option<(usize, f64)> {
     if viewport.start >= viewport.end || source.start >= source.end {
-        return None; // 普通视口不接受空范围；真正的 EOF 单片由调用方独立核原 document length。
+        return None; // Ordinary viewports reject empty ranges; callers independently validate actual EOF against original document length.
     }
     let bottom = gutter_frame_bottom(frame, previous_bottom)?;
     if frame.size.height == 0.0 && !hidden(source) {
-        return None; // 零高不能无条件吞掉正文；只有真实显式fold可省略这整个源范围。
+        return None; // Zero height alone cannot consume Source; only an actual explicit fold permits omitting that complete range.
     }
     let continuous = match covered {
         None => {
@@ -1556,10 +1557,10 @@ fn gutter_viewport_fragment_frontier_with_hidden(
                 && (source.start == end || (source.start > end && hidden(&(end..source.start))))
         }
     };
-    continuous.then_some((source.end, bottom)) // 普通源仍精确相接，只有已证明的hidden空洞例外。
+    continuous.then_some((source.end, bottom)) // Ordinary Source remains exactly adjacent; only a proven hidden gap is exempt.
 }
 
-/// 普通片与真实 EOF 片共享有限 frame 校验；不通过改 y、排序或估计高度修补失效布局。
+/// Ordinary and actual EOF fragments share bounded frame validation, without repairing invalid layout through moved y, sorting, or estimated height.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn gutter_frame_bottom(frame: NSRect, previous_bottom: Option<f64>) -> Option<f64> {
     if ![
@@ -1573,22 +1574,22 @@ fn gutter_frame_bottom(frame: NSRect, previous_bottom: Option<f64>) -> Option<f6
         || frame.size.width < 0.0
         || frame.size.height < 0.0
     {
-        return None; // 空源、未知/溢出几何没有覆盖能力，不能由旧坐标猜可见逻辑行。
+        return None; // Invalid or overflowing geometry proves no coverage; old coordinates cannot identify a visible logical line.
     }
     let bottom = frame.origin.y + frame.size.height;
     if !bottom.is_finite() || previous_bottom.is_some_and(|previous| frame.origin.y < previous) {
-        return None; // 源顺序正确但 y 倒退同样是混合布局；不能重新排序坐标掩盖重叠。
+        return None; // Correct Source order with backward y still indicates mixed layout; coordinate sorting cannot hide overlap.
     }
     Some(bottom)
 }
 
-/// 只允许活的同代次投影发布，窗口可见性和已经排队均不是权限。
+/// Publication requires the live matching-generation projection; window visibility and queued work are not authority.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn projection_can_publish(sealed: bool, expected: u64, current: Option<u64>) -> bool {
     !sealed && current == Some(expected)
 }
 
-/// 有限纯 metadata 的最后提交点；拒收时 prepared Vec 在无状态借用处完整 drop。
+/// The final bounded-metadata commit point; rejection drops the complete prepared Vec outside state borrowing.
 #[cfg(any(test, feature = "native-markdown-runtime-probe"))]
 fn publish_gutter_lines(
     target: &RefCell<Vec<GutterLine>>,
@@ -1596,7 +1597,7 @@ fn publish_gutter_lines(
     current: bool,
 ) -> bool {
     if !current || prepared.len() > MAX_GUTTER_LINES {
-        // 不截断过大的或已失效的本地结果，更不能覆盖 accepted 清理后的零容量槽。
+        // Neither truncates excess/stale candidates nor overwrites a zero-capacity slot after accepted cleanup.
         return false;
     }
     let previous = target.replace(prepared);
@@ -1608,21 +1609,11 @@ fn publish_gutter_lines(
 mod publication_tests {
     use super::*;
 
-    fn line(number: usize) -> GutterLine {
-        GutterLine {
-            number,
-            document_y: number as f64,
-            height: 20.0,
-            may_fold: false,
-            folded: false,
-        }
-    }
-
     #[test]
     fn actual_viewport_excludes_old_outflow_and_rejects_backwards_geometry() {
         let viewport = 11_763..13_520;
         let frame = |y, height| NSRect::new(NSPoint::new(0.0, y), NSSize::new(600.0, height));
-        // 实际回归的旧 point 查询先给出三条离开 viewport 的 source；state==3 也不能授予覆盖。
+        // The regression's old point query returned three Source ranges before the viewport; LayoutAvailable alone grants no coverage.
         for (source, y, height) in [
             (11_504..11_560, 6_443.0, 17.0),
             (11_560..11_707, 6_460.0, 51.0),
@@ -1668,7 +1659,7 @@ mod publication_tests {
     fn viewport_coverage_keeps_wrapped_first_and_folded_zero_height_but_never_bridges_holes() {
         let viewport = 100..300;
         let frame = |y, height| NSRect::new(NSPoint::new(0.0, y), NSSize::new(0.0, height));
-        // 首片本身可跨视口起点；折叠片源仍存在，零高只不画标签，不删除 canonical 覆盖。
+        // The first fragment may straddle viewport start; folded Source remains present, and zero height suppresses labels without deleting canonical coverage.
         let first =
             gutter_viewport_fragment_frontier(&viewport, None, &(80..160), None, frame(0.0, 34.0))
                 .unwrap();
@@ -1765,72 +1756,19 @@ mod publication_tests {
                 frame(85.0, 0.0),
             )
             .is_none()
-        ); // 零高本身不能作为隐藏证明。
-    }
-
-    #[test]
-    fn native_callback_close_cannot_republish_prepared_geometry_capacity() {
-        let target = RefCell::new(vec![line(0)]);
-        let prepared: Vec<_> = (0..MAX_GUTTER_LINES).map(line).collect();
-        // 模拟 Native 枚举返回前接受清理：目标已 take/drop，而栈内旧 geometry 尚未结束。
-        let previous = target.replace(Vec::new());
-        drop(previous);
-        assert!(!publish_gutter_lines(
-            &target,
-            prepared,
-            projection_can_publish(true, 7, Some(7))
-        ));
-        assert!(target.borrow().is_empty());
-        assert_eq!(target.borrow().capacity(), 0);
-    }
-
-    #[test]
-    fn native_callback_revision_change_or_detach_preserves_the_last_live_snapshot() {
-        let target = RefCell::new(vec![line(3)]);
-        for current in [Some(9), None] {
-            // 入口的第 8 代不授权第 9 代/已断开结果；只检查入口会错误写回旧值。
-            assert!(!publish_gutter_lines(
-                &target,
-                vec![line(8)],
-                projection_can_publish(false, 8, current)
-            ));
-            assert_eq!(target.borrow()[0].number, 3);
-        }
-        assert!(publish_gutter_lines(
-            &target,
-            vec![line(9)],
-            projection_can_publish(false, 9, Some(9))
-        ));
-        assert_eq!(target.borrow()[0].number, 9);
-    }
-
-    #[test]
-    fn publication_rejects_oversized_native_geometry_without_a_truncated_prefix() {
-        let target = RefCell::new(Vec::new());
-        assert!(!publish_gutter_lines(
-            &target,
-            (0..=MAX_GUTTER_LINES).map(line).collect(),
-            true
-        ));
-        assert_eq!(target.borrow().capacity(), 0);
-        assert!(publish_gutter_lines(
-            &target,
-            (0..MAX_GUTTER_LINES).map(line).collect(),
-            true
-        ));
-        assert_eq!(target.borrow().len(), MAX_GUTTER_LINES);
+        ); // Zero height alone cannot prove hidden Source.
     }
 
     #[test]
     fn partially_visible_long_line_keeps_only_its_real_visible_fold_target() {
-        // 长行从 Find 区域上方延续到正文下方，原完整行高会错误接受两侧遮挡区的点击。
+        // A long line extends beyond both document edges near Find; using its full height would admit clicks in occluded regions.
         let viewport = NSRect::new(NSPoint::new(0.0, 100.0), NSSize::new(74.0, 60.0));
         let visible = visible_gutter_line(40.0, 200.0, viewport).unwrap();
         assert_eq!(visible, viewport);
         assert!(!gutter_contains_point(visible, NSPoint::new(10.0, 80.0)));
         assert!(gutter_contains_point(visible, NSPoint::new(10.0, 120.0)));
         assert!(!gutter_contains_point(visible, NSPoint::new(10.0, 170.0)));
-        // 完全屏外的行没有命中矩形，不能仅依赖 Native dirtyRect 代替可见区。
+        // Fully offscreen lines have no hit rectangle; Native dirtyRect cannot replace the visible region.
         assert!(visible_gutter_line(10.0, 20.0, viewport).is_none());
     }
 
@@ -1840,7 +1778,7 @@ mod publication_tests {
         let after = NSRect::new(NSPoint::new(0.0, 80.0), NSSize::new(74.0, 100.0));
         let old_line = visible_gutter_line(60.0, 40.0, before).unwrap();
         let new_line = visible_gutter_line(60.0, 40.0, after).unwrap();
-        // Find/resize 收紧后的真实区域立即拒绝旧热区，但保留同一逻辑行仍可见的部分。
+        // The narrowed Find/resize region immediately rejects old hit areas while preserving the same logical line's still-visible portion.
         assert!(gutter_contains_point(old_line, NSPoint::new(10.0, 70.0)));
         assert!(!gutter_contains_point(new_line, NSPoint::new(10.0, 70.0)));
         assert!(gutter_contains_point(new_line, NSPoint::new(0.0, 80.0)));

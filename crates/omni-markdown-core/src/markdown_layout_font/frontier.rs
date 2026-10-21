@@ -1,4 +1,4 @@
-//! 同一个原字体owner与已验证选项的计划，不用PSName、role或同名字体重建来源。
+//! Bind a shaping plan to its original font owner/options without rebuilding source authority from PSName, role, or same-name fonts.
 
 use harfrust::{
     AsciiFrontierCapability, AsciiFrontierRejection, Direction, Feature, Language, Script,
@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::{MarkdownLayoutFont, MarkdownLayoutFontAuthority};
 
-/// 计划由唯一frontier owner持有；子任务暂借原计划执行，不能换成同名字体的另一计划。
+/// The frontier owns this original plan; child jobs borrow it rather than substituting a plan for another same-name font.
 pub(crate) struct FontFrontierPlan {
     plan: Arc<harfrust::ShapePlan>,
     capability: Option<AsciiFrontierCapability>,
@@ -25,15 +25,15 @@ impl FontFrontierPlan {
         features: &[Feature],
     ) -> Result<Self, AsciiFrontierRejection> {
         if !font.permits(authority) {
-            return Err(AsciiFrontierRejection::LookupUnavailable); // 原调用方另报精确FontMismatch。
+            return Err(AsciiFrontierRejection::LookupUnavailable); // The original caller separately reports its precise FontMismatch.
         }
         let plan =
             harfrust::ShapePlan::new(font.font(), direction, Some(script), language, features);
         let (capability, local) = match plan.ascii_frontier_capability(font.font()) {
             Ok(capability) => (Some(capability), false),
             Err(_) => {
-                // 这里只取得尚未完成的局部证书游标构造资格；绝不把它伪装成已通过
-                // 单输入查表。实际可达闭包和支持半径仍须原frontier逐记录完成。
+                // Establish only eligibility to construct an unfinished local-certificate job, not completed single-input lookup proof.
+                // The original frontier still visits actual records to establish reachable closure and supported radius.
                 plan.ascii_local_frontier_job(font.font())?;
                 (None, true)
             }
@@ -47,7 +47,7 @@ impl FontFrontierPlan {
     }
 
     pub(crate) fn capability(&self) -> Option<AsciiFrontierCapability> {
-        self.capability // 固定元数据不是另一个可构造源票；实际plan仍只在本owner中。
+        self.capability // Fixed metadata cannot manufacture another source ticket; the actual plan remains bound to this owner.
     }
 
     pub(crate) fn requires_local_certificate(&self) -> bool {
@@ -59,6 +59,7 @@ impl FontFrontierPlan {
         font: &MarkdownLayoutFont,
         bounds: (u8, u8),
     ) -> Result<harfrust::AsciiLocalFrontierJob, AsciiFrontierRejection> {
+        // Only the admitted local path and same original font may start this finite actual input-domain certificate.
         if !self.local || !self.permits_font(font) {
             return Err(AsciiFrontierRejection::LookupUnavailable);
         }
@@ -74,6 +75,7 @@ impl FontFrontierPlan {
         &self,
         font: &MarkdownLayoutFont,
     ) -> Result<harfrust::SimpleGcbFrontierJob, AsciiFrontierRejection> {
+        // The plan's GCB proof still belongs to its original font allocation, even if another font shares all bytes/options.
         if !self.permits_font(font) {
             return Err(AsciiFrontierRejection::LookupUnavailable);
         }
@@ -81,7 +83,7 @@ impl FontFrontierPlan {
     }
 
     pub(crate) fn permits_font(&self, font: &MarkdownLayoutFont) -> bool {
-        // 同script/features甚至同字节的Font也不能借原计划证明；这里只保弱owner身份。
+        // Equal script/features or even identical font bytes cannot borrow this plan's proof; retain original weak owner identity only.
         font.permits(&self.font)
     }
 }

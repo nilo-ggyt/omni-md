@@ -1,4 +1,4 @@
-//! 绑定实际字号的内部定位尺度与设计轴等价证明；不改变通用字体的既有量化合同。
+//! Bind precise positioning scale and design-axis equivalence to actual point size, preserving the general font's original quantization contract.
 use read_fonts::{
     TableProvider,
     types::{F2Dot14, Fixed, Tag},
@@ -7,6 +7,7 @@ use read_fonts::{
 use super::{MarkdownLayoutFont, MarkdownLayoutFontError as Error, Result};
 
 pub(super) fn validate_points(points: f64) -> Result<()> {
+    // Validate the original double value against the representable 26.6 range; never saturate invalid input into a usable size.
     let scale = (points * 64.0).round();
     if !points.is_finite() || points <= 0.0 || scale < 1.0 || scale > f64::from(i32::MAX) {
         return Err(Error::InvalidPointSize);
@@ -14,19 +15,19 @@ pub(super) fn validate_points(points: f64) -> Result<()> {
     Ok(())
 }
 
-/// 固定最多2^14倍内部精度；大字号逐级降低因子，保留原接口全部有效字号范围。
-/// 基础advance、GPOS、kerx与trak都在同一个细尺度内相加，最终glyph出口才统一量化。
+/// Use at most 2^14 internal precision, reducing the factor for larger sizes to retain the original valid size range.
+/// Nominal advances, GPOS, kerx, and trak accumulate on one fine scale before final glyph-output quantization.
 pub(crate) fn scale(font: &MarkdownLayoutFont, points: f32, legacy: i32) -> Result<(i32, i32)> {
     let Some(bound) = font.shaping_point_size() else {
-        return Ok((legacy, 1)); // 原Font默认路径与原HarfBuzz oracle逐位一致。
+        return Ok((legacy, 1)); // The general Font path remains bit-for-bit aligned with the original HarfBuzz oracle.
     };
     if (bound as f32).to_bits() != points.to_bits() {
-        return Err(Error::InvalidPointSize); // 同face另一个字号不取得本实例定位权限。
+        return Err(Error::InvalidPointSize); // Another size for the same face cannot acquire this instance's positioning authority.
     }
     bound_scale(bound)
 }
 
-/// 字号绑定与平台纯值推进共用同一内部尺度；不能各自舍入后再在绘图端修补差值。
+/// Bound size and platform pure-value advances share one internal scale; do not round them separately and patch differences while drawing.
 pub(super) fn bound_scale(bound: f64) -> Result<(i32, i32)> {
     let mut divisor = 1_i32 << 14;
     loop {
@@ -35,7 +36,7 @@ pub(super) fn bound_scale(bound: f64) -> Result<(i32, i32)> {
             return Ok((scaled as i32, divisor));
         }
         if divisor == 1 {
-            return Err(Error::InvalidPointSize); // 不能饱和成另一有效尺度。
+            return Err(Error::InvalidPointSize); // Do not saturate into a different valid scale.
         }
         divisor /= 2;
     }
@@ -49,6 +50,7 @@ pub(super) fn verify_design_coordinates(
         return Err(Error::VariationBudgetExceeded);
     }
     for (index, (tag, value)) in coordinates.iter().enumerate() {
+        // Only actual unique finite axes can enter normalization; source identity is already bound to this Font instance.
         if !value.is_finite() || coordinates[..index].iter().any(|(prior, _)| prior == tag) {
             return Err(Error::InvalidAxisValue);
         }
@@ -57,7 +59,7 @@ pub(super) fn verify_design_coordinates(
         }
     }
     if font.metadata().axes.is_empty() {
-        return Ok(()); // 静态face只能接受空轴集合；上方已拒绝所有外来tag。
+        return Ok(()); // Static faces accept only an empty axis set; every foreign tag was rejected above.
     }
     let fvar = font
         .font()
@@ -74,7 +76,7 @@ pub(super) fn verify_design_coordinates(
             .find(|axis| axis.axis_tag().to_be_bytes() == *tag)
             .ok_or(Error::UnknownAxis)?;
         if *value < axis.min_value().to_f64() || *value > axis.max_value().to_f64() {
-            return Err(Error::InvalidAxisValue); // 不用fvar的默认夹取隐藏Native原值越界。
+            return Err(Error::InvalidAxisValue); // fvar's normal clamping must not hide out-of-range original Native values.
         }
     }
     let avar = if font.font().tables().avar_data().is_some() {
@@ -85,9 +87,10 @@ pub(super) fn verify_design_coordinates(
                 .map_err(|_| Error::InvalidVariationTable)?,
         )
     } else {
-        None // 真正缺表才没有重映射；损坏的实际表不能按缺失继续证明等价。
+        None // Only actual table absence means no remapping; a corrupt present table cannot be treated as missing.
     };
     let mut expected = [F2Dot14::ZERO; 32];
+    // Normalize original f64 coordinates through actual fvar/avar, then compare exact quantized positions rather than an epsilon in design space.
     fvar.user_to_normalized(
         avar.as_ref(),
         coordinates

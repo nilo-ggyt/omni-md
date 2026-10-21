@@ -1,4 +1,4 @@
-//! 原 ruler 仍负责全部背景、标签和折叠标记；这里只替换有限绘图目标与 backing 发布。
+//! The reference ruler still owns backgrounds, labels, and fold markers; this explicit raster path replaces only its bounded drawing target and backing publication.
 
 use super::*;
 use crate::native_surface::raster_surface::{
@@ -10,8 +10,8 @@ use objc2_core_foundation::CGAffineTransform;
 use objc2_core_graphics::{CGContext, CGImage};
 use objc2_quartz_core::{CALayer, CATransaction, kCAContentsFormatRGBA8Uint, kCAGravityResize};
 
-/// 只有实际启用了同一正文 Raster 才安装；没有正文、图像或另一个资源计数器。
-/// 原 contents 仅为恢复既有 Native 关系保留，原来为 nil 时不制造占位图。
+/// Installs only with the same document's explicitly enabled Raster; retains no document text/image or independent resource counter.
+/// Retains original contents only to restore the existing Native relationship; an originally nil value creates no placeholder image.
 pub(super) struct GutterRaster {
     ruler: Weak<NativeMarkdownGutter>,
     view: Weak<PieceBackedMarkdownTextView>,
@@ -36,8 +36,8 @@ pub(super) struct GutterRaster {
     active: RefCell<Option<Rc<PaintAuthority>>>,
 }
 
-/// 只存在于一次同步 updateLayer 栈；持有的 Native 值在当前调用退出前全部归还。
-/// 原 OriginPermit 同时约束正文、字体、模式、选择和几何事件，绝不补领较新票。
+/// Exists on one synchronous updateLayer stack; all Native claims return before that call ends.
+/// The original OriginPermit covers document, font, mode, selection, and geometry events without acquiring newer authority.
 struct PaintAuthority {
     lease: Rc<GutterRaster>,
     owner: Rc<NativeMarkdownRasterSurface>,
@@ -45,7 +45,7 @@ struct PaintAuthority {
     view: Retained<PieceBackedMarkdownTextView>,
     capture: NativeMarkdownSelectionCapture,
     lines: Vec<GutterLine>,
-    // 固定刷新时的真实文档视口/片段批次，不能让同代次旧 labels 借新绘制票重新发布。
+    // Fixes the actual document viewport/fragment batch from refresh, so old same-generation labels cannot republish under a new paint intent.
     proof: Rc<GutterGeometryProof>,
     attributes: Rc<Retained<MarkdownTextAttributes>>,
     bounds: NSRect,
@@ -59,7 +59,7 @@ struct PaintAuthority {
     published_image: Cell<Option<NonNull<CGImage>>>,
 }
 
-/// graphics slot 是线程局部原生状态；失败撤权也必须恢复原值，不能把 CPU context 留给窗口。
+/// The graphics slot is thread-local Native state; failure/revocation still restores its original value instead of leaving a CPU context for the window.
 struct GraphicsRestore(Option<Retained<NSGraphicsContext>>);
 impl Drop for GraphicsRestore {
     fn drop(&mut self) {
@@ -67,7 +67,7 @@ impl Drop for GraphicsRestore {
     }
 }
 
-/// active 只借给同步的原 drawHashMarks 回调；先移出槽，再释放全部 Native 临时 claim。
+/// Lends active authority only to synchronous original drawHashMarks callbacks; takes the slot before releasing Native temporaries.
 struct ActivePaint<'a>(&'a GutterRaster);
 impl Drop for ActivePaint<'_> {
     fn drop(&mut self) {
@@ -77,7 +77,7 @@ impl Drop for ActivePaint<'_> {
     }
 }
 
-/// 即使中途撤权也要配平 begin/commit；该清理不据此签任何发布成功收据。
+/// Balances begin/commit even after revocation; cleanup itself certifies no successful publication.
 struct Transaction;
 impl Drop for Transaction {
     fn drop(&mut self) {
@@ -86,6 +86,8 @@ impl Drop for Transaction {
 }
 
 impl GutterRaster {
+    /// Captures original public backing settings before installing this reference-only CPU target;
+    /// partial construction remains owned by the local lease and uses the same restoration path.
     pub(super) fn install(
         ruler: &NativeMarkdownGutter,
         view: &PieceBackedMarkdownTextView,
@@ -103,22 +105,22 @@ impl GutterRaster {
                     .as_ref()
                     .is_some_and(|actual| Rc::ptr_eq(actual, owner))
         };
-        // 构造尚未绑定活 session，不能伪造选择票；这里仅检查原构造仍拥有同一 view/Raster。
+        // Construction has no live session selection intent; checks only that the original construction still owns the same view/Raster.
         let previous_wants_layer = construction_step(&current, || ruler.wantsLayer())?;
         let previous_redraw = construction_step(&current, || ruler.layerContentsRedrawPolicy())?;
         let previous_layer = construction_step(&current, || ruler.layer())?;
         let previous_weak = match previous_layer.as_deref() {
             Some(layer) => Some(construction_step(&current, || Weak::from(layer))?),
-            None => None, // 原 nil 关系最终必须恢复为 nil。
+            None => None, // The originally nil relationship must ultimately return to nil.
         };
         let previous_contents = match previous_layer.as_deref() {
-            // SAFETY: 当前主线程 CALayer 的公开 contents 值只为恢复原关系保留；不解释其类型。
+            // SAFETY: Retains this main-thread CALayer's public contents solely for relationship restoration, without interpreting its type.
             Some(layer) => construction_step(&current, || unsafe { layer.contents() })?,
             None => None,
         };
         let previous_format = match previous_layer.as_ref() {
             Some(layer) => Some(construction_step(&current, || layer.contentsFormat())?),
-            None => None, // 原无层时没有需要恢复的层配置，不能为快照另造一个CALayer。
+            None => None, // An originally absent layer has no settings to restore; snapshotting must not create another CALayer.
         };
         let previous_gravity = match previous_layer.as_ref() {
             Some(layer) => Some(construction_step(&current, || layer.contentsGravity())?),
@@ -153,9 +155,9 @@ impl GutterRaster {
             geometry_logs: Cell::new(0),
             active: RefCell::new(None),
         };
-        // 必须先且仅由wantsLayer让AppKit创建真正layer-backed层。先setLayer再wantsLayer会成为
-        // layer-hosting view，AppKit不再负责updateLayer；这正是缓存已刷新但74pt栏一直空白的原因。
-        // 此处不调用setLayer安装自有层，关闭恢复仍只操作下方捕获的真实backing身份。
+        // Lets wantsLayer alone create actual AppKit layer backing. Calling setLayer first would create a
+        // layer-hosting view without AppKit updateLayer delivery, which caused the refreshed 74-point ruler to remain blank.
+        // Installs no custom layer here; closure restores only the actual backing identities captured below.
         construction_step(&current, || ruler.setWantsLayer(true))?;
         let layer = construction_step(&current, || ruler.layer())?
             .ok_or("源码行号未取得AppKit实际backing层")?;
@@ -165,8 +167,8 @@ impl GutterRaster {
                 ledger.include("editor.raster.gutter-layer", &layer)
             })??;
         }
-        // 公开合同规定该flag为true会忽略wantsUpdateLayer并建立drawRect显示列表；此独立栏明确保留
-        // 自己的CPU contents入口，不把下层窗口绘制重新引回accelerated-CG。
+        // A true flag would bypass wantsUpdateLayer and build a drawRect display list; this separate ruler
+        // keeps its CPU contents entry instead of routing window drawing back through accelerated Core Graphics.
         construction_step(&current, || ruler.setCanDrawSubviewsIntoLayer(false))?;
         construction_step(&current, || {
             ruler.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::OnSetNeedsDisplay)
@@ -189,7 +191,7 @@ impl GutterRaster {
 
     pub(super) fn invalidate_geometry(&self) {
         if !self.finished.get() {
-            // 与正文共用原几何代次；只撤原票，不增加调度器或第二个几何 authority。
+            // Shares the document's original geometry epoch, revoking authority without another scheduler or geometry owner.
             self.resources.invalidate_geometry();
         }
     }
@@ -198,14 +200,14 @@ impl GutterRaster {
         self.active.borrow().is_some()
     }
 
-    /// 原绘制函数逐 Native 原语调用本入口；没有同步 CPU 原票时禁止走窗口绘图旁路。
+    /// The original drawing loop guards each Native primitive here; absent synchronous CPU authority, no window-drawing bypass is permitted.
     pub(super) fn drawing_step<T>(
         &self,
         ruler: &NativeMarkdownGutter,
         work: impl FnOnce() -> T,
     ) -> Option<T> {
         let auth = self.active.borrow().clone();
-        let auth = auth?; // 只接受当前原 super drawRect 同步回调，不能自行新建权限。
+        let auth = auth?; // Accepts only the current original super drawRect callback, without creating authority.
         match auth.step(ruler, work) {
             Ok(value) => Some(value),
             Err(error) => {
@@ -230,16 +232,16 @@ impl GutterRaster {
                     eprintln!("native_raster_surface event=gutter_draw_geometry dirty={:?} viewport={:?} first_line_number_document_y_ruler_y_height={:?} cached_lines={} outside_viewport={} outside_damage={} drawn_labels={} formal=false", facts.dirty, facts.viewport, facts.first_line, auth.lines.len(), facts.outside_viewport, facts.outside_damage, auth.drawn_labels.get());
                 }
             }
-            // 只标记原循环完整返回；实际标签/屏外交集另作事实输出，不能据此宣称可见覆盖正确。
+            // Records only complete return of the original loop; actual label/clip facts are separate and this alone proves no correct visible coverage.
             auth.draw_completed.set(true);
         }
     }
 
-    /// 只累计本次真实 drawAtPoint 已沿原票返回的标签，不把缓存长度冒充已画行数。
+    /// Counts only this intent's actually returned drawAtPoint calls, never substituting cache length for painted labels.
     pub(super) fn record_drawn_label(&self) {
         if let Some(auth) = self.active.borrow().as_ref() {
             auth.drawn_labels.set(auth.drawn_labels.get() + 1);
-        } // 没有同步 CPU 原绘图栈时不记录后继或窗口旁路的绘制。
+        } // Without the original synchronous CPU stack, records neither successor drawing nor a window bypass.
     }
 
     fn pending(&self, reason: &'static str) -> Result<bool, String> {
@@ -248,9 +250,11 @@ impl GutterRaster {
             self.pending_logs.set(count + 1);
             native_markdown_trace! { eprintln!("native_raster_surface event=gutter_pending reason={reason} formal=false"); }
         }
-        Ok(false) // 只解释本次没有绘制/发布，绝不是完成收据，也不追加timer或重试任务。
+        Ok(false) // Reports no drawing/publication for this call; grants no completion receipt and schedules no timer or retry.
     }
 
+    /// Paints one original geometry proof into a private bounded bitmap and publishes only after
+    /// the actual draw completes; Pending grants no coverage and schedules no replacement work.
     pub(super) fn paint(
         self: &Rc<Self>,
         ruler: &NativeMarkdownGutter,
@@ -262,14 +266,14 @@ impl GutterRaster {
             native_markdown_trace! { eprintln!("native_raster_surface event=gutter_callback_received entry={entry} formal=false"); }
         }
         if self.finished.get() || !self.resources.is_open() {
-            return self.pending("closed"); // accepted 后迟到的空壳回调不能恢复任何业务资源。
+            return self.pending("closed"); // A late shell callback after acceptance cannot restore business resources.
         }
         if self.painting.replace(true) {
             return Err("源码行号光栅绘制发生同步重入".into());
         }
         let _active = ActivePaint(self);
         let _operation = self.resources.operation()?;
-        // 首个 Native Weak.load 前固定原纯 Rust 选择/owner 票和有限缓存，不靠 getter 重签。
+        // Fixes original pure Rust selection/owner authority and bounded cache before the first Native Weak load, without renewal from getters.
         let Some(folds) = self.folds.upgrade() else {
             return self.pending("fold_owner_unavailable");
         };
@@ -285,7 +289,7 @@ impl GutterRaster {
             return self.pending("gutter_attributes_unavailable");
         };
         if lines.is_empty() {
-            return self.pending("visible_line_cache_empty"); // 没有原逻辑行时不发布一张缺标签的空图。
+            return self.pending("visible_line_cache_empty"); // Without original logical lines, publishes no blank image missing its labels.
         }
         if lines.len() > MAX_GUTTER_LINES {
             return Err("源码行号缓存超出原有限上限".into());
@@ -295,7 +299,7 @@ impl GutterRaster {
             .ok_or("源码行号原 view 已释放")?;
         let _payload = PayloadUseGuard::enter(&view.ivars().payload_use_depth);
         if !ruler.cached_geometry_is_current(&view, &capture, &proof, "raster_admission") {
-            return self.pending("visible_geometry_proof_stale"); // 只拒绝本次发布，不清空旧图像或假装刷新完成。
+            return self.pending("visible_geometry_proof_stale"); // Rejects only this publication, without clearing the old image or claiming a completed refresh.
         }
         let Some(owner) = self.owner.upgrade() else {
             return self.pending("raster_owner_unavailable");
@@ -308,7 +312,7 @@ impl GutterRaster {
         let Some((viewport, generation)) =
             owner.auxiliary_step(&view, &permit, || ruler.source_viewport(&view))?
         else {
-            return self.pending("source_viewport_unavailable"); // Preview/未挂窗/空交集都不签已画好的结果。
+            return self.pending("source_viewport_unavailable"); // Preview, an unmounted window, or an empty intersection certifies no completed drawing.
         };
         let bounds = owner.auxiliary_step(&view, &permit, || ruler.bounds())?;
         let Some(window) = owner.auxiliary_step(&view, &permit, || ruler.window())? else {
@@ -361,7 +365,7 @@ impl GutterRaster {
         })?;
         auth.step(ruler, || CGContext::clip_to_rect(Some(context), bounds))?;
         *self.active.borrow_mut() = Some(Rc::clone(&auth));
-        // 临时 NSGraphicsContext 必须在 finish 前真实归还 CG context；原 provider 要求冻结后无写者。
+        // Temporary NSGraphicsContext claims must return the CG context before finish; the original provider requires no writer after freezing.
         autoreleasepool(|_| -> Result<(), String> {
             let raster = auth.step(ruler, || {
                 NSGraphicsContext::graphicsContextWithCGContext_flipped(context, true)
@@ -373,14 +377,14 @@ impl GutterRaster {
                 NSGraphicsContext::setCurrentContext(Some(&raster))
             })?;
             auth.step(ruler, || ruler.draw_native_for_raster(bounds))?;
-            drop(restore); // 先恢复线程原槽，再归还临时 CPU context。
+            drop(restore); // Restores the thread's original slot before returning the temporary CPU context.
             drop(raster);
             auth.validate_geometry(ruler)
         })?;
         let active = self.active.borrow_mut().take();
-        drop(active); // super 的所有同步回调已经结束，不让 active 槽延长 Native claim。
+        drop(active); // All synchronous superclass callbacks have ended; the active slot must not extend Native claims.
         if !auth.draw_completed.get() {
-            return self.pending("native_hash_marks_incomplete"); // 原绘制提前退出时不发布缺少标签的图像。
+            return self.pending("native_hash_marks_incomplete"); // An early original-draw exit cannot publish an image missing labels.
         }
         if !auth.step(ruler, || {
             ruler.cached_geometry_is_current(
@@ -410,7 +414,7 @@ impl GutterRaster {
         if emitted < 8 {
             self.paint_logs.set(emitted + 1);
             native_markdown_trace! {
-                // 只复用已验证的绘制与发布结果；这不是截图、命中或整产品功能通过收据。
+                // Reports only already-validated drawing/publication facts, without claiming screenshot, hit-testing, or whole-product acceptance.
                 eprintln!("native_raster_surface event=gutter_published ordinal={} drawn_labels={} cached_lines={} bounds={:?} scale={} formal=false", emitted + 1, auth.drawn_labels.get(), auth.lines.len(), auth.bounds, auth.scale);
             }
         }
@@ -424,7 +428,7 @@ impl GutterRaster {
 
     pub(super) fn restore(&self) -> Result<(), String> {
         if self.finished.replace(true) {
-            return Ok(()); // 幂等仅约束本同步清理；真实 nil/像素收据仍由原门禁判断。
+            return Ok(()); // Idempotence covers this synchronous cleanup only; the original boundary still verifies actual nil/pixel receipts.
         }
         let result = self.restore_once();
         if result.is_err() {
@@ -433,6 +437,8 @@ impl GutterRaster {
         result
     }
 
+    /// Restores only captured layer/view relationships. An active draw or externally replaced
+    /// relationship remains failure rather than permission to overwrite another owner's graph.
     fn restore_once(&self) -> Result<(), String> {
         if self.active.borrow().is_some() || self.painting.get() {
             return Err("源码行号仍有同步绘制，不能提前恢复 backing".into());
@@ -453,17 +459,17 @@ impl GutterRaster {
                 construction_step(&current, || layer.load())?
                     .ok_or("本次 ruler backing 已失去原身份")?,
             ),
-            None => None, // 尚未取得AppKit层的构造失败没有可以冒认的已安装身份。
+            None => None, // Construction failing before acquiring an AppKit layer has no installed identity to claim.
         };
         let actual = construction_step(&current, || ruler.layer())?;
-        // 构造尚未设置层就失败时，actual 可能仍是精确原层；只接受这两个预先固定的身份。
+        // If construction failed before changing backing, actual may still be the exact original layer; accepts only these two captured identities.
         if !same_layer(actual.as_deref(), installed.as_deref())
             && !same_layer(actual.as_deref(), original.as_deref())
         {
             return Err("源码行号 backing 已被替换，不覆盖后继 Native 关系".into());
         }
         if let Some(layer) = actual.as_deref().filter(|_| installed.is_some()) {
-            // SAFETY: 只恢复本次原层的 contents；不会修改图像/provider 或让仍存活的不可变值变空。
+            // SAFETY: Restores only this original layer's contents, without mutating the image/provider or emptying a live immutable value.
             construction_step(&current, || unsafe {
                 layer.setContents(self.previous_contents.as_deref())
             })?;
@@ -476,7 +482,7 @@ impl GutterRaster {
             if let Some(scale) = self.previous_scale {
                 construction_step(&current, || layer.setContentsScale(scale))?;
             }
-            // SAFETY: 只比较原 contents 身份；任意原 CF 值都不接收额外 NSObject 消息。
+            // SAFETY: Compares original contents identity only; arbitrary CF values receive no extra NSObject messages.
             let contents = construction_step(&current, || unsafe { layer.contents() })?;
             if !same_contents(contents.as_deref(), self.previous_contents.as_deref()) {
                 return Err("源码行号原 contents 身份未精确恢复".into());
@@ -535,7 +541,7 @@ impl PaintAuthority {
                 .is_some_and(|actual| Rc::ptr_eq(actual, &self.attributes))
     }
 
-    /// 先后均核原纯票；当前函数不直接读取 Native，因而不会递归进入几何校验。
+    /// Checks original pure authority before and after work; this wrapper performs no independent Native geometry read, avoiding recursive validation.
     fn primitive<T>(
         &self,
         ruler: &NativeMarkdownGutter,
@@ -574,13 +580,13 @@ impl PaintAuthority {
         })? {
             return Err("源码行号不再属于原 Source 代次".into());
         }
-        // viewport 的原位置来自原 source_viewport；真实 frame/bounds/backing 事件撤同一原票。
-        // 这里不递归重调 source_viewport，原绘制函数仍逐行核同一原 viewport。
+        // Original viewport position comes from source_viewport; actual frame/bounds/backing events revoke that same intent.
+        // Does not recursively call source_viewport; the original drawing loop still checks the same viewport per line.
         if self.viewport.size.width <= 0.0 || self.viewport.size.height <= 0.0 {
             return Err("源码行号没有真实的原 Source 视口".into());
         }
         if let Some(expected) = self.published_image.get() {
-            // SAFETY: 发布后的每个原语仍检查当前层持有同一 CF 图像；不对 CF 值调用 NSObject 方法。
+            // SAFETY: Post-publication primitives verify the layer still holds the same CF image, without NSObject methods on CF values.
             let image = self.primitive(ruler, || unsafe { self.layer.contents() })?;
             if image.as_deref().is_none_or(|image| {
                 std::ptr::from_ref(image).cast::<CGImage>() != expected.as_ptr()
@@ -606,27 +612,27 @@ fn publish(
 ) -> Result<(), String> {
     let transaction = auth.step(ruler, || {
         CATransaction::begin();
-        Transaction // step 后核验失败也会析构返回值，配平已发生的 begin。
+        Transaction // The temporary is dropped even if step's post-check fails, balancing the actual begin.
     })?;
     auth.step(ruler, || CATransaction::setDisableActions(true))?;
-    // SAFETY: 常量均为 QuartzCore 的公开进程期不可变字符串，图层仍是本次原票固定的真实层。
+    // SAFETY: QuartzCore constants are public immutable process-lifetime strings; the layer remains this intent's actual captured layer.
     auth.step(ruler, || unsafe {
         auth.layer.setContentsFormat(kCAContentsFormatRGBA8Uint)
     })?;
-    // SAFETY: 同上；resize 只把已按实际 scale 绘制的完整 bounds 图像交给原层。
+    // SAFETY: The same constant lifetime applies; resize passes the complete actual-scale bounds image to the original layer.
     auth.step(ruler, || unsafe {
         auth.layer.setContentsGravity(kCAGravityResize)
     })?;
     auth.step(ruler, || auth.layer.setContentsScale(auth.scale))?;
-    // SAFETY: CALayer.contents 接收真实 CF CGImage；只桥接同一对象身份，不向 CF 对象发 NSObject 消息。
+    // SAFETY: CALayer.contents receives an actual CF CGImage; bridges its identity without NSObject messages to CF.
     auth.step(ruler, || unsafe {
         let object = &*std::ptr::from_ref(image).cast::<AnyObject>();
         auth.layer.setContents(Some(object));
-        // 仅保存身份标量；同一次 setter 返回后的检查已要求实际 contents 为该对象。
+        // Stores identity only; the same setter's post-check requires actual contents to remain this object.
         auth.published_image.set(Some(NonNull::from(image)));
     })?;
     verify_image(auth, ruler, image)?;
-    drop(transaction); // commit 后还要核实际 contents，不能只以 setter 返回视为成功发布。
+    drop(transaction); // Rechecks actual contents after commit; setter return alone is not successful publication.
     verify_image(auth, ruler, image)
 }
 
@@ -635,7 +641,7 @@ fn verify_image(
     ruler: &NativeMarkdownGutter,
     image: &CGImage,
 ) -> Result<(), String> {
-    // SAFETY: 只取得实际原层公开 contents 并比较 CF 身份，不假设任何 NSObject 子类或文本内容。
+    // SAFETY: Reads only the actual original layer's public contents and compares CF identity, assuming no NSObject subclass or text payload.
     let actual = auth.step(ruler, || unsafe { auth.layer.contents() })?;
     if actual.as_deref().is_none_or(|actual| {
         std::ptr::from_ref(actual).cast::<CGImage>() != std::ptr::from_ref(image)
@@ -657,7 +663,7 @@ fn same_layer(actual: Option<&CALayer>, expected: Option<&CALayer>) -> bool {
     match (actual, expected) {
         (Some(actual), Some(expected)) => std::ptr::eq(actual, expected),
         (None, None) => true,
-        _ => false, // 精确 nil 与一个仍存活的不同层不是同一原关系。
+        _ => false, // Exact nil and a different live layer are not the same original relationship.
     }
 }
 

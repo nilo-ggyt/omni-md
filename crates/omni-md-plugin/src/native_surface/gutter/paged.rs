@@ -1,4 +1,4 @@
-//! Paged源码行号只消费原Scene的有限几何；挂载、像素与关闭仍属于原Body。
+//! Paged source line numbers consume bounded geometry from the original Scene; Body still owns mounting, pixels, and closure.
 
 use std::{
     cell::{Cell, RefCell},
@@ -35,7 +35,7 @@ use crate::native_surface::{
 type Result<T> = std::result::Result<T, Error>;
 mod folding;
 
-/// 原canonical逻辑行与同次已度量软行的交集；续行没有伪造的行号，仍保活动底色。
+/// Intersects canonical logical lines with the same measured soft lines; continuations keep active highlighting without invented line numbers.
 pub(in crate::native_surface) struct GutterRow {
     pub logical_line: usize,
     pub number: Option<usize>,
@@ -53,7 +53,7 @@ pub(in crate::native_surface) struct PagedGutterIvars {
     scene: RefCell<RcWeak<Scene>>,
     font: RefCell<Option<Rc<LineNumberFont>>>,
     layer: RefCell<Option<Rc<Retained<CALayer>>>>,
-    // 和正文同Arc；原存活像素额度、真实munmap和关闭事件共同覆盖这张窄图。
+    // Shares the document pixel Arc; its live-byte budget, actual munmap, and close events also cover this narrow image.
     pixels: RefCell<Option<Arc<NativeMarkdownViewportPixels>>>,
     original_ruler_flags: (bool, bool),
     original_clip_automatic_insets: bool,
@@ -63,38 +63,38 @@ pub(in crate::native_surface) struct PagedGutterIvars {
 }
 
 define_class!(
-    // SAFETY: 主线程NSRulerView的全部ivars在super init前安装；回指和Scene均为弱引用。
+    // SAFETY: All main-thread NSRulerView ivars precede super init; owner back-references and Scene are weak.
     #[unsafe(super(NSRulerView))]
     #[thread_kind = MainThreadOnly]
     #[ivars = PagedGutterIvars]
     pub(in crate::native_surface) struct NativeMarkdownPagedGutter;
 
-    // SAFETY: 继承公开主线程NSObject身份，不改变父类对象或协议的布局。
+    // SAFETY: Inherits public main-thread NSObject identity without changing superclass or protocol layout.
     unsafe impl NSObjectProtocol for NativeMarkdownPagedGutter {}
 
     impl NativeMarkdownPagedGutter {
         #[unsafe(method(isFlipped))]
-        /// 与Paged正文及CPU context保持同一y-up方向；转换由真实NSView关系完成。
+        /// Matches the paged document and CPU context's y-up coordinates; actual NSView relationships own conversion.
         fn is_flipped(&self) -> bool { false }
 
         #[unsafe(method(wantsUpdateLayer))]
         fn wants_update_layer(&self) -> bool { true }
 
         #[unsafe(method(acceptsFirstResponder))]
-        /// 行号只是静态绘图，原CodeMirror数字区不接键盘焦点或输入命令。
+        /// Line numbers are presentation only and retain the original nonfocusable number-area interaction, without input commands.
         fn accepts_first_responder(&self) -> bool { false }
 
         #[unsafe(method(canBecomeKeyView))]
-        /// 从构造期排除Tab焦点资格，不让装饰视图成为正文输入链中的候选。
+        /// Excludes Tab eligibility during construction so decoration cannot enter the document input chain.
         fn can_become_key_view(&self) -> bool { false }
 
         #[unsafe(method(updateLayer))]
-        /// 原AppKit绘制事件只消费当前弱Scene；失败不回采新权限或启动另一调度链。
+        /// Actual AppKit drawing consumes the current weak Scene only; failure neither recaptures authority nor starts another scheduler.
         fn update_layer(&self) {
             if self.ivars().closed.get() || self.ivars().painting.replace(true) {
-                return; // 关闭或同栈重入不能重复创建候选像素。
+                return; // Closed or synchronously reentrant drawing cannot create duplicate candidate pixels.
             }
-            // 同步displayIfNeeded也可能由外层长寿命池调用；本次getter/CA临时claim只活这一帧。
+            // Even synchronous displayIfNeeded may run inside a long-lived caller pool; getter/CA temporaries belong only to this frame.
             let result = autoreleasepool(|_| self.paint());
             self.ivars().painting.set(false);
             let owner = self.ivars().owner.borrow().upgrade();
@@ -102,20 +102,20 @@ define_class!(
                 && !matches!(error, Error::Pending | Error::Revoked)
                 && let Some(owner) = owner
             {
-                owner.gutter_failed(error); // 真实资源/字体/Source错误沿原Body首错退出，不静默丢帧。
+                owner.gutter_failed(error); // Actual resource/font/Source errors enter the original Body's failure path rather than silently dropping frames.
             }
         }
 
         #[unsafe(method(drawHashMarksAndLabelsInRect:))]
-        /// 标签只能进入上方CPU图，禁止NSRuler父类再建立窗口字形显示列表。
+        /// Labels enter the CPU image only; the NSRuler superclass must not create a window glyph display list.
         fn draw_hash_marks_and_labels(&self, _dirty: NSRect) {}
 
         #[unsafe(method(drawRect:))]
-        /// layer-backed入口已独占显示；旧ruler绘制不能旁路CPU像素归属。
+        /// The layer-backed entry exclusively owns display; legacy ruler drawing cannot bypass CPU pixel ownership.
         fn draw_rect(&self, _dirty: NSRect) {}
 
         #[unsafe(method(mouseDown:))]
-        /// 原 Source 行号点击仍执行同一折叠动作，迟到 Scene 没有重捕后继布局的权限。
+        /// Source-gutter clicks retain the same fold action; a late Scene cannot recapture successor layout authority.
         fn mouse_down(&self, event: &NSEvent) {
             let result = autoreleasepool(|_| self.toggle_fold_at_event(event));
             if let Err(cause) = result && !matches!(cause, Error::Pending | Error::Revoked) {
@@ -126,7 +126,7 @@ define_class!(
 );
 
 impl NativeMarkdownPagedGutter {
-    /// 原Body已构造CPU正文；本ruler只借它的实际像素页账，不创建隐藏文本视图。
+    /// Body already constructed CPU content; this ruler shares its actual pixel ledger without hidden text views.
     pub(in crate::native_surface) fn new(
         owner: RcWeak<NativeMarkdownPagedBody>,
         scroll: &NSScrollView,
@@ -135,9 +135,9 @@ impl NativeMarkdownPagedGutter {
         mtm: MainThreadMarker,
     ) -> Result<Retained<Self>> {
         autoreleasepool(|_| {
-            // 构造可能直接位于调用方会话池内；只让返回Retained和明确ivars越过此阶段。
+            // Construction may run in the caller's session pool; only the returned Retained owner and explicit ivars survive this phase.
             if construction_step(view, || scroll.verticalRulerView())?.is_some() {
-                return Err(Error::InvalidGeometry); // 不夺取调用方已挂载的另一行号图。
+                return Err(Error::InvalidGeometry); // Does not take over another ruler already mounted by the caller.
             }
             let font = Rc::new(construction_step(view, LineNumberFont::new)??);
             let width = font.width(lines);
@@ -167,7 +167,7 @@ impl NativeMarkdownPagedGutter {
                 painting: Cell::new(false),
                 closed: Cell::new(false),
             });
-            // SAFETY: 主线程指定初始化器接收同一scroll，所有Rust载荷已经在上方固定。
+            // SAFETY: The main-thread designated initializer receives the same scroll after every Rust payload is initialized.
             let ruler: Retained<Self> = construction_step(view, || unsafe {
                 msg_send![super(allocated), initWithScrollView: Some(scroll), orientation: NSRulerOrientation::VerticalRuler]
             })?;
@@ -179,7 +179,7 @@ impl NativeMarkdownPagedGutter {
             construction_step(view, || {
                 ruler.setAccessibilityLabel(Some(ns_string!("源码行号")))
             })?;
-            // AppKit创建唯一backing；字体只在有限CPU context绘制，不调用NSRuler父类绘图。
+            // AppKit creates the sole backing; font drawing stays in bounded CPU contexts without superclass ruler painting.
             construction_step(view, || ruler.setWantsLayer(true))?;
             construction_step(view, || {
                 ruler.setLayerContentsRedrawPolicy(
@@ -195,10 +195,10 @@ impl NativeMarkdownPagedGutter {
         })
     }
 
-    /// 先把owner槽交回调用方再挂载；同步Native通知能看到唯一已装配的ruler归属。
+    /// The caller installs the owner slot before mounting, so synchronous native notifications see the sole assembled ruler.
     pub(in crate::native_surface) fn mount(&self) -> Result<()> {
         autoreleasepool(|_| {
-            // 原scroll装配触发的布局/getter临时值在返回前归还，不保留到业务关闭后的等待。
+            // Mount-triggered layout/getter temporaries return before this call ends instead of surviving into post-close waits.
             let view = self.body_view().ok_or(Error::Revoked)?;
             let scroll = self.scroll_view().ok_or(Error::Revoked)?;
             let clip = self.clip_view().ok_or(Error::Revoked)?;
@@ -212,9 +212,9 @@ impl NativeMarkdownPagedGutter {
                 return Err(Error::Revoked);
             }
             construction_step(&view, || scroll.setVerticalRulerView(Some(self)))?;
-            // 现代AppKit可把ruler覆盖在完整clip上；公开clip.contentInsets才记录实际预留。
-            // 由原clip按真实ruler/header计算，viewport消费这些inset安放唯一正文，不猜ruler宽。
-            // scroll自己的自动策略仅处理标题栏，属于调用方；此组件不再改它。
+            // AppKit may overlay the ruler on the full clip; public clip.contentInsets records the actual reserved area.
+            // The original clip calculates actual ruler/header insets; viewport uses them for the sole document instead of guessing ruler width.
+            // The scroll's automatic title-bar policy belongs to the caller and is not changed here.
             construction_step(&view, || clip.setAutomaticallyAdjustsContentInsets(true))?;
             construction_step(&view, || scroll.setHasVerticalRuler(true))?;
             construction_step(&view, || scroll.setRulersVisible(true))?;
@@ -227,7 +227,7 @@ impl NativeMarkdownPagedGutter {
         self.ivars().painting.get()
     }
 
-    /// 总行数只有位数跨界才改Native宽度；调用方在后继回合重新捕获真实正文几何。
+    /// Only a line-count digit-width change updates native thickness; the caller captures actual document geometry in its subsequent turn.
     pub(in crate::native_surface) fn update_width(&self, lines: usize) -> Result<bool> {
         let font = self.ivars().font.borrow().clone().ok_or(Error::Revoked)?;
         let width = font.width(lines);
@@ -236,20 +236,20 @@ impl NativeMarkdownPagedGutter {
             return Err(Error::Revoked);
         }
         if construction_step(&view, || self.ruleThickness())? == width {
-            return Ok(false); // 同位数不重复布局或撤销正在绘制的正文Scene。
+            return Ok(false); // An unchanged digit width neither repeats layout nor revokes the document Scene being painted.
         }
         self.clear_snapshot();
         construction_step(&view, || self.setRuleThickness(width))?;
         let scroll = self.scroll_view().ok_or(Error::Revoked)?;
-        // 位数改变后先完成真实scroll子视图布局；延迟tile会让后继正文捕获旧clip宽度并交付错误的一帧。
+        // Completes actual scroll layout after a digit-width change; delayed tile would let the next document capture stale clip width.
         construction_step(&view, || scroll.tile())?;
         Ok(true)
     }
 
-    /// 只挂同次发布的弱Scene；行号不会延长原Reader、Source或文档的生命期。
+    /// Stores only the same publication's weak Scene, without extending Reader, Source, or document lifetime.
     pub(in crate::native_surface) fn publish(&self, scene: &Rc<Scene>) -> Result<()> {
         if scene.key().presentation_mode != omni_markdown_core::MarkdownPresentationMode::Source {
-            // 隐藏的源码附件不消费预览排版，也不让已排队的行号绘制保留旧 Source。
+            // A hidden source accessory consumes no preview layout and retains no old Source through queued gutter paint.
             self.clear_snapshot();
             return Ok(());
         }
@@ -261,17 +261,17 @@ impl NativeMarkdownPagedGutter {
         self.native(scene, || self.setNeedsDisplay(true))
     }
 
-    /// 原Scene失权即撤销标签像素；保留的空ruler不会签下一代行号或显示旧数字。
+    /// Revoking Scene removes label pixels; an empty retained ruler cannot authorize the next epoch or display old numbers.
     pub(in crate::native_surface) fn clear_snapshot(&self) {
         *self.ivars().scene.borrow_mut() = RcWeak::new();
         let layer = self.ivars().layer.borrow().clone();
         if let Some(layer) = layer {
-            // SAFETY: 只清本自有图层的原contents，provider沿原像素归还回调执行真实munmap。
+            // SAFETY: Clears only this owned layer's contents; provider release follows the original pixel callback to actual munmap.
             unsafe { layer.setContents(None) };
         }
     }
 
-    /// 同一个编辑会话只持一份标准 ruler；模式仅改变其可见性，像素立即归还，最终关闭统一拆图。
+    /// One editing session owns one standard ruler; mode changes visibility and returns its pixel claim, while final close tears down the graph.
     pub(in crate::native_surface) fn set_mode_visibility(
         &self,
         visible: bool,
@@ -292,12 +292,12 @@ impl NativeMarkdownPagedGutter {
         {
             return Err(Error::Revoked);
         }
-        drop(actual); // Native claim 的析构不跨后面的状态变更或 RefCell 借用。
+        drop(actual); // Native claim destruction precedes subsequent state mutation and RefCell borrowing.
         self.clear_snapshot();
         if !current() {
             return Err(Error::Revoked);
         }
-        self.setNeedsDisplay(false); // 隐藏期间不让旧脏标记重新创建行号像素。
+        self.setNeedsDisplay(false); // Old damage notifications cannot recreate label pixels while hidden.
         if !current() {
             return Err(Error::Revoked);
         }
@@ -305,33 +305,33 @@ impl NativeMarkdownPagedGutter {
         if !current() {
             return Err(Error::Revoked);
         }
-        scroll.tile(); // 先完成真实 clip 宽度改变，后继模式目标才按新 lane 排版。
+        scroll.tile(); // Completes the actual clip-width change before the next mode target lays out its new lane.
         if !current() {
             return Err(Error::Revoked);
         }
         Ok(())
     }
 
-    /// Weak加载可能进入原生引用计数；先结束槽借用，关闭回调才可取走相同槽。
+    /// Weak loading may enter native reference counting; releases the slot borrow first so close can take that same slot.
     fn body_view(&self) -> Option<Retained<NativeMarkdownPagedTextView>> {
         let view = self.ivars().view.borrow().clone();
         view.and_then(|view| view.load())
     }
 
-    /// 仅在挂载或拆图时借原scroll身份；关闭后连Weak控制块也不留在系统空壳中。
+    /// Borrows the original scroll for mounting/teardown only; closure leaves no Weak control block in a framework-cached shell.
     fn scroll_view(&self) -> Option<Retained<NSScrollView>> {
         let scroll = self.ivars().scroll.borrow().clone();
         scroll.and_then(|scroll| scroll.load())
     }
 
-    /// 只恢复本次装配的原clip；弱身份避免关闭时误改调用方已经替换的contentView。
+    /// Restores only the originally mounted clip; weak identity prevents modifying a replacement contentView during closure.
     fn clip_view(&self) -> Option<Retained<NSClipView>> {
         let clip = self.ivars().clip.borrow().clone();
         clip.and_then(|clip| clip.load())
     }
 
     fn require(&self, scene: &Rc<Scene>) -> Result<()> {
-        scene.gutter_rows()?; // Source/Font/Reader首错先于普通Native撤权，不重捕后继Scene。
+        scene.gutter_rows()?; // Original Source/Font/Reader failure precedes ordinary native revocation, without recapturing a successor Scene.
         if self.ivars().closed.get()
             || !RcWeak::ptr_eq(&self.ivars().scene.borrow(), &Rc::downgrade(scene))
         {
@@ -340,7 +340,7 @@ impl NativeMarkdownPagedGutter {
         Ok(())
     }
 
-    /// Native重入前后仍核同一Scene；返回值不在失权后作为新布局的输入。
+    /// Checks the same Scene around native reentry; revoked return values cannot become input to a new layout.
     fn native<T>(&self, scene: &Rc<Scene>, work: impl FnOnce() -> T) -> Result<T> {
         self.require(scene)?;
         let value = work();
@@ -382,7 +382,7 @@ impl NativeMarkdownPagedGutter {
         {
             return Err(Error::InvalidGeometry);
         }
-        // 只分配实际ruler视口尺寸；原Bitmap复用真实页预算，绝不采用文档逻辑高度。
+        // Allocates only the actual ruler viewport; Bitmap shares the real page budget rather than document logical height.
         let bitmap = Bitmap::new(width.ceil() as usize, height.ceil() as usize, pixels)
             .map_err(Error::Raster)?;
         let context = bitmap.context();
@@ -407,11 +407,11 @@ impl NativeMarkdownPagedGutter {
             let top =
                 (bounds.origin.y + bounds.size.height).min(frame.origin.y + frame.size.height);
             if top <= bottom {
-                continue; // 真实首soft行已出屏时不把它的数字挪到视口顶；续行仍沿原几何独立裁切。
+                continue; // An offscreen first soft line does not move its number to the viewport top; continuations clip their own actual geometry.
             }
             if row.active {
-                // 相邻真实软行可以在分数device-pixel边界相接；分别抗锯齿会把两边各自
-                // 混入未活动底色，留下并不存在的横缝。仅背景矩形用完整像素覆盖，字形状态随后恢复。
+                // Adjacent soft lines may meet at fractional device-pixel edges; separate antialiasing would blend
+                // inactive color into both sides and create a false seam. Only backgrounds disable antialiasing; glyph state is restored afterward.
                 CGContext::save_g_state(Some(context));
                 CGContext::set_should_antialias(Some(context), false);
                 CGContext::set_rgb_fill_color(
@@ -454,7 +454,7 @@ impl NativeMarkdownPagedGutter {
                         row.folded,
                     );
                 }
-            } // 数字只来自原逻辑行首；后续wrapped行不建立重复标签或折叠标记。
+            } // Only the original logical-line start supplies a number; wrapped continuations create no duplicate number or fold marker.
         }
         CGContext::set_rgb_fill_color(Some(context), 37.0 / 255.0, 42.0 / 255.0, 51.0 / 255.0, 1.0);
         CGContext::fill_rect(
@@ -465,7 +465,7 @@ impl NativeMarkdownPagedGutter {
             ),
         );
         self.require(&scene)?;
-        let image = bitmap.finish().map_err(Error::Raster)?; // 写context已真实结束，才能将只读provider交给图层。
+        let image = bitmap.finish().map_err(Error::Raster)?; // The writable context has actually ended before its read-only provider transfers to the layer.
         if self.native(&scene, || self.bounds())? != bounds
             || self.native(&scene, || window.backingScaleFactor())? != scale
             || !self
@@ -485,14 +485,14 @@ impl NativeMarkdownPagedGutter {
         }
         let transaction = self.native(&scene, || {
             CATransaction::begin();
-            GutterTransaction // 后置原票撤销也由临时值Drop配平，不能遗留已经开始的事务。
+            GutterTransaction // Temporary Drop balances begin even if the post-call intent check revokes authority.
         })?;
         self.native(&scene, || CATransaction::setDisableActions(true))?;
-        // SAFETY: 两个字符串为QuartzCore公开的进程期常量；只设原同一自有backing。
+        // SAFETY: QuartzCore exports these process-lifetime constants; only the same original owned backing is configured.
         self.native(&scene, || unsafe {
             layer.setContentsFormat(kCAContentsFormatRGBA8Uint)
         })?;
-        // SAFETY: 同上，完整图已按实际scale绘制，无局部图或降采样替补。
+        // SAFETY: The same constant lifetime applies; the complete image uses actual scale, without partial or downsampled substitution.
         self.native(&scene, || unsafe {
             layer.setContentsGravity(kCAGravityResize)
         })?;
@@ -502,7 +502,7 @@ impl NativeMarkdownPagedGutter {
             image: std::ptr::from_ref(&*image).cast::<AnyObject>(),
             accepted: false,
         };
-        // SAFETY: CALayer.contents接受真实CF CGImage；这里只桥接同一个对象，不向CF发送NSObject消息。
+        // SAFETY: CALayer.contents receives the actual CF CGImage; bridges identity only, without sending NSObject messages to CF.
         self.native(&scene, || unsafe {
             layer.setContents(Some(&*std::ptr::from_ref(&*image).cast::<AnyObject>()));
         })?;
@@ -522,9 +522,9 @@ impl NativeMarkdownPagedGutter {
                 .as_deref()
                 .is_some_and(|actual| std::ptr::eq(actual, &*window))
         {
-            return Err(Error::Revoked); // setter已执行仍须核真实原几何；失权只清本次实际图，不回滚后继内容。
+            return Err(Error::Revoked); // An executed setter still requires original geometry checks; revocation removes only this actual image, never successor contents.
         }
-        // SAFETY: 只读本图层的公开contents关系，不对返回的CF图像发送NSObject消息。
+        // SAFETY: Reads this layer's public contents relationship only, without NSObject messages to its CF image.
         let actual = self.native(&scene, || unsafe { layer.contents() })?;
         if !actual
             .as_deref()
@@ -536,7 +536,7 @@ impl NativeMarkdownPagedGutter {
         Ok(())
     }
 
-    /// 同原NSRuler合同，实际像素必须归还；系统若缓存空控件，收据另核每个自有载荷已取走。
+    /// Actual pixels must return under the ruler contract; if AppKit caches an empty control, the receipt separately checks every owned payload was removed.
     pub(in crate::native_surface) fn close(
         &self,
         receipt: &NativeMarkdownPagedCloseReceipt,
@@ -551,25 +551,25 @@ impl NativeMarkdownPagedGutter {
             .take()
             .expect("已装配的Source行号持有原正文像素页账");
         receipt.track_pixels(&pixels);
-        drop(pixels); // 收据保留真实页归还观察者；缓存的ruler不能继续持有项目的共享Arc。
+        drop(pixels); // The receipt keeps actual page-return observation; a cached ruler cannot retain the project's shared Arc.
         let layer = self.ivars().layer.borrow().clone();
         receipt.track_gutter(PagedGutterRelease {
             ruler: Weak::from(self),
             layer: layer.as_ref().map(|layer| Weak::from(&***layer)),
         });
         let owner = self.ivars().owner.replace(RcWeak::new());
-        drop(owner); // 即使Body强引用已为零，旧Weak控制块也必须离开可被框架缓存的对象。
+        drop(owner); // Even after Body's last strong claim ends, its Weak control block must leave any framework-cached object.
         autoreleasepool(|_| {
-            // 本关闭阶段的公开getter、CA临时claim与contents返回值不能留到调用方跨wait的池。
-            // 原收据固定实际像素与原层身份；以下仍履行真实拆图并保留第一清理错误。
+            // Close-stage public getters, CA temporaries, and contents results must not survive in a caller pool across waits.
+            // The original receipt fixes pixel and layer identities; teardown below still performs actual cleanup and retains cleanup failure.
             let original_window = self.window();
             let this_view: &NSView = self;
-            // SAFETY: 原主线程关闭栈持活ruler；公开key-view getter仅返回此刻的真实相邻视图。
+            // SAFETY: The original main-thread close stack keeps the ruler live; public key-view getters return its actual current neighbors.
             let (previous_key, next_key) = unsafe { (self.previousKeyView(), self.nextKeyView()) };
             if let Some(previous) = previous_key.as_deref()
                 && !std::ptr::eq(previous, this_view)
             {
-                // SAFETY: previous由上方公开getter持活；只读取真实incoming关系，不遍历焦点图。
+                // SAFETY: The getter keeps previous alive; reads its actual incoming edge without traversing the focus graph.
                 let incoming = unsafe { previous.nextKeyView() };
                 if incoming
                     .as_deref()
@@ -578,15 +578,15 @@ impl NativeMarkdownPagedGutter {
                     let successor = next_key
                         .as_deref()
                         .filter(|actual| !std::ptr::eq(*actual, this_view));
-                    // SAFETY: 仅仍指向本次关闭视图的原前驱被接回真实后继；不改外方已经替换的链。
+                    // SAFETY: Reconnects the original predecessor only while it still points here, preserving an externally replaced chain.
                     unsafe { previous.setNextKeyView(successor) };
                 }
             }
-            // SAFETY: 本ruler已封闭，清自己的公开outgoing关系；不销毁或访问相邻视图载荷。
+            // SAFETY: The sealed ruler clears its own outgoing edge without destroying or reading neighboring view payloads.
             unsafe { self.setNextKeyView(None) };
             self.clear_snapshot();
             let font = self.ivars().font.borrow_mut().take();
-            drop(font); // 十个glyph标量与本项目NSFont强边先结束，系统字体没有正文或业务回指。
+            drop(font); // Releases ten glyph scalars and this project's NSFont claim; the system font has no document/business back-reference.
             self.setClientView(None);
             let mut result = Ok(());
             if let Some(scroll) = self.scroll_view() {
@@ -605,38 +605,38 @@ impl NativeMarkdownPagedGutter {
                             self.ivars().original_clip_automatic_insets,
                         );
                         if !self.ivars().original_clip_automatic_insets {
-                            // 调用方原先手工设置的值会被挂载期自动策略覆盖；先关闭自动，再还具体值。
-                            // 原策略为true时仍由AppKit按已移出的ruler重算，不能写回旧自动结果。
+                            // Mount-time automatic policy may replace caller-specified insets; disables automatic adjustment before restoring those values.
+                            // An originally automatic policy lets AppKit recompute after ruler removal instead of restoring stale automatic results.
                             clip.setContentInsets(self.ivars().original_clip_content_insets);
                         }
                         if !std::ptr::eq::<NSClipView>(&*scroll.contentView(), &*clip) {
-                            result = Err(Error::Revoked); // setter同步重入也不能把已被替换的原clip还原算成成功。
+                            result = Err(Error::Revoked); // Setter reentry replacing the original clip cannot be reported as successful restoration.
                         }
                     } else {
-                        result = Err(Error::Revoked); // 后继contentView不属于这次原clip策略的恢复范围。
+                        result = Err(Error::Revoked); // A successor contentView lies outside this original clip-policy restoration.
                     }
                 } else {
-                    result = Err(Error::Revoked); // 外方替换了挂载关系，不能为了清理删除后继ruler。
+                    result = Err(Error::Revoked); // An externally replaced mount cannot authorize deleting a successor ruler for cleanup.
                 }
             }
-            // scroll的ruler属性和NSView子关系是两条独立强边；关闭同时撤掉真实自有子视图，
-            // 再清NSRuler的弱scroll关联，不能以属性变nil冒充它已离开原生父图。
+            // The scroll ruler property and NSView hierarchy are separate strong edges; removes the actual owned subview
+            // and the ruler's weak scroll relationship, because a nil property alone does not prove detachment from the native parent graph.
             self.removeFromSuperview();
             self.setScrollView(None);
             if let Some(window) = &original_window {
-                window.recalculateKeyViewLoop(); // 这里只标记待重算；真实移出后的焦点环仍由原窗口更新。
+                window.recalculateKeyViewLoop(); // Marks recalculation only; the original window updates its focus loop after actual removal.
                 if let Some(view) = self.body_view()
                     && view
                         .window()
                         .as_deref()
                         .is_some_and(|actual| std::ptr::eq(actual, &**window))
                 {
-                    // AppKit在窗口内视图的下一次key-view查询才重算；仅查询原正文一次，不移动焦点。
-                    // SAFETY: 原window和正文均存活且关系已核同一窗口；重算由AppKit按当前窗口树建立有效key-view。
+                    // AppKit recalculates on the next in-window key-view query; queries the original document once without moving focus.
+                    // SAFETY: Both live objects belong to the verified original window; AppKit rebuilds valid key-view edges from its current tree.
                     drop(unsafe { view.nextKeyView() });
                 }
             }
-            self.setNeedsDisplay(false); // 取消本自有视图待交付的原生脏标记，不再为关闭后的空壳绘图。
+            self.setNeedsDisplay(false); // Cancels this owned view's pending damage so a closed empty shell creates no more pixels.
             if let Some(layer) = &layer {
                 let actual = self.layer();
                 if actual
@@ -644,7 +644,7 @@ impl NativeMarkdownPagedGutter {
                     .is_some_and(|actual| std::ptr::eq::<CALayer>(actual, &***layer))
                 {
                     self.setWantsLayer(false);
-                    // 禁层可能已经同步清了backing；只撤仍是原层或已经为空的关系，不夺取外方替换层。
+                    // Disabling layers may synchronously remove backing; clears only the original or now-empty relationship, never an external replacement.
                     let after_disable = self.layer();
                     if after_disable
                         .as_deref()
@@ -655,12 +655,12 @@ impl NativeMarkdownPagedGutter {
                         result = Err(Error::Revoked);
                     }
                 } else {
-                    result = Err(Error::Revoked); // 不清外方替换的backing；原自有层仍在下面解除自己的载荷。
+                    result = Err(Error::Revoked); // Preserves replacement backing; the original owned layer still sheds its own payload below.
                 }
-                layer.removeFromSuperlayer(); // 原自有层不继续作为其他层的子项保留这次绘制。
-                layer.setDelegate(None); // NSView给backing的绘制回调关系也必须实际撤掉。
+                layer.removeFromSuperlayer(); // The original layer cannot retain this drawing as another layer's child.
+                layer.setDelegate(None); // Also removes NSView's actual backing-layer drawing callback relationship.
                 layer.setBackgroundColor(None);
-                // SAFETY: 只清本组件原层的图像/遮罩/子层；传入None不引入外方对象或CA所有权。
+                // SAFETY: Clears only this component's original image/mask/sublayers; None introduces no external object or CA ownership.
                 unsafe {
                     layer.setContents(None);
                     layer.setMask(None);
@@ -668,18 +668,18 @@ impl NativeMarkdownPagedGutter {
                 }
             }
             drop(self.ivars().layer.borrow_mut().take());
-            // 所有Native getter已结束，取走Native Weak自身的分配；空控件不保留旧视图图的身份槽。
+            // After native getters finish, takes the Native Weak allocations too; empty controls retain no old graph identity slots.
             let view = self.ivars().view.borrow_mut().take();
             let scroll = self.ivars().scroll.borrow_mut().take();
             let clip = self.ivars().clip.borrow_mut().take();
             drop((view, scroll, clip));
             drop(layer);
-            CATransaction::flush(); // 自有backing/挂载已真实detach后提交CA归还，再结束这个局部Native池。
+            CATransaction::flush(); // Flushes CA after actual owned backing/mount detachment, before this local native pool ends.
             result
         })
     }
 
-    /// 逐字段证明框架可能缓存的仅为空壳；Weak控制块、页账Arc和字体也不能留在ivars中。
+    /// Checks every payload slot so framework-cached controls are empty shells, with no Weak blocks, pixel Arc, or fonts left in ivars.
     fn payload_is_empty(&self) -> bool {
         let payload_empty = self.ivars().closed.get()
             && !self.ivars().painting.get()
@@ -692,10 +692,10 @@ impl NativeMarkdownPagedGutter {
             && self.ivars().layer.borrow().is_none()
             && self.ivars().pixels.borrow().is_none();
         if !payload_empty {
-            return false; // 死Weak或零像素计数不能替代项目实际取走相同的所有权槽。
+            return false; // Dead Weak references or zero pixel counts cannot replace removal of the actual ownership slots.
         }
-        // Rust借用已全部结束；公开关系必须真实detach，不能只凭closed标志授权成功。
-        // SAFETY: 收据的同一主线程Weak加载持活本对象，getter不访问已经取走的项目载荷。
+        // All Rust borrows have ended; public relationships must be actually detached rather than certified by a closed flag alone.
+        // SAFETY: The receipt's same-thread Weak upgrade keeps this object alive; getters do not access removed project payloads.
         let detached = unsafe { self.superview().is_none() && self.nextKeyView().is_none() };
         detached
             && self.window().is_none()
@@ -706,14 +706,14 @@ impl NativeMarkdownPagedGutter {
     }
 }
 
-/// 只观察这次真实ruler/backing；不持正文、字体、像素Arc或Native强引用，不引入第二资源账本。
+/// Observes only this actual ruler/backing without document, font, pixel Arc, or Native strong owners and without another resource ledger.
 pub(in crate::native_surface) struct PagedGutterRelease {
     ruler: Weak<NativeMarkdownPagedGutter>,
     layer: Option<Weak<CALayer>>,
 }
 
 impl PagedGutterRelease {
-    /// AppKit可以缓存已清空的标准控件；项目载荷和原图层关系仍按实际对象逐项核验。
+    /// AppKit may cache empty standard controls; project payloads and original layer relationships still require checks on the actual objects.
     pub(in crate::native_surface) fn verify_released(&self) -> std::result::Result<(), String> {
         autoreleasepool(|_| {
             if self
@@ -724,9 +724,9 @@ impl PagedGutterRelease {
                 return Err("源码行号仍持有业务载荷或原生挂载关系".into());
             }
             if let Some(layer) = self.layer.as_ref().and_then(Weak::load) {
-                // SAFETY: 收据只读原自有层；CF contents只查是否为空，不向其发送NSObject消息。
+                // SAFETY: The receipt reads only its original layer, testing CF contents for absence without sending NSObject messages.
                 let contents_empty = unsafe { layer.contents().is_none() };
-                // SAFETY: 同一主线程原层仍存活，仅查询公开子层关系；数组只查长度，不改未知对象。
+                // SAFETY: The original layer remains live on the same main thread; reads public sublayer count without mutating unknown objects.
                 let children_empty =
                     unsafe { layer.sublayers() }.is_none_or(|children| children.is_empty());
                 if !contents_empty
@@ -738,13 +738,13 @@ impl PagedGutterRelease {
                 {
                     return Err("源码行号原图层仍持有像素、回调或父子关系".into());
                 }
-            } // 实际层已析构或全部载荷/关系均为空，才符合原标准控件空壳合同。
+            } // Only actual layer destruction or empty payload/relationships satisfies the standard-control empty-shell contract.
             Ok(())
         })
     }
 }
 
-/// 任意失败出口也配平原CATransaction；提交本身不授予失权候选成功资格。
+/// Balances the original CATransaction on every failure path; commit alone cannot certify a revoked candidate.
 struct GutterTransaction;
 impl Drop for GutterTransaction {
     fn drop(&mut self) {
@@ -752,7 +752,7 @@ impl Drop for GutterTransaction {
     }
 }
 
-/// setter后撤权也有真实像素后果；只撤仍等于本次image的关系，不覆盖后继已发布内容。
+/// Revocation after a setter still has pixel consequences; removes only contents matching this image, preserving successor publication.
 struct GutterPublication<'a> {
     layer: &'a CALayer,
     image: *const AnyObject,
@@ -761,21 +761,21 @@ struct GutterPublication<'a> {
 impl Drop for GutterPublication<'_> {
     fn drop(&mut self) {
         if self.accepted {
-            return; // 完整原票和真实contents均通过后，唯一图像归属由图层继续持有。
+            return; // After original intent and actual contents checks pass, the layer retains the sole published image ownership.
         }
-        // SAFETY: 只比较原生公开contents身份，CF对象只作地址比较，不被发送对象消息。
+        // SAFETY: Compares public native contents identity only; CF objects receive no object messages.
         let actual = unsafe { self.layer.contents() };
         if actual
             .as_deref()
             .is_some_and(|actual| std::ptr::eq(actual, self.image))
         {
-            // SAFETY: 关系仍属于本次失败setter，只清自己的像素，不删除外方或后继内容。
+            // SAFETY: The relationship still belongs to this failed setter, so clears only its own pixels, not external or successor contents.
             unsafe { self.layer.setContents(None) };
         }
     }
 }
 
-/// 构造/宽度事务尚没有Scene；只借原CPU正文的现有会话权限，Native关闭后不能继续挂回旧图。
+/// Construction/width work has no Scene yet; borrows the original CPU document's session authority without remounting old graphs after native closure.
 fn construction_step<T>(view: &NativeMarkdownPagedTextView, work: impl FnOnce() -> T) -> Result<T> {
     if !view.session_is_current() {
         return Err(Error::Revoked);

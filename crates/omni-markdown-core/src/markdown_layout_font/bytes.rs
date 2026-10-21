@@ -1,4 +1,5 @@
-//! 从已经核验的源FD捕获独立匿名inode；Font只借用稳定Blob，不映射可被用户截断的源。
+//! Capture an independent anonymous inode from a verified source descriptor. Fonts borrow a stable
+//! blob instead of mapping the user-controlled source that can later be truncated.
 use std::{
     fs::{Metadata, OpenOptions},
     io,
@@ -61,26 +62,30 @@ fn regular(value: &Metadata) -> bool {
     value.is_file() && !value.file_type().is_symlink()
 }
 
-/// 所有Clone和Blob wrapper共享同一映射；不保源路径、源FD或可写inode句柄。
+/// Clones and blob wrappers share one frozen mapping, without retaining the source path, source
+/// descriptor, or a writable inode handle. This font-only blob grants no full Markdown-body lease.
 #[derive(Clone)]
 pub struct MarkdownLayoutFontBytes(Arc<Payload>);
 struct Payload {
-    // VM由唯一owner实际munmap；observer仅保固定原子，不参与Font或映射保活。
+    // The unique mapping owner actually calls munmap; observer atomics retain neither Font nor VM.
     mapping: ReadonlyFontMapping,
-    // 只保留捕获时的文件标量身份；不同字号可复用同一冻结字节，不保源路径或源FD。
+    // Keep only capture-time scalar identity. Different point sizes may share frozen bytes without
+    // retaining a source path/descriptor or inheriting another font instance's axes or metrics.
     source: FileIdentity,
 }
 
-/// Drop步骤、实际munmap和descriptor关闭分别观察；多字段不是运行中事务快照。
-/// 最后owner结束后应同时核completed、unmap_succeeded、mapped_bytes为0且failed为false。
+/// Observe completed disposal, actual munmap, and descriptor close separately; independent atomics
+/// are not a live transaction snapshot. After the final owner ends, check completed, unmap success,
+/// zero mapped bytes, and no failure together. These facts do not measure kernel RSS.
 #[derive(Clone)]
 pub struct MarkdownLayoutFontBytesResourceObserver {
     facts: Arc<MappingFacts>,
     captured_bytes: usize,
 }
 impl MarkdownLayoutFontBytesResourceObserver {
-    /// 只比较同一实际映射的释放收据，不保活映射，也不以文件路径、长度或内容相同猜共享。
-    /// 多个字号可拥有不同 Font payload 而共享该映射，释放责任须分别判断。
+    /// Compare receipts for the same actual mapping without keeping it alive or inferring sharing
+    /// from equal paths, lengths, or content. Different point-size Font payloads may share these
+    /// bytes; font-payload lifetime and final mapping release remain distinct responsibilities.
     #[must_use]
     pub fn same_mapping_resource(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.facts, &other.facts)
@@ -122,28 +127,35 @@ impl MarkdownLayoutFontBytesResourceObserver {
 
 impl AsRef<[u8]> for MarkdownLayoutFontBytes {
     fn as_ref(&self) -> &[u8] {
+        // The frozen font factory authorizes the complete immutable font blob. Document source
+        // readers keep their separate bounded-lease contract and cannot use this font-only owner.
         self.0.mapping.as_ref()
     }
 }
 
 impl MarkdownLayoutFontBytes {
-    /// 先冻结独立无名inode，再核原FD和路径；不执行UTF8、hash或整字体内容扫描。
+    /// Freeze an independent unnamed inode, then recheck the original descriptor and path without
+    /// UTF-8 validation, hashing, or a full-font content scan.
     ///
-    /// 元数据复核是与Document open相同的乐观并发保护，不能检测蓄意恢复全部时间戳
-    /// 的外部写入；内存安全由独立匿名inode保证，而非把原文件视为不可变。
+    /// Metadata revalidation provides the same optimistic concurrency protection as document open;
+    /// it cannot detect an external writer deliberately restoring all identity metadata. Memory
+    /// safety relies on the independent frozen inode, not on treating the source as immutable.
     ///
     /// # Errors
-    /// 非普通文件、末级符号链接、空/过大来源、路径替换、源变动或实际快照IO失败均拒绝。
+    /// Reject nonregular files, final-component symlinks, empty/oversized sources, path replacement,
+    /// source changes, and actual snapshot/storage failures.
     pub fn capture_file(path: &Path, max_bytes: u64) -> Result<Self> {
         capture(path, max_bytes, || {})
     }
 
-    /// 在调用方现有有限字体集合内共享同一未变来源的冻结字节；不建立进程缓存。
-    /// 文件身份与首次捕获一致才可复用，face、轴位、字号仍由新Font各自解析和验证。
-    /// 与首次捕获相同，这项乐观复核不能识别外部蓄意恢复全部元数据的写入。
+    /// Share frozen bytes within the caller's existing finite font set, without a process cache.
+    /// Reuse requires the initial file identity; each new Font still parses/validates its own face,
+    /// axes, and point size. Like initial capture, this optimistic check cannot recognize a writer
+    /// deliberately restoring all identity metadata.
     ///
     /// # Errors
-    /// 来源不可访问、变成非普通文件或超出本次字节预算时拒绝；正常文件换代返回None。
+    /// Reject inaccessible/nonregular sources or the current byte-budget violation; an ordinary
+    /// file identity change returns None so the caller can capture the actual new source.
     pub fn share_unchanged_file(&self, path: &Path, max_bytes: u64) -> Result<Option<Self>> {
         let metadata =
             std::fs::symlink_metadata(path).map_err(MarkdownLayoutFontBytesError::Storage)?;
@@ -153,14 +165,16 @@ impl MarkdownLayoutFontBytes {
         if metadata.len() > max_bytes {
             return Err(MarkdownLayoutFontBytesError::FileTooLarge);
         }
-        // 新inode、长度、mtime或ctime任一变化都回到真实捕获，不能只凭路径复用旧字体。
+        // Any changed inode, extent, mtime, or ctime requires real recapture; path equality alone
+        // cannot authorize the old font bytes.
         Ok((FileIdentity::from(&metadata) == self.0.source).then(|| self.clone()))
     }
     #[must_use]
     pub fn byte_len(&self) -> usize {
         self.0.mapping.len()
     }
-    /// 小wrapper只共享原payload，Font的Blob strong边可自然延长同一映射使用期。
+    /// The small wrapper shares the original payload. A Font blob's strong reference legitimately
+    /// extends this mapping's lifetime until that actual consumer finishes.
     #[must_use]
     pub fn blob(&self) -> Arc<dyn AsRef<[u8]> + Send + Sync> {
         Arc::new(self.clone())
@@ -193,11 +207,11 @@ fn capture(
         .metadata()
         .map_err(MarkdownLayoutFontBytesError::Storage)?;
     if !regular(&before) {
-        return Err(MarkdownLayoutFontBytesError::NotRegularFile); // 不在设备/FIFO等特殊FD上等待或映射。
+        return Err(MarkdownLayoutFontBytesError::NotRegularFile); // Never wait on or map devices, FIFOs, or other special descriptors.
     }
     let identity = FileIdentity::from(&before);
     if FileIdentity::from(&path_before) != identity {
-        return Err(MarkdownLayoutFontBytesError::SourceChanged); // path检查与open之间换inode同样拒绝。
+        return Err(MarkdownLayoutFontBytesError::SourceChanged); // Reject inode replacement between path checking and open.
     }
     if before.len() == 0 {
         return Err(MarkdownLayoutFontBytesError::EmptyFile);
@@ -205,7 +219,7 @@ fn capture(
     let bytes =
         usize::try_from(before.len()).map_err(|_| MarkdownLayoutFontBytesError::FileTooLarge)?;
     if before.len() > max_bytes || bytes > isize::MAX as usize {
-        return Err(MarkdownLayoutFontBytesError::FileTooLarge); // 在捕获/借用任何字体正文前限制extent。
+        return Err(MarkdownLayoutFontBytesError::FileTooLarge); // Bound the extent before capturing or borrowing font bytes.
     }
     let frozen = snapshot_font_file(&file, before.len())
         .map_err(|error| match error {
@@ -216,7 +230,7 @@ fn capture(
         .ok_or(MarkdownLayoutFontBytesError::SnapshotUnavailable)?;
     let mapping =
         ReadonlyFontMapping::map(frozen).map_err(MarkdownLayoutFontBytesError::Storage)?;
-    after_snapshot(); // 产品为空操作；测试只在此真实边界替换路径，验证同一发布门。
+    after_snapshot(); // Production does nothing; the existing test replaces its own path at this actual publication boundary.
     let validation = (|| {
         let after = file
             .metadata()
@@ -233,10 +247,12 @@ fn capture(
         }
         Ok(())
     })();
-    // 原用户文件FD只用于乐观身份核验，发布前真实close；Blob不保路径或源descriptor。
+    // The original descriptor serves only optimistic identity checks and must close before blob
+    // publication. A close failure is returned as Storage even if validation already found a change.
     if let Err(error) = close_descriptor(file.into_raw_fd()) {
         mapping.record_error(&error);
-        // map.close保留同一首因，实际munmap失败也不能把资源数量假归零。
+        // Mapping cleanup preserves its first recorded errno; failed munmap cannot report a zero
+        // extent. No blob is published after this source-descriptor failure.
         mapping
             .close()
             .map_err(MarkdownLayoutFontBytesError::Storage)?;
@@ -244,10 +260,13 @@ fn capture(
     }
     mapping.source_closed();
     if let Err(error) = validation {
+        // Return private VM before reporting SourceChanged. Preserve the existing error order:
+        // cleanup Storage replaces that validation error if close itself fails; no combined error
+        // or successful release is fabricated.
         mapping
             .close()
             .map_err(MarkdownLayoutFontBytesError::Storage)?;
-        return Err(error); // 路径变动时先实际归还私有VM，再保留SourceChanged类别。
+        return Err(error); // SourceChanged is returned only after successful private-mapping cleanup.
     }
     Ok(MarkdownLayoutFontBytes(Arc::new(Payload {
         mapping,
@@ -268,7 +287,7 @@ mod tests {
         let observer = captured.resource_observer();
         let blob = captured.blob();
         std::fs::write(&path, []).unwrap();
-        assert_eq!(captured.as_ref(), [0, 0xff, 0x80, 7]); // 无UTF8验证或原inode借用。
+        assert_eq!(captured.as_ref(), [0, 0xff, 0x80, 7]); // Binary font bytes require no UTF-8 validation or original-inode lease.
         assert_eq!(observer.captured_bytes(), 4);
         drop(captured);
         assert!(!observer.mapping_drop_completed());
@@ -297,7 +316,7 @@ mod tests {
         drop(value);
         std::thread::spawn(move || {
             assert_eq!(blob.as_ref().as_ref(), b"font");
-            drop(blob); // 最后共享值在后台真实析构，observer不参与其VM保活。
+            drop(blob); // The last shared value really drops on this joined thread; the observer retains no VM owner.
         })
         .join()
         .unwrap();
@@ -330,7 +349,8 @@ mod tests {
         let first = MarkdownLayoutFontBytes::capture_file(&path, 4).unwrap();
         let release = first.resource_observer();
         let second = first.share_unchanged_file(&path, 4).unwrap().unwrap();
-        // 原观察者见到同一真实映射的生存期；不会因为另一个字号实例还活着而提前报归还。
+        // Observe the same actual mapping lifetime; another live instance must prevent an early
+        // successful-release receipt.
         drop(first);
         assert!(!release.mapping_drop_completed());
         assert_eq!(second.as_ref(), b"font");
@@ -349,7 +369,7 @@ mod tests {
         let replacement = directory.path().join("replacement.bin");
         std::fs::write(&path, b"font").unwrap();
         let original = MarkdownLayoutFontBytes::capture_file(&path, 4).unwrap();
-        // 不同inode即使字节数相同也必须重新捕获，避免字体文件更新时套用旧字形数据。
+        // A new inode needs recapture even at equal length; font-file updates cannot reuse old glyph bytes.
         std::fs::write(&replacement, b"next").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         assert!(original.share_unchanged_file(&path, 4).unwrap().is_none());

@@ -1,8 +1,8 @@
-//! 精确字体face与轴位置；解析只消费不可变Blob，文件输入先冻结独立匿名inode。
+//! Resolve exact font faces and axis positions from immutable blobs; file capture first freezes a separate anonymous inode.
 //!
-//! 平台owner必须先保证payload的全部字节在所有Font使用期内稳定；普通可被外部截断或
-//! 改写的文件映射不满足此合同。resolver不复制字体、不猜集合index；安全捕获子模块
-//! 可以按固定64KiB scratch流式创建快照。两者均不接触Native或Markdown正文。
+//! The platform owner must keep every payload byte stable throughout all Font uses; mappings of externally mutable files do not qualify.
+//! Resolution shares original bytes without copying fonts or guessing collection indices. Safe capture streams a snapshot with fixed 64-KiB scratch.
+//! Neither path owns Native objects or Markdown text; a complete frozen-font blob grants no whole-document text access.
 
 use std::sync::{
     Arc, Weak,
@@ -22,14 +22,14 @@ pub use bytes::{
     MarkdownLayoutFontBytes, MarkdownLayoutFontBytesError, MarkdownLayoutFontBytesResourceObserver,
 };
 
-/// 显式轴tag使用原OpenType四字节，不把显示名称或浮点hash当字体权限。
+/// Use the original four-byte OpenType axis tag; display names or floating-point hashes cannot establish font authority.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MarkdownLayoutFontAxis {
     pub tag: [u8; 4],
     pub value: f32,
 }
 
-/// 解析实际同一字节payload的结果；axes为完整有效轴位，硬上限为32个。
+/// Metadata resolved from the same actual byte payload; axes contains all effective positions, with a hard 32-axis limit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownLayoutFontMetadata {
     pub face_index: u32,
@@ -89,17 +89,17 @@ pub enum MarkdownLayoutFontError {
 }
 type Result<T> = std::result::Result<T, MarkdownLayoutFontError>;
 
-/// Clone只共享同一个Font实例payload；重新resolve相同字节也不取得原实例权限。
+/// Clone shares this Font instance's payload; resolving identical bytes again does not acquire its original authority.
 #[derive(Clone)]
 pub struct MarkdownLayoutFont(Arc<Payload>);
 
 struct Payload {
-    // 按声明顺序实际析构Font与有限metadata后才发布drop事实。observer不保活它们。
+    // Declaration order drops Font and finite metadata before publishing payload-drop completion; observers keep neither alive.
     font: Font,
     metadata: MarkdownLayoutFontMetadata,
-    // 只有显式字号构造采用高精度定位；旧通用字体仍保留HarfBuzz的原26.6合同。
+    // Explicit-size construction uses precise positioning; the general Font path retains HarfBuzz's original 26.6 contract.
     positioning_points: Option<f64>,
-    // 平台位图/UI字体的实际水平推进只保纯值，不保Native对象或回调；原Font最后一个owner归还时一起释放。
+    // Bitmap/UI font advances retain pure values, not Native objects/callbacks, and leave with this Font payload's last owner.
     horizontal_advances: Option<horizontal::HorizontalAdvances>,
     dropped: PayloadDrop,
 }
@@ -110,7 +110,7 @@ impl Drop for PayloadDrop {
     }
 }
 
-/// 原Font allocation的弱权限；名字、轴值相同不等于同一个owner。
+/// Weak authority for the original Font allocation; equal names or axis values do not identify the same owner.
 #[derive(Clone)]
 pub struct MarkdownLayoutFontAuthority {
     font: Weak<Payload>,
@@ -118,13 +118,13 @@ pub struct MarkdownLayoutFontAuthority {
 
 #[cfg(feature = "paged-shaping-frontier")]
 impl MarkdownLayoutFontAuthority {
-    /// 只比较原allocation身份；不升级弱引用，也不把相同名称/轴值或已经释放当作可用权限。
+    /// Compare original allocation identity without upgrading weak references; equality alone neither proves liveness nor grants usable font authority.
     pub(crate) fn same_payload(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.font, &other.font)
     }
 }
 
-/// 只证明本payload及其Font字段已析构，不证明其他Arc持有的字体字节或映射也已释放。
+/// Prove only that this payload and its Font field were dropped, not that font bytes or mappings retained by another Arc were released.
 #[derive(Clone)]
 pub struct MarkdownLayoutFontResourceObserver {
     dropped: Arc<AtomicBool>,
@@ -137,13 +137,13 @@ impl MarkdownLayoutFontResourceObserver {
 }
 
 impl MarkdownLayoutFont {
-    /// 从真实PSName与完整字节确定唯一face/实例；显式轴覆盖该实例的对应坐标。
+    /// Resolve a unique face/instance from actual PSName and complete stable bytes; explicit axes override corresponding instance positions.
     ///
-    /// 调用方须交付在所有共享使用期内不变的payload。此层只保原Arc，不把可变文件
-    /// mmap当作安全快照；字体字节生命周期和Native CTFont对应关系由平台owner负责。
+    /// The caller supplies payload immutable throughout shared use. This layer retains the original Arc, without treating
+    /// mutable-file mmap as a safe snapshot; the platform owner guarantees byte lifetime and correspondence with its actual CTFont.
     ///
     /// # Errors
-    /// 容器、名称、轴元数据不完整、超出固定预算、歧义或未知名称均明确拒绝，不回退face0。
+    /// Reject incomplete/over-budget container, name, or axis metadata, ambiguous matches, and unknown names; never fall back to face zero.
     pub fn resolve(
         bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
         postscript: &str,
@@ -159,11 +159,11 @@ impl MarkdownLayoutFont {
         })))
     }
 
-    /// 原生UIFont别名/变量合成PSName不一定存在于文件名称表；以原Native完整name表匹配唯一face。
-    /// 仍由固定目录/name/fvar预算和显式轴位构造，不解析合成名字、不猜集合索引或默认face。
+    /// A Native UI alias or synthesized variable PSName may be absent from file names; match its complete original name table to one actual face.
+    /// Retain fixed directory/name/fvar limits and explicit axis validation, without parsing synthesized names or guessing an index/default face.
     ///
     /// # Errors
-    /// 表缺失、超预算、face歧义或轴位无效均拒绝；不以同名字体或默认face补齐来源。
+    /// Reject missing/over-budget tables, ambiguous faces, or invalid axes without substituting a same-name font or default face.
     pub fn resolve_name_table(
         bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
         native_name_table: &[u8],
@@ -179,11 +179,11 @@ impl MarkdownLayoutFont {
         })))
     }
 
-    /// 以完整名称表、实际轴位和原字号绑定一个新字体权限，内部定位只在最终出口量化。
-    /// 此构造不改变已有字体或其弱权限；平台须交付与实际绘制CTFont相同的字号和来源。
+    /// Bind a new font authority to the full name table, actual axes, and original point size; quantize precise positioning only at output.
+    /// Existing fonts/weak authorities are unchanged; the platform supplies the same size/source as its actual drawing CTFont.
     ///
     /// # Errors
-    /// 字号不在原26.6可表示范围，或face/轴解析失败时拒绝，不降低已有通用接口的范围。
+    /// Reject sizes outside the original representable 26.6 range or failed face/axis resolution, without narrowing the general interface's valid range.
     pub fn resolve_name_table_at_size(
         bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
         native_name_table: &[u8],
@@ -201,13 +201,13 @@ impl MarkdownLayoutFont {
         })))
     }
 
-    /// 绑定同一个实际平台字体在原双精度字号下的完整水平推进，单位为point。
-    /// 仅平台实际度量不同于文件hmtx时使用；调用方须交付每个真实glyph恰好一项，
-    /// 不能交正文出现字形的抽样。纯值表转入本payload，既不保平台对象也不按正文增长。
+    /// Bind complete horizontal advances in points from the same actual platform font at its original double-precision size.
+    /// Use only when platform metrics differ from file hmtx, supplying exactly one value per actual glyph rather than a sample seen in text.
+    /// Transfer the pure-value table to this payload, without retaining platform objects or growing with document content.
     ///
     /// # Errors
-    /// face/轴/字号解析失败，表项数量不等于真实glyph域，或任一推进非有限、超坐标范围时拒绝；
-    /// 不以默认hmtx补缺项。真实负值照常保留，由原前沿非负证明决定能否提前发布。
+    /// Reject face/axis/size errors, incomplete glyph domains, or nonfinite/unrepresentable advances; never fill missing values from default hmtx.
+    /// Preserve actual negative values; the original frontier's nonnegative proof decides whether early publication is possible.
     pub fn resolve_name_table_at_size_with_horizontal_advances(
         bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
         native_name_table: &[u8],
@@ -232,11 +232,11 @@ impl MarkdownLayoutFont {
         })))
     }
 
-    /// 从本实例的同一冻结来源派生新字号与轴位；必须匹配原 face 的完整 Native 名称表。
-    /// 底层只读 face 与布局缓存共享，新 payload、字体权限和字号绑定仍各自独立。
+    /// Derive new size/axes from this instance's same immutable source, requiring the original face's complete Native name table.
+    /// Share underlying read-only face/layout caches while keeping the new payload, font authority, and bound size independent.
     ///
     /// # Errors
-    /// 外来或截短名称表、无效字号及重复、未知、越界轴均拒绝；不改用另一 face。
+    /// Reject foreign/truncated name tables, invalid sizes, and duplicate/unknown/out-of-range axes without selecting another face.
     pub fn derive_name_table_at_size(
         &self,
         native_name_table: &[u8],
@@ -246,7 +246,7 @@ impl MarkdownLayoutFont {
         positioning::validate_points(points)?;
         let (font, metadata) =
             resolve::derive_name_table(&self.0.font, &self.0.metadata, native_name_table, axes)?;
-        // 平台推进属于旧实例的真实字号；普通派生绝不继承旧表或它的度量权限。
+        // Platform advances belong to the old instance's actual size; ordinary derivation inherits neither that table nor its metric authority.
         Ok(Self(Arc::new(Payload {
             font,
             metadata,
@@ -256,11 +256,11 @@ impl MarkdownLayoutFont {
         })))
     }
 
-    /// 派生同 face 时安装本次实际 Native 字号的完整推进表；旧表不会被共享或复用。
-    /// 表仍按真实 glyph 域校验并独占归新 payload，底层 face 数据保持原不可变来源。
+    /// Derive the same face with complete advances for this actual Native size, without sharing/reusing the previous size's table.
+    /// Validate the real glyph domain and transfer the table exclusively to the new payload while retaining original immutable face data.
     ///
     /// # Errors
-    /// 名称表、轴位、字号或任一真实推进不满足原捕获契约时拒绝整个新实例。
+    /// Reject the complete new instance if name table, axes, size, or any actual advance violates the original capture contract.
     pub fn derive_name_table_at_size_with_horizontal_advances(
         &self,
         native_name_table: &[u8],
@@ -277,7 +277,7 @@ impl MarkdownLayoutFont {
             metadata.glyph_count,
             horizontal_advances,
         )?;
-        // 新表转换失败只归还候选；原实例、原权限与它已发布的字形不受影响。
+        // Failed new-table conversion drops the candidate only; original instance, authority, and published glyphs remain unaffected.
         Ok(Self(Arc::new(Payload {
             font,
             metadata,
@@ -287,17 +287,17 @@ impl MarkdownLayoutFont {
         })))
     }
 
-    /// 返回本实例构造时绑定的实际字号；None明确表示通用HarfBuzz定位合同。
+    /// Return this instance's actual bound point size; None explicitly selects the general HarfBuzz positioning contract.
     #[must_use]
     pub fn shaping_point_size(&self) -> Option<f64> {
         self.0.positioning_points
     }
 
-    /// 核原双精度设计坐标经真实fvar/avar转换后，与本Font采用的归一化位置完全相同。
-    /// 设计空间的f32舍入可以跨一个16.16单位，只有最终实际位置相等才允许接受。
+    /// Require original double-precision design coordinates to normalize through actual fvar/avar to this Font's exact positions.
+    /// Design-space f32 rounding can cross a 16.16 unit; accept only equal final normalized coordinates.
     ///
     /// # Errors
-    /// 超预算、重复/未知轴、越界、无效表或归一化位置不同均拒绝，不按epsilon猜等价。
+    /// Reject over-budget/duplicate/unknown axes, out-of-range values, invalid tables, or unequal normalization; no epsilon equivalence.
     pub fn verify_design_coordinates(&self, coordinates: &[([u8; 4], f64)]) -> Result<()> {
         positioning::verify_design_coordinates(self, coordinates)
     }
@@ -318,19 +318,19 @@ impl MarkdownLayoutFont {
             dropped: Arc::clone(&self.0.dropped.0),
         }
     }
-    /// 只核同一个不可变字体payload；同名、相同face或相同轴值的另一次capture不冒充原owner。
-    /// 此身份判断不授予Source、字形Ready或Native绘制权限，各调用仍须核自己的原票。
+    /// Check the same immutable font payload; another capture with equal name/face/axes cannot impersonate its original owner.
+    /// Identity alone grants no Source, glyph readiness, or Native drawing authority; each operation checks its own original ticket.
     #[must_use]
     pub fn permits(&self, authority: &MarkdownLayoutFontAuthority) -> bool {
         Weak::ptr_eq(&authority.font, &Arc::downgrade(&self.0))
     }
-    /// 只供同crate的原shaping任务借用；不得把克隆出的底层Font绕过本owner长期保留。
+    /// Lend only to this crate's original shaping tasks; cloned underlying Fonts must not outlive or bypass this owner contract.
     pub(crate) fn font(&self) -> &Font {
         &self.0.font
     }
 
-    /// 整形与证明统一借同一原Font和原水平推进；绑定平台度量的实例不能借另一个尺度查询。
-    /// 不含平台度量的通用字体仍直接使用文件实际hmtx/变体表，不建立另一份默认表。
+    /// Shaping and proofs use the same original Font/advances; a platform-metric instance cannot be queried at another scale.
+    /// General fonts without platform metrics use actual file hmtx/variation tables directly rather than another default advance table.
     pub(crate) fn shaper_at_scale(&self, scale: i32) -> Result<harfrust::ShaperFont<'_, '_>> {
         let shaper = harfrust::ShaperFont::new(self.font()).with_scale(scale);
         match &self.0.horizontal_advances {

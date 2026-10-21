@@ -1,8 +1,8 @@
-//! 列表预览只替换一个源unit的字形；piece tree、NSString和每个插入点始终保留原坐标。
+//! Reference list preview replaces only one source unit's glyph; the piece tree, NSString, and every caret keep their original coordinates.
 
 use super::*;
 
-/// 字形角色进入既有属性LRU的key；相同MARKER样式不能命中活动源码的旧字典。
+/// Includes glyph role in the existing attribute-LRU key, so identical MARKER bits cannot reuse a dictionary for active literal source.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum MarkdownListGlyphRole {
     #[default]
@@ -15,7 +15,7 @@ pub(super) enum MarkdownListGlyphRole {
     Hidden,
 }
 
-/// 仅活动editor拥有这组固定资源；任一字形不可用时整套保持可编辑的原字面。
+/// The active reference editor alone owns this fixed palette; missing any glyph preserves the complete editable literal marker.
 pub(super) struct MarkdownListMarkerGlyphPalette {
     pub(super) font: Retained<NSFont>,
     dash: Retained<NSGlyphInfo>,
@@ -26,13 +26,15 @@ pub(super) struct MarkdownListMarkerGlyphPalette {
 }
 
 impl MarkdownListMarkerGlyphPalette {
+    /// Acquires one fixed reference-preview palette. Any missing symbol drops the partial palette;
+    /// callers then preserve literal markers rather than selecting another font or hiding a suffix.
     pub(super) fn new() -> Option<Self> {
         let font = NSFont::fontWithName_size(ns_string!("AppleSymbols"), 14.0)?;
-        // 三个显示符号均须由同一真实字体映射成功；不把缺字方框当作可隐藏源码的许可。
+        // All three symbols require coverage from the same actual font; a missing-glyph box grants no authority to hide source syntax.
         let mut symbols = [0x2022_u16, 0x2610, 0x2611];
         let mut glyphs = [0_u16; 3];
         let core_font: &CTFont = font.as_ref();
-        // SAFETY: 两个栈数组均有三个元素；所有符号为单UTF-16 unit，输出在本调用内独占可写。
+        // SAFETY: Both stack arrays have three entries; every symbol is one UTF-16 unit, and output is exclusively writable during this call.
         let covered = unsafe {
             core_font.glyphs_for_characters(
                 NonNull::new(symbols.as_mut_ptr())?,
@@ -41,9 +43,9 @@ impl MarkdownListMarkerGlyphPalette {
             )
         };
         if !covered || glyphs.contains(&0) {
-            return None; // 字体失败不收起任务框尾部或原bullet，避免留下半个控件。
+            return None; // Font failure hides neither the task-box suffix nor original bullet, preventing partial marker presentation.
         }
-        // baseString精确对应一个原字符；不得把[x]合成一个cluster而丢失内部caret。
+        // Each baseString names exactly one original character; combining [x] into one cluster would lose its interior carets.
         let dash = NSGlyphInfo::glyphInfoWithCGGlyph_forFont_baseString(
             glyphs[0],
             &font,
@@ -79,6 +81,7 @@ impl MarkdownListMarkerGlyphPalette {
         })
     }
 
+    /// Borrows only the glyph assigned to this actual role, with no allocation or new text authority.
     pub(super) fn info(&self, role: MarkdownListGlyphRole) -> Option<&NSGlyphInfo> {
         match role {
             MarkdownListGlyphRole::Dash => Some(&self.dash),
@@ -86,13 +89,13 @@ impl MarkdownListMarkerGlyphPalette {
             MarkdownListGlyphRole::Star => Some(&self.star),
             MarkdownListGlyphRole::Unchecked => Some(&self.unchecked),
             MarkdownListGlyphRole::Checked => Some(&self.checked),
-            // 隐藏尾部没有自造字形；活动与Source字面也不带NSGlyphInfo。
+            // Hidden suffixes invent no glyph; active and Source literals likewise carry no NSGlyphInfo.
             MarkdownListGlyphRole::Literal | MarkdownListGlyphRole::Hidden => None,
         }
     }
 }
 
-/// 只消费Core真实Item/Task token；没有可用的整套字形时保持原字面且不隐藏任何部分。
+/// Consumes actual Core Item/Task tokens only; an unavailable complete palette preserves every literal source unit.
 pub(super) fn native_markdown_list_role(
     marker: Option<&MarkdownPreviewListMarker>,
     index: usize,
@@ -100,6 +103,7 @@ pub(super) fn native_markdown_list_role(
     enabled: bool,
 ) -> MarkdownListGlyphRole {
     let Some(marker) = marker.filter(|marker| enabled && !marker.active) else {
+        // Active editing or an unavailable palette keeps every original character visible and editable.
         return MarkdownListGlyphRole::Literal;
     };
     match marker.kind {
@@ -111,7 +115,7 @@ pub(super) fn native_markdown_list_role(
         MarkdownPreviewListMarkerKind::TaskBullet { .. } => MarkdownListGlyphRole::Hidden,
         MarkdownPreviewListMarkerKind::TaskBox { checked } => {
             if index == marker.utf16_range.start {
-                // 只有原'['这一个unit取得框字形；内部两个源码unit仍分别可放置光标。
+                // Only the original opening bracket receives the box glyph; the remaining two source units keep separate caret positions.
                 range.end = range.end.min(marker.utf16_range.start + 1);
                 if checked {
                     MarkdownListGlyphRole::Checked
@@ -119,7 +123,7 @@ pub(super) fn native_markdown_list_role(
                     MarkdownListGlyphRole::Unchecked
                 }
             } else {
-                // x/空格和']'沿现有0.1pt隐藏策略，不使用多unit的glyph cluster。
+                // The x/space and closing bracket use the existing 0.1-point hidden style rather than a multi-unit glyph cluster.
                 range.start = range.start.max(marker.utf16_range.start + 1);
                 MarkdownListGlyphRole::Hidden
             }
